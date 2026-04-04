@@ -20,9 +20,11 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.steervla_policy as steervla_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
+import openpi.training.steervla_rlds_dataset as steervla_rlds_dataset
 import openpi.training.misc.polaris_config as polaris_config
 import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
@@ -90,12 +92,25 @@ class DataConfig:
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
 
-    # Only used for RLDS data loader (ie currently only used for DROID).
+    # Only used for RLDS data loader (ie currently only used for DROID and SteerVLA).
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
     action_space: droid_rlds_dataset.DroidActionSpace | None = None
     # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
     datasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
+
+    # SteerVLA RLDS-specific fields.
+    steervla_rlds: bool = False
+    steervla_datasets: Sequence[steervla_rlds_dataset.SteerVLARLDSDataset] = ()
+    steervla_dataset_format: steervla_rlds_dataset.DatasetFormat = steervla_rlds_dataset.DatasetFormat.NUSCENES
+    steervla_include_ego_history: bool = True
+    steervla_include_xy_action: bool = False
+    steervla_speed_in_prompt: bool = True
+    steervla_proprio_norm: bool = True
+    steervla_output_action_format: steervla_rlds_dataset.OutputActionFormat = steervla_rlds_dataset.OutputActionFormat.DELTA_XY_T_DELTA_XY_SPACE
+    steervla_lang_label_type: steervla_rlds_dataset.LangLabelType = steervla_rlds_dataset.LangLabelType.ROUTING_COMMAND
+    steervla_routing_command_in_prompt: bool = False
+    steervla_add_suffix_to_prompt: bool = False
 
 
 class GroupFactory(Protocol):
@@ -109,14 +124,16 @@ class ModelTransformFactory(GroupFactory):
 
     # If provided, will determine the default prompt that be used by the model.
     default_prompt: str | None = None
+    image_size: int = 224
 
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
+        h = w = self.image_size
         match model_config.model_type:
             case _model.ModelType.PI0:
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
-                        _transforms.ResizeImages(224, 224),
+                        _transforms.ResizeImages(h, w),
                         _transforms.TokenizePrompt(
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
                         ),
@@ -128,7 +145,7 @@ class ModelTransformFactory(GroupFactory):
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
-                        _transforms.ResizeImages(224, 224),
+                        _transforms.ResizeImages(h, w),
                         _transforms.TokenizePrompt(
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
                             discrete_state_input=model_config.discrete_state_input,
@@ -148,7 +165,7 @@ class ModelTransformFactory(GroupFactory):
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
-                        _transforms.ResizeImages(224, 224),
+                        _transforms.ResizeImages(h, w),
                         _transforms.TokenizeFASTInputs(
                             tokenizer_cls(model_config.max_token_len, **tokenizer_kwargs),
                         ),
@@ -452,6 +469,151 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
             inputs=[droid_policy.DroidInputs(model_type=model_config.model_type)],
             outputs=[droid_policy.DroidOutputs()],
         )
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class RLDSSteerVLADataConfig(DataConfigFactory):
+    """
+    Config for training on driving data (nuScenes or SimLingo), using RLDS data format.
+    Adapted from the bigvision-palivla-drive pipeline.
+
+    Datasets can be specified either as:
+    - A sequence of SteerVLARLDSDataset objects via `datasets`
+    - A dict mapping dataset names to weights via `dataset_name_weight_mappings`
+      (more ergonomic for multi-dataset configs like SimLingo)
+
+    Weights do NOT need to sum to 1.0 -- they are normalized internally.
+    """
+
+    rlds_data_dir: str | None = None
+    dataset_format: tyro.conf.Suppress[steervla_rlds_dataset.DatasetFormat] = steervla_rlds_dataset.DatasetFormat.NUSCENES
+    include_ego_history: bool = True
+    include_xy_action: bool = False
+    speed_in_prompt: bool = True
+    proprio_norm: bool = True
+    action_dim: int = 2
+
+    # Option 1: explicit dataset list.
+    datasets: Sequence[steervla_rlds_dataset.SteerVLARLDSDataset] = ()
+
+    # Option 2: dict mapping dataset_name -> weight (version will use dataset_version).
+    dataset_name_weight_mappings: tyro.conf.Suppress[dict[str, float] | None] = None
+    dataset_version: tyro.conf.Suppress[str | None] = None
+
+    # SimLingo-specific options.
+    output_action_format: tyro.conf.Suppress[steervla_rlds_dataset.OutputActionFormat] = steervla_rlds_dataset.OutputActionFormat.DELTA_XY_T_DELTA_XY_SPACE
+    lang_label_type: tyro.conf.Suppress[steervla_rlds_dataset.LangLabelType] = steervla_rlds_dataset.LangLabelType.ROUTING_COMMAND
+    routing_command_in_prompt: bool = False
+    add_suffix_to_prompt: bool = False
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Resolve datasets from either datasets list or name->weight mapping.
+        resolved_datasets = list(self.datasets)
+        if self.dataset_name_weight_mappings is not None:
+            for name, weight in self.dataset_name_weight_mappings.items():
+                resolved_datasets.append(
+                    steervla_rlds_dataset.SteerVLARLDSDataset(
+                        name=name, weight=weight, version=self.dataset_version,
+                    )
+                )
+
+        assert len(resolved_datasets) > 0, "Must specify at least one dataset via `datasets` or `dataset_name_weight_mappings`."
+
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "observation/image",
+                        "observation/state": "observation/state",
+                        "observation/current_speed": "observation/current_speed",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        # For RLDS data, the speed_in_prompt injection already happens in the RLDS loader,
+        # so we disable it in the policy transform to avoid double-injection.
+        data_transforms = _transforms.Group(
+            inputs=[steervla_policy.SteerVLAInputs(
+                model_type=model_config.model_type,
+                speed_in_prompt=False,
+                include_ego_history=False,
+                proprio_norm=False,
+            )],
+            outputs=[steervla_policy.SteerVLAOutputs(action_dim=self.action_dim)],
+        )
+
+        model_transforms = ModelTransformFactory(image_size=128)(model_config)
+
+        assert self.rlds_data_dir is not None, "Need to set rlds_data_dir for RLDS data loader."
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            steervla_rlds=True,
+            rlds_data_dir=self.rlds_data_dir,
+            steervla_datasets=tuple(resolved_datasets),
+            steervla_dataset_format=self.dataset_format,
+            steervla_include_ego_history=self.include_ego_history,
+            steervla_include_xy_action=self.include_xy_action,
+            steervla_speed_in_prompt=self.speed_in_prompt,
+            steervla_proprio_norm=self.proprio_norm,
+            steervla_output_action_format=self.output_action_format,
+            steervla_lang_label_type=self.lang_label_type,
+            steervla_routing_command_in_prompt=self.routing_command_in_prompt,
+            steervla_add_suffix_to_prompt=self.add_suffix_to_prompt,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotSteerVLADataConfig(DataConfigFactory):
+    """
+    Config for training on a smaller nuScenes-style driving dataset in LeRobot format.
+    """
+
+    speed_in_prompt: bool = True
+    include_ego_history: bool = True
+    proprio_norm: bool = True
+    action_dim: int = 2
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "image",
+                        "observation/state": "state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[steervla_policy.SteerVLAInputs(
+                model_type=model_config.model_type,
+                speed_in_prompt=self.speed_in_prompt,
+                include_ego_history=self.include_ego_history,
+                proprio_norm=self.proprio_norm,
+            )],
+            outputs=[steervla_policy.SteerVLAOutputs(action_dim=self.action_dim)],
+        )
+
         model_transforms = ModelTransformFactory()(model_config)
 
         return dataclasses.replace(
@@ -917,6 +1079,187 @@ _CONFIGS = [
         batch_size=32,
     ),
     #
+    # SteerVLA (nuScenes driving) configs.
+    #
+    TrainConfig(
+        name="pi05_steervla",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=6,
+        ),
+        data=RLDSSteerVLADataConfig(
+            repo_id="steervla",
+            rlds_data_dir="<path_to_nuscenes_rlds_dataset>",
+            include_ego_history=True,
+            include_xy_action=False,
+            speed_in_prompt=True,
+            proprio_norm=True,
+            action_dim=2,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=1e-4,
+            decay_steps=100_000,
+            decay_lr=1e-5,
+        ),
+        num_train_steps=5_000,
+        batch_size=96,
+        log_interval=100,
+        save_interval=500,
+        num_workers=0,
+    ),
+    TrainConfig(
+        name="pi0_steervla",
+        model=pi0_config.Pi0Config(
+            action_dim=32,
+            action_horizon=6,
+        ),
+        data=RLDSSteerVLADataConfig(
+            repo_id="steervla",
+            rlds_data_dir="<path_to_nuscenes_rlds_dataset>",
+            include_ego_history=True,
+            include_xy_action=False,
+            speed_in_prompt=True,
+            proprio_norm=True,
+            action_dim=2,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=1e-4,
+            decay_steps=100_000,
+            decay_lr=1e-5,
+        ),
+        num_train_steps=5_000,
+        batch_size=96,
+        log_interval=100,
+        save_interval=500,
+        num_workers=0,
+    ),
+    TrainConfig(
+        name="pi0_fast_steervla",
+        model=pi0_fast.Pi0FASTConfig(
+            action_dim=2,
+            action_horizon=6,
+            max_token_len=180,
+        ),
+        data=RLDSSteerVLADataConfig(
+            repo_id="steervla",
+            rlds_data_dir="<path_to_nuscenes_rlds_dataset>",
+            include_ego_history=True,
+            include_xy_action=False,
+            speed_in_prompt=True,
+            proprio_norm=True,
+            action_dim=2,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=1e-4,
+            decay_steps=100_000,
+            decay_lr=1e-5,
+        ),
+        num_train_steps=5_000,
+        batch_size=96,
+        log_interval=100,
+        save_interval=500,
+        num_workers=0,
+    ),
+    #
+    # SteerVLA SimLingo configs (multi-dataset with sampling weights).
+    #
+    TrainConfig(
+        name="pi05_steervla_simlingo",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=10,
+        ),
+        data=RLDSSteerVLADataConfig(
+            repo_id="steervla_simlingo",
+            rlds_data_dir="gs://tian-us-central2/tensorflow_datasets",
+            dataset_format=steervla_rlds_dataset.DatasetFormat.SIMLINGO,
+            include_ego_history=False,
+            include_xy_action=False,
+            speed_in_prompt=True,
+            proprio_norm=True,
+            action_dim=4,
+            output_action_format=steervla_rlds_dataset.OutputActionFormat.DELTA_XY_T_DELTA_XY_SPACE,
+            lang_label_type=steervla_rlds_dataset.LangLabelType.ROUTING_COMMAND,
+            routing_command_in_prompt=False,
+            add_suffix_to_prompt=False,
+            dataset_name_weight_mappings={
+                "simlingo_dataset_all_img512_0916": 1.0,
+                # "simlingo_dataset_acceleration_negative5_img512_0916": 0.2,
+                # "simlingo_dataset_acceleration_negative1_img512_0916": 0.1,
+                # "simlingo_dataset_acceleration_positive1_img512_0916": 0.1,
+                # "simlingo_dataset_acceleration_positive5_img512_0916": 0.2,
+                # "simlingo_dataset_lateral_control12_img512_0916": 0.1,
+                # "simlingo_dataset_lateral_control_higher5_img512_0916": 0.3,
+                # "simlingo_dataset_start_from_stop_img512_0916": 0.2,
+                # "simlingo_dataset_vehicle_front_img512_0916": 0.3,
+                # "simlingo_dataset_vehicle_side_img512_0916": 0.1,
+                # "simlingo_dataset_leading_object_vehicle_img512_0916": 0.05,
+                # "simlingo_dataset_leading_object_traffic_stop_img512_0916": 0.2,
+                # "simlingo_dataset_leading_object_traffic_light_img512_0916": 0.2,
+                # "simlingo_dataset_leading_object_walker_img512_0916": 0.2,
+                # "simlingo_dataset_changed_route_img512_0916": 0.2,
+                # "simlingo_dataset_parkinglane_img512_0916": 0.3,
+            },
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=1e-4,
+            decay_steps=100_000,
+            decay_lr=1e-5,
+        ),
+        num_train_steps=100_000,
+        batch_size=4,
+        fsdp_devices=4,
+        log_interval=1,
+        save_interval=5000,
+        num_workers=0,
+    ),
+    TrainConfig(
+        name="pi05_steervla_finetune",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=6,
+        ),
+        data=LeRobotSteerVLADataConfig(
+            repo_id="your_hf_username/my_steervla_dataset",
+            base_config=DataConfig(prompt_from_task=True),
+            speed_in_prompt=True,
+            include_ego_history=True,
+            proprio_norm=True,
+            action_dim=2,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        batch_size=32,
+    ),
+    #
+    # Inference SteerVLA configs.
+    #
+    TrainConfig(
+        name="pi05_steervla_inference",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=6),
+        data=SimpleDataConfig(
+            assets=AssetsConfig(asset_id="steervla"),
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[steervla_policy.SteerVLAInputs(model_type=ModelType.PI05)],
+                outputs=[steervla_policy.SteerVLAOutputs(action_dim=2)],
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+    ),
+    
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
     #
     TrainConfig(

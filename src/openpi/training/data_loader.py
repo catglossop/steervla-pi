@@ -14,6 +14,7 @@ import torch
 import openpi.models.model as _model
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
+from openpi.training.steervla_rlds_dataset import SteerVLARldsDataset
 import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
@@ -158,7 +159,23 @@ def create_rlds_dataset(
     *,
     shuffle: bool = False,
 ) -> Dataset:
-    # At the moment, we only support DROID for RLDS datasets.
+    if data_config.steervla_rlds:
+        return SteerVLARldsDataset(
+            data_dir=data_config.rlds_data_dir,
+            batch_size=batch_size,
+            datasets=data_config.steervla_datasets,
+            dataset_format=data_config.steervla_dataset_format,
+            shuffle=shuffle,
+            action_chunk_size=action_horizon,
+            include_ego_history=data_config.steervla_include_ego_history,
+            include_xy_action=data_config.steervla_include_xy_action,
+            speed_in_prompt=data_config.steervla_speed_in_prompt,
+            proprio_norm=data_config.steervla_proprio_norm,
+            output_action_format=data_config.steervla_output_action_format,
+            lang_label_type=data_config.steervla_lang_label_type,
+            routing_command_in_prompt=data_config.steervla_routing_command_in_prompt,
+            add_suffix_to_prompt=data_config.steervla_add_suffix_to_prompt,
+        )
     return DroidRldsDataset(
         data_dir=data_config.rlds_data_dir,
         batch_size=batch_size,
@@ -484,14 +501,14 @@ def _worker_init_fn(worker_id: int) -> None:
 
 
 class RLDSDataLoader:
-    """Shallow wrapper around the DROID data loader to make it compatible with openpi.
+    """Shallow wrapper around RLDS data loaders to make them compatible with openpi.
 
-    All batching already happens in the DROID dataset, so we don't need to do anything here.
+    All batching already happens in the RLDS dataset, so we don't need to do anything here.
     """
 
     def __init__(
         self,
-        dataset: DroidRldsDataset,
+        dataset: DroidRldsDataset | SteerVLARldsDataset,
         *,
         sharding: jax.sharding.Sharding | None = None,
         num_batches: int | None = None,
