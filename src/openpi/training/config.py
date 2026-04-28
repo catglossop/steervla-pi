@@ -111,6 +111,8 @@ class DataConfig:
     steervla_lang_label_type: steervla_rlds_dataset.LangLabelType = steervla_rlds_dataset.LangLabelType.ROUTING_COMMAND
     steervla_routing_command_in_prompt: bool = False
     steervla_add_suffix_to_prompt: bool = False
+    steervla_action_dim: int = 4
+    steervla_enable_cot: bool = False
 
 
 class GroupFactory(Protocol):
@@ -124,16 +126,14 @@ class ModelTransformFactory(GroupFactory):
 
     # If provided, will determine the default prompt that be used by the model.
     default_prompt: str | None = None
-    image_size: int = 224
 
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
-        h = w = self.image_size
         match model_config.model_type:
             case _model.ModelType.PI0:
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
-                        _transforms.ResizeImages(h, w),
+                        _transforms.ResizeImages(224, 224),
                         _transforms.TokenizePrompt(
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
                         ),
@@ -145,7 +145,7 @@ class ModelTransformFactory(GroupFactory):
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
-                        _transforms.ResizeImages(h, w),
+                        _transforms.ResizeImages(224, 224),
                         _transforms.TokenizePrompt(
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
                             discrete_state_input=model_config.discrete_state_input,
@@ -165,7 +165,7 @@ class ModelTransformFactory(GroupFactory):
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
-                        _transforms.ResizeImages(h, w),
+                        _transforms.ResizeImages(224, 224),
                         _transforms.TokenizeFASTInputs(
                             tokenizer_cls(model_config.max_token_len, **tokenizer_kwargs),
                         ),
@@ -554,7 +554,7 @@ class RLDSSteerVLADataConfig(DataConfigFactory):
             outputs=[steervla_policy.SteerVLAOutputs(action_dim=self.action_dim)],
         )
 
-        model_transforms = ModelTransformFactory(image_size=128)(model_config)
+        model_transforms = ModelTransformFactory()(model_config)
 
         assert self.rlds_data_dir is not None, "Need to set rlds_data_dir for RLDS data loader."
 
@@ -575,6 +575,97 @@ class RLDSSteerVLADataConfig(DataConfigFactory):
             steervla_lang_label_type=self.lang_label_type,
             steervla_routing_command_in_prompt=self.routing_command_in_prompt,
             steervla_add_suffix_to_prompt=self.add_suffix_to_prompt,
+            steervla_action_dim=self.action_dim,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class RLDSSteerVLACoTDataConfig(RLDSSteerVLADataConfig):
+    """Extension of RLDSSteerVLADataConfig that enables chain-of-thought generation.
+
+    Uses the routing_command as the high-level prompt, gemini_refined_label as
+    the subtask, and commentary as the reasoning.
+    """
+
+    # CoT-specific token lengths.
+    max_subtask_len: int = 48
+    max_reasoning_len: int = 96
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        resolved_datasets = list(self.datasets)
+        if self.dataset_name_weight_mappings is not None:
+            for name, weight in self.dataset_name_weight_mappings.items():
+                resolved_datasets.append(
+                    steervla_rlds_dataset.SteerVLARLDSDataset(
+                        name=name, weight=weight, version=self.dataset_version,
+                    )
+                )
+
+        assert len(resolved_datasets) > 0
+
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "observation/image",
+                        "observation/state": "observation/state",
+                        "observation/current_speed": "observation/current_speed",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                        "subtask": "subtask",
+                        "reasoning": "reasoning",
+                    }
+                )
+            ]
+        )
+
+
+        data_transforms = _transforms.Group(
+            inputs=[steervla_policy.SteerVLAInputs(
+                model_type=model_config.model_type,
+                speed_in_prompt=True,
+                include_ego_history=False,
+                proprio_norm=False,
+            )],
+            outputs=[steervla_policy.SteerVLAOutputs(action_dim=self.action_dim)],
+        )
+
+        from openpi.models.tokenizer import CoTPaligemmaTokenizer
+        cot_tokenizer = CoTPaligemmaTokenizer(
+            max_prompt_len=model_config.max_token_len,
+            max_subtask_len=self.max_subtask_len,
+            max_reasoning_len=self.max_reasoning_len,
+        )
+        model_transforms = _transforms.Group(
+            inputs=[
+                _transforms.ResizeImages(224, 224),
+                _transforms.TokenizeCoTPrompt(cot_tokenizer),
+                _transforms.PadStatesAndActions(model_config.action_dim),
+            ],
+        )
+
+        assert self.rlds_data_dir is not None
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            steervla_rlds=True,
+            rlds_data_dir=self.rlds_data_dir,
+            steervla_datasets=tuple(resolved_datasets),
+            steervla_dataset_format=self.dataset_format,
+            steervla_include_ego_history=self.include_ego_history,
+            steervla_include_xy_action=self.include_xy_action,
+            steervla_speed_in_prompt=False,
+            steervla_proprio_norm=self.proprio_norm,
+            steervla_output_action_format=self.output_action_format,
+            steervla_lang_label_type=self.lang_label_type,
+            steervla_routing_command_in_prompt=False,
+            steervla_add_suffix_to_prompt=False,
+            steervla_action_dim=self.action_dim,
+            steervla_enable_cot=True,
         )
 
 
@@ -674,6 +765,8 @@ class TrainConfig:
 
     # How often (in steps) to log training metrics.
     log_interval: int = 100
+    # How often (in steps) to run eval visualization (0 = disabled).
+    eval_interval: int = 0
     # How often (in steps) to save checkpoints.
     save_interval: int = 1000
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
@@ -702,11 +795,11 @@ class TrainConfig:
         return (pathlib.Path(self.assets_base_dir) / self.name).resolve()
 
     @property
-    def checkpoint_dir(self) -> pathlib.Path:
+    def checkpoint_dir(self) -> epath.Path:
         """Get the checkpoint directory for this config."""
         if not self.exp_name:
             raise ValueError("--exp_name must be set")
-        return (pathlib.Path(self.checkpoint_base_dir) / self.name / self.exp_name).resolve()
+        return epath.Path(self.checkpoint_base_dir) / self.name / self.exp_name
 
     @property
     def trainable_filter(self) -> nnx.filterlib.Filter:
@@ -1192,21 +1285,21 @@ _CONFIGS = [
             add_suffix_to_prompt=False,
             dataset_name_weight_mappings={
                 "simlingo_dataset_all_img512_0916": 1.0,
-                # "simlingo_dataset_acceleration_negative5_img512_0916": 0.2,
-                # "simlingo_dataset_acceleration_negative1_img512_0916": 0.1,
-                # "simlingo_dataset_acceleration_positive1_img512_0916": 0.1,
-                # "simlingo_dataset_acceleration_positive5_img512_0916": 0.2,
-                # "simlingo_dataset_lateral_control12_img512_0916": 0.1,
-                # "simlingo_dataset_lateral_control_higher5_img512_0916": 0.3,
-                # "simlingo_dataset_start_from_stop_img512_0916": 0.2,
-                # "simlingo_dataset_vehicle_front_img512_0916": 0.3,
-                # "simlingo_dataset_vehicle_side_img512_0916": 0.1,
-                # "simlingo_dataset_leading_object_vehicle_img512_0916": 0.05,
-                # "simlingo_dataset_leading_object_traffic_stop_img512_0916": 0.2,
-                # "simlingo_dataset_leading_object_traffic_light_img512_0916": 0.2,
-                # "simlingo_dataset_leading_object_walker_img512_0916": 0.2,
-                # "simlingo_dataset_changed_route_img512_0916": 0.2,
-                # "simlingo_dataset_parkinglane_img512_0916": 0.3,
+                "simlingo_dataset_acceleration_negative5_img512_0916": 0.2,
+                "simlingo_dataset_acceleration_negative1_img512_0916": 0.1,
+                "simlingo_dataset_acceleration_positive1_img512_0916": 0.1,
+                "simlingo_dataset_acceleration_positive5_img512_0916": 0.2,
+                "simlingo_dataset_lateral_control12_img512_0916": 0.1,
+                "simlingo_dataset_lateral_control_higher5_img512_0916": 0.3,
+                "simlingo_dataset_start_from_stop_img512_0916": 0.2,
+                "simlingo_dataset_vehicle_front_img512_0916": 0.3,
+                "simlingo_dataset_vehicle_side_img512_0916": 0.1,
+                "simlingo_dataset_leading_object_vehicle_img512_0916": 0.05,
+                "simlingo_dataset_leading_object_traffic_stop_img512_0916": 0.2,
+                "simlingo_dataset_leading_object_traffic_light_img512_0916": 0.2,
+                "simlingo_dataset_leading_object_walker_img512_0916": 0.2,
+                "simlingo_dataset_changed_route_img512_0916": 0.2,
+                "simlingo_dataset_parkinglane_img512_0916": 0.3,
             },
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
@@ -1217,11 +1310,136 @@ _CONFIGS = [
             decay_lr=1e-5,
         ),
         num_train_steps=100_000,
-        batch_size=4,
+        batch_size=24,
         fsdp_devices=4,
         log_interval=1,
+        eval_interval=100,
         save_interval=5000,
         num_workers=0,
+        checkpoint_base_dir="gs://cat-logs",
+    ),
+    #
+    # SteerVLA Chain-of-Thought: Pi0.5 with reasoning + subtask generation.
+    # Uses routing_command as high-level prompt, gemini_refined_label as subtask,
+    # and commentary as reasoning (chain-of-thought).
+    #
+    TrainConfig(
+        name="pi05_steervla_cot",
+        model=pi0_config.Pi0CoTConfig(
+            action_dim=32,
+            action_horizon=10,
+            max_token_len=112,
+            max_subtask_len=48,
+            max_reasoning_len=96,
+            cot_loss_weight=1.0,
+            knowledge_insulation=False,
+        ),
+        data=RLDSSteerVLACoTDataConfig(
+            repo_id="steervla_simlingo_cot",
+            rlds_data_dir="gs://tian-us-central2/tensorflow_datasets",
+            dataset_format=steervla_rlds_dataset.DatasetFormat.SIMLINGO,
+            include_ego_history=False,
+            include_xy_action=False,
+            speed_in_prompt=True,
+            proprio_norm=True,
+            action_dim=4,
+            output_action_format=steervla_rlds_dataset.OutputActionFormat.DELTA_XY_T_DELTA_XY_SPACE,
+            lang_label_type=steervla_rlds_dataset.LangLabelType.ROUTING_COMMAND,
+            dataset_name_weight_mappings={
+                "simlingo_dataset_all_img512_1116": 1.0,
+                "simlingo_dataset_acceleration_negative5_img512_1116": 0.2,
+                "simlingo_dataset_acceleration_negative1_img512_1116": 0.1,
+                "simlingo_dataset_acceleration_positive1_img512_1116": 0.1,
+                "simlingo_dataset_acceleration_positive5_img512_1116": 0.2,
+                "simlingo_dataset_lateral_control12_img512_1116": 0.1,
+                "simlingo_dataset_lateral_control_higher5_img512_1116": 0.3,
+                "simlingo_dataset_start_from_stop_img512_1116": 0.2,
+                "simlingo_dataset_vehicle_front_img512_1116": 0.3,
+                "simlingo_dataset_vehicle_side_img512_1116": 0.1,
+                "simlingo_dataset_leading_object_vehicle_img512_1116": 0.05,
+                "simlingo_dataset_leading_object_traffic_stop_img512_1116": 0.2,
+                "simlingo_dataset_leading_object_traffic_light_img512_1116": 0.2,
+                "simlingo_dataset_leading_object_walker_img512_1116": 0.2,
+                "simlingo_dataset_changed_route_img512_1116": 0.2,
+                "simlingo_dataset_parking_lane_img512_1116": 0.3,
+            },
+            max_subtask_len=48,
+            max_reasoning_len=96,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=1e-4,
+            decay_steps=100_000,
+            decay_lr=1e-5,
+        ),
+        num_train_steps=100_000,
+        batch_size=24,
+        fsdp_devices=4,
+        log_interval=1,
+        eval_interval=500,
+        save_interval=5000,
+        num_workers=0,
+        checkpoint_base_dir="gs://cat-logs",
+    ),
+    TrainConfig(
+        name="pi05_steervla_cot_ki",
+        model=pi0_config.Pi0CoTConfig(
+            action_dim=32,
+            action_horizon=10,
+            max_token_len=112,
+            max_subtask_len=48,
+            max_reasoning_len=96,
+            cot_loss_weight=1.0,
+            knowledge_insulation=True,
+        ),
+        data=RLDSSteerVLACoTDataConfig(
+            repo_id="steervla_simlingo_cot",
+            rlds_data_dir="gs://tian-us-central2/tensorflow_datasets",
+            dataset_format=steervla_rlds_dataset.DatasetFormat.SIMLINGO,
+            include_ego_history=False,
+            include_xy_action=False,
+            speed_in_prompt=True,
+            proprio_norm=True,
+            action_dim=4,
+            output_action_format=steervla_rlds_dataset.OutputActionFormat.DELTA_XY_T_DELTA_XY_SPACE,
+            lang_label_type=steervla_rlds_dataset.LangLabelType.ROUTING_COMMAND,
+            dataset_name_weight_mappings={
+                "simlingo_dataset_all_img512_1116": 1.0,
+                "simlingo_dataset_acceleration_negative5_img512_1116": 0.2,
+                "simlingo_dataset_acceleration_negative1_img512_1116": 0.1,
+                "simlingo_dataset_acceleration_positive1_img512_1116": 0.1,
+                "simlingo_dataset_acceleration_positive5_img512_1116": 0.2,
+                "simlingo_dataset_lateral_control12_img512_1116": 0.1,
+                "simlingo_dataset_lateral_control_higher5_img512_1116": 0.3,
+                "simlingo_dataset_start_from_stop_img512_1116": 0.2,
+                "simlingo_dataset_vehicle_front_img512_1116": 0.3,
+                "simlingo_dataset_vehicle_side_img512_1116": 0.1,
+                "simlingo_dataset_leading_object_vehicle_img512_1116": 0.05,
+                "simlingo_dataset_leading_object_traffic_stop_img512_1116": 0.2,
+                "simlingo_dataset_leading_object_traffic_light_img512_1116": 0.2,
+                "simlingo_dataset_leading_object_walker_img512_1116": 0.2,
+                "simlingo_dataset_changed_route_img512_1116": 0.2,
+                "simlingo_dataset_parking_lane_img512_1116": 0.3,
+            },
+            max_subtask_len=48,
+            max_reasoning_len=96,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=1e-4,
+            decay_steps=100_000,
+            decay_lr=1e-5,
+        ),
+        num_train_steps=100_000,
+        batch_size=24,
+        fsdp_devices=4,
+        log_interval=1,
+        eval_interval=1000,
+        save_interval=5000,
+        num_workers=0,
+        checkpoint_base_dir="gs://cat-logs",
     ),
     TrainConfig(
         name="pi05_steervla_finetune",

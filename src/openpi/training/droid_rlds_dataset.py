@@ -16,6 +16,7 @@ from pathlib import Path
 import tqdm
 
 import openpi.shared.download as download
+from openpi.training.rlds_multihost import shard_dataset_then_batch
 
 
 class DroidActionSpace(Enum):
@@ -231,7 +232,7 @@ class DroidRldsDataset:
 
         final_dataset = dl.DLataset.sample_from_datasets(all_datasets, weights=weights)
         final_dataset = final_dataset.shuffle(shuffle_buffer_size)
-        final_dataset = final_dataset.batch(batch_size)
+        final_dataset = shard_dataset_then_batch(final_dataset, batch_size)
         # Note =>> Seems to reduce memory usage without affecting speed?
         final_dataset = final_dataset.with_ram_budget(1)
 

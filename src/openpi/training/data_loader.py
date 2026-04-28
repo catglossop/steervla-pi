@@ -175,6 +175,7 @@ def create_rlds_dataset(
             lang_label_type=data_config.steervla_lang_label_type,
             routing_command_in_prompt=data_config.steervla_routing_command_in_prompt,
             add_suffix_to_prompt=data_config.steervla_add_suffix_to_prompt,
+            enable_cot=data_config.steervla_enable_cot,
         )
     return DroidRldsDataset(
         data_dir=data_config.rlds_data_dir,
@@ -515,9 +516,6 @@ class RLDSDataLoader:
     ):
         self._dataset = dataset
         self._num_batches = num_batches
-
-        if jax.process_count() > 1:
-            raise NotImplementedError("Data loading with multiple processes is not supported.")
 
         if sharding is None:
             # Use data parallel sharding by default.

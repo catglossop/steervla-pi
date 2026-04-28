@@ -11,6 +11,8 @@ import dataclasses
 from enum import Enum, auto
 import logging
 
+from openpi.training.rlds_multihost import shard_dataset_then_batch
+
 
 class DatasetFormat(Enum):
     """Supported RLDS dataset formats."""
@@ -62,6 +64,7 @@ class SteerVLARldsDataset:
         lang_label_type: LangLabelType = LangLabelType.ROUTING_COMMAND,
         routing_command_in_prompt: bool = False,
         add_suffix_to_prompt: bool = False,
+        enable_cot: bool = False,
         shuffle_buffer_size: int = 50_000,
         num_parallel_reads: int = -1,
         num_parallel_calls: int = -1,
@@ -239,7 +242,7 @@ class SteerVLARldsDataset:
 
                 front_image = traj["observation"]["image"]
 
-                return {
+                result = {
                     "actions": actions,
                     "observation": {
                         "image": front_image,
@@ -248,6 +251,13 @@ class SteerVLARldsDataset:
                     },
                     "prompt": instruction,
                 }
+
+                if enable_cot:
+                    # routing_cmd = tf.strings.regex_replace(traj["routing_command"], "^Command: ", "")
+                    result["subtask"] = traj["gemini_refined_label"]
+                    result["reasoning"] = traj["commentary"]
+
+                return result
 
             return restructure
 
@@ -291,11 +301,9 @@ class SteerVLARldsDataset:
             dataset = dataset.flatten(num_parallel_calls=num_parallel_calls)
 
             def decode_images(frame):
-                img = tf.io.decode_image(
+                frame["observation"]["image"] = tf.io.decode_image(
                     frame["observation"]["image"], expand_animations=False, dtype=tf.uint8
                 )
-                img = tf.image.resize(img, [128, 128], method="bilinear")
-                frame["observation"]["image"] = tf.cast(img, tf.uint8)
                 return frame
 
             return dataset.frame_map(decode_images, num_parallel_calls)
@@ -312,7 +320,7 @@ class SteerVLARldsDataset:
         final_dataset = dl.DLataset.sample_from_datasets(all_datasets, weights=normalized_weights)
         if shuffle:
             final_dataset = final_dataset.shuffle(shuffle_buffer_size)
-        final_dataset = final_dataset.batch(batch_size)
+        final_dataset = shard_dataset_then_batch(final_dataset, batch_size)
         final_dataset = final_dataset.with_ram_budget(1)
 
         self.dataset = final_dataset

@@ -48,6 +48,102 @@ class PaligemmaTokenizer:
         return np.asarray(tokens), np.asarray(mask)
 
 
+class CoTPaligemmaTokenizer:
+    """Tokenizer for Chain-of-Thought Pi0.5 that produces three separate token
+    sequences: prompt (input), reasoning (generated), and subtask (generated).
+
+    Full logical layout (concatenated at train/inference time):
+
+        Prompt:"task";State:"state";
+        <start_of_reasoning>"reasoning"<end_of_reasoning>;
+        <start_of_subtask>"subtask"<end_of_subtask>
+
+    Attention (see ``Pi0CoT``): images + prompt segment bidirectional; reasoning and
+    subtask segments causal; the action expert does not attend to reasoning.
+    """
+
+    def __init__(
+        self,
+        max_prompt_len: int = 64,
+        max_subtask_len: int = 48,
+        max_reasoning_len: int = 96,
+    ):
+        self._max_prompt_len = max_prompt_len
+        self._max_subtask_len = max_subtask_len
+        self._max_reasoning_len = max_reasoning_len
+        
+        self._cot_skip_tokens = 128  # Skip last 128 tokens in PaliGemma vocab since they are special tokens
+
+        path = download.maybe_download(
+            "gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"}
+        )
+        with path.open("rb") as f:
+            self._tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
+
+    def _pad_or_truncate(
+        self, tokens: list[int], mask: list[bool], max_len: int
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if len(tokens) < max_len:
+            pad = [False] * (max_len - len(tokens))
+            tokens = tokens + pad
+            mask = mask + pad
+        elif len(tokens) > max_len:
+            logging.warning(
+                f"Token length ({len(tokens)}) exceeds max ({max_len}), truncating."
+            )
+            tokens = tokens[:max_len]
+            mask = mask[:max_len]
+        return np.asarray(tokens, dtype=np.int32), np.asarray(mask, dtype=bool)
+
+    def tokenize_prompt(
+        self, prompt: str, state: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Tokenize the bidirectional prefix: through ``<start_of_reasoning>`` (exclusive of reasoning body)."""
+        cleaned = prompt.strip().replace("_", " ").replace("\n", " ")
+        discretized = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+        state_str = " ".join(map(str, discretized))
+        text = (
+            f"Prompt:{cleaned};State:{state_str};"
+        )
+        tokens = self._tokenizer.encode(text, add_bos=True) + [self._start_of_reasoning()]
+        mask = [True] * len(tokens)
+        return self._pad_or_truncate(tokens, mask, self._max_prompt_len)
+
+    def tokenize_subtask(self, subtask: str) -> tuple[np.ndarray, np.ndarray]:
+        """Tokenize subtask body (causal segment; follows reasoning in the prefix)."""
+        cleaned = subtask.strip().replace("_", " ").replace("\n", " ")
+        text = f"{cleaned};"
+        tokens = self._tokenizer.encode(text) + [self._end_of_subtask()] + [self._tokenizer.eos_id()]
+        mask = [True] * len(tokens)
+        return self._pad_or_truncate(tokens, mask, self._max_subtask_len)
+
+    def tokenize_reasoning(self, reasoning: str) -> tuple[np.ndarray, np.ndarray]:
+        """Tokenize reasoning body (causal segment; first generated segment after the prompt)."""
+        cleaned = reasoning.strip().replace("_", " ").replace("\n", " ")
+        text = f"{cleaned};"
+        tokens = self._tokenizer.encode(text) + [self._end_of_reasoning()] + [self._start_of_subtask()]
+        mask = [True] * len(tokens)
+        return self._pad_or_truncate(tokens, mask, self._max_reasoning_len)
+
+    @property
+    def vocab_size(self) -> int:
+        return self._tokenizer.vocab_size()
+    
+    def _start_of_subtask(self) -> int:
+        return self.vocab_size - 1 - self._cot_skip_tokens - 1
+
+    def _end_of_subtask(self) -> int:
+        return self.vocab_size - 1 - self._cot_skip_tokens - 2
+    
+    def _start_of_reasoning(self) -> int:
+        return self.vocab_size - 1 - self._cot_skip_tokens - 3
+    
+    def _end_of_reasoning(self) -> int:
+        return self.vocab_size - 1 - self._cot_skip_tokens - 4
+    
+    
+
+
 class FASTTokenizer:
     def __init__(self, max_len: int = 256, fast_tokenizer_path: str = "physical-intelligence/fast"):
         self._max_len = max_len

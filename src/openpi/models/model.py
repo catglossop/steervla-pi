@@ -106,6 +106,15 @@ class Observation(Generic[ArrayT]):
     # Token loss mask (for FAST autoregressive model).
     token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
 
+    # Chain-of-thought fields (for Pi0-CoT model).
+
+    # Ground-truth subtask/meta-action tokens and mask.
+    tokenized_subtask: at.Int[ArrayT, "*b ls"] | None = None
+    tokenized_subtask_mask: at.Bool[ArrayT, "*b ls"] | None = None
+    # Ground-truth reasoning/commentary tokens and mask.
+    tokenized_reasoning: at.Int[ArrayT, "*b lr"] | None = None
+    tokenized_reasoning_mask: at.Bool[ArrayT, "*b lr"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
@@ -126,6 +135,10 @@ class Observation(Generic[ArrayT]):
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
+            tokenized_subtask=data.get("tokenized_subtask"),
+            tokenized_subtask_mask=data.get("tokenized_subtask_mask"),
+            tokenized_reasoning=data.get("tokenized_reasoning"),
+            tokenized_reasoning_mask=data.get("tokenized_reasoning_mask"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -205,6 +218,10 @@ def preprocess_observation(
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
+        tokenized_subtask=observation.tokenized_subtask,
+        tokenized_subtask_mask=observation.tokenized_subtask_mask,
+        tokenized_reasoning=observation.tokenized_reasoning,
+        tokenized_reasoning_mask=observation.tokenized_reasoning_mask,
     )
 
 

@@ -13,6 +13,7 @@ import openpi.shared.nnx_utils as nnx_utils
 
 if TYPE_CHECKING:
     from openpi.models.pi0 import Pi0
+    from openpi.models.pi0_cot import Pi0CoT
 
 
 @dataclasses.dataclass(frozen=True)
@@ -31,6 +32,8 @@ class Pi0Config(_model.BaseModelConfig):
     pi05: bool = False
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
+    # Stop gradients from action expert → VLM backbone in attention (Driess et al., 2025).
+    knowledge_insulation: bool = False
 
     pytorch_compile_mode: str | None = "max-autotune"
 
@@ -115,3 +118,66 @@ class Pi0Config(_model.BaseModelConfig):
         if not filters:
             return nnx.Nothing
         return nnx.All(*filters)
+
+
+@dataclasses.dataclass(frozen=True)
+class Pi0CoTConfig(_model.BaseModelConfig):
+    """Config for Pi0.5 with chain-of-thought reasoning + subtask generation."""
+
+    dtype: str = "bfloat16"
+    paligemma_variant: _gemma.Variant = "gemma_2b"
+    action_expert_variant: _gemma.Variant = "gemma_300m"
+
+    action_dim: int = 32
+    action_horizon: int = 10
+    max_token_len: int = 96
+    max_subtask_len: int = 48
+    max_reasoning_len: int = 96
+
+    cot_loss_weight: float = 1.0
+    knowledge_insulation: bool = True
+
+    pytorch_compile_mode: str | None = "max-autotune"
+
+    @property
+    @override
+    def model_type(self) -> _model.ModelType:
+        return _model.ModelType.PI05
+
+    @override
+    def create(self, rng: at.KeyArrayLike) -> "Pi0CoT":
+        from openpi.models.pi0_cot import Pi0CoT
+
+        return Pi0CoT(self, rngs=nnx.Rngs(rng))
+
+    @override
+    def inputs_spec(self, *, batch_size: int = 1) -> tuple[_model.Observation, _model.Actions]:
+        image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
+        image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
+
+        with at.disable_typechecking():
+            observation_spec = _model.Observation(
+                images={
+                    "base_0_rgb": image_spec,
+                    "left_wrist_0_rgb": image_spec,
+                    "right_wrist_0_rgb": image_spec,
+                },
+                image_masks={
+                    "base_0_rgb": image_mask_spec,
+                    "left_wrist_0_rgb": image_mask_spec,
+                    "right_wrist_0_rgb": image_mask_spec,
+                },
+                state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
+                tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
+                tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
+                tokenized_subtask=jax.ShapeDtypeStruct([batch_size, self.max_subtask_len], jnp.int32),
+                tokenized_subtask_mask=jax.ShapeDtypeStruct([batch_size, self.max_subtask_len], bool),
+                tokenized_reasoning=jax.ShapeDtypeStruct([batch_size, self.max_reasoning_len], jnp.int32),
+                tokenized_reasoning_mask=jax.ShapeDtypeStruct([batch_size, self.max_reasoning_len], bool),
+            )
+        action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
+
+        return observation_spec, action_spec
+
+    def get_freeze_filter(self) -> nnx.filterlib.Filter:
+        return Pi0Config.get_freeze_filter(self)

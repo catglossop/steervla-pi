@@ -12,6 +12,8 @@ def make_steervla_example() -> dict:
     return {
         "observation/image": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
         "observation/state": np.random.rand(8).astype(np.float32),
+        "subtask": "",
+        "reasoning": "",
         "prompt": "The car is driving on a highway.",
     }
 
@@ -135,12 +137,26 @@ class SteerVLAInputs(transforms.DataTransformFn):
 
             inputs["prompt"] = prompt
 
+        for cot_key in ("reasoning", "subtask"):
+            if cot_key in data:
+                val = data[cot_key]
+                if isinstance(val, bytes):
+                    val = val.decode("utf-8")
+                inputs[cot_key] = val
+
         return inputs
 
 
 @dataclasses.dataclass(frozen=True)
 class SteerVLAOutputs(transforms.DataTransformFn):
     action_dim: int = 2
-
+    enable_cot: bool = False
     def __call__(self, data: dict) -> dict:
+        # if self.enable_cot:
+        #     return {
+        #         "actions": np.asarray(data["actions"][:, :self.action_dim]),
+        #         "subtask": data["subtask"],
+        #         "reasoning": data["reasoning"],
+        #     }
+        # else:
         return {"actions": np.asarray(data["actions"][:, :self.action_dim])}

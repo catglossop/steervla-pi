@@ -159,6 +159,7 @@ class Attention(nn.Module):
     """Attention module."""
 
     configs: Sequence[Config]
+    knowledge_insulation: bool = False
 
     @nn.compact
     def __call__(self, xs, positions, attn_mask, kv_cache):
@@ -198,6 +199,11 @@ class Attention(nn.Module):
                 k, v = kv_einsum("BSD,2KDH->2BSKH", x)
                 qkvs.append((q, k, v))
 
+        # Track per-expert sequence lengths before concatenation (needed for
+        # knowledge insulation to identify which token positions belong to the
+        # backbone vs. action expert).
+        segment_lengths = [x.shape[1] for x in xs if x is not None]
+
         q, k, v = (jnp.concatenate(y, axis=1) for y in zip(*qkvs, strict=True))
 
         q = _apply_rope(q, positions=positions)
@@ -213,22 +219,84 @@ class Attention(nn.Module):
             k = jnp.concatenate([cache_k, k], axis=1)
             v = jnp.concatenate([cache_v, v], axis=1)
 
-        q = einops.rearrange(q, "B T (K G) H -> B T K G H", K=self.configs[0].num_kv_heads)
-        logits = jnp.einsum("BTKGH,BSKH->BKGTS", q, k, preferred_element_type=jnp.float32)
+        num_kv_heads = self.configs[0].num_kv_heads
 
-        if attn_mask.shape != (q.shape[0], 1, q.shape[1], k.shape[1]):
-            raise ValueError(
-                f"Attention mask with shape {attn_mask.shape} but shapes for q and k are: {q.shape} and {k.shape}"
+        # ---- Knowledge insulation (Driess et al., 2025) ----
+        # Stop gradients from the action expert's flow-matching loss flowing
+        # back into the VLM backbone through attention cross-talk.  Only
+        # active during training (both experts present, no KV cache).
+        _use_insulation = (
+            self.knowledge_insulation
+            and kv_cache is None
+            and len(segment_lengths) > 1
+        )
+
+        if _use_insulation:
+            backbone_len = segment_lengths[0]
+
+            # Split along sequence axis at the backbone / action-expert boundary
+            q_b, q_a = q[:, :backbone_len], q[:, backbone_len:]
+            k_b, k_a = k[:, :backbone_len], k[:, backbone_len:]
+            v_b, v_a = v[:, :backbone_len], v[:, backbone_len:]
+
+            q_b = einops.rearrange(q_b, "B T (K G) H -> B T K G H", K=num_kv_heads)
+            q_a = einops.rearrange(q_a, "B T (K G) H -> B T K G H", K=num_kv_heads)
+
+            # Backbone queries attend to all keys normally.
+            logits_b = jnp.einsum(
+                "BTKGH,BSKH->BKGTS", q_b, k, preferred_element_type=jnp.float32
             )
 
-        # big_neg = jnp.finfo(logits.dtype).min
-        big_neg = -2.3819763e38  # See gemma/modules.py
-        masked_logits = jnp.where(attn_mask[:, :, None, :, :], logits, big_neg)
+            # Action-expert queries attend to backbone K with stop_gradient,
+            # and to action-expert K normally.
+            k_for_action = jnp.concatenate(
+                [jax.lax.stop_gradient(k_b), k_a], axis=1
+            )
+            logits_a = jnp.einsum(
+                "BTKGH,BSKH->BKGTS", q_a, k_for_action, preferred_element_type=jnp.float32
+            )
 
-        probs = jax.nn.softmax(masked_logits, axis=-1).astype(dtype)
+            logits = jnp.concatenate([logits_b, logits_a], axis=-2)  # concat along T (query) dim
 
-        encoded = jnp.einsum("BKGTS,BSKH->BTKGH", probs, v)
-        encoded = einops.rearrange(encoded, "B T K G H -> B T (K G) H")
+            if attn_mask.shape != (logits.shape[0], 1, logits.shape[-2], logits.shape[-1]):
+                raise ValueError(
+                    f"Attention mask with shape {attn_mask.shape} but "
+                    f"logits shape {logits.shape}"
+                )
+
+            big_neg = -2.3819763e38
+            masked_logits = jnp.where(attn_mask[:, :, None, :, :], logits, big_neg)
+            probs = jax.nn.softmax(masked_logits, axis=-1).astype(dtype)
+
+            # Value aggregation: action-expert reads backbone V with stop_gradient.
+            probs_b = probs[:, :, :, :backbone_len, :]      # backbone query probs
+            probs_a = probs[:, :, :, backbone_len:, :]       # action expert query probs
+
+            encoded_b = jnp.einsum("BKGTS,BSKH->BTKGH", probs_b, v)
+
+            v_for_action = jnp.concatenate(
+                [jax.lax.stop_gradient(v_b), v_a], axis=1
+            )
+            encoded_a = jnp.einsum("BKGTS,BSKH->BTKGH", probs_a, v_for_action)
+
+            encoded = jnp.concatenate([encoded_b, encoded_a], axis=1)
+            encoded = einops.rearrange(encoded, "B T K G H -> B T (K G) H")
+        else:
+            q = einops.rearrange(q, "B T (K G) H -> B T K G H", K=num_kv_heads)
+            logits = jnp.einsum("BTKGH,BSKH->BKGTS", q, k, preferred_element_type=jnp.float32)
+
+            if attn_mask.shape != (q.shape[0], 1, q.shape[1], k.shape[1]):
+                raise ValueError(
+                    f"Attention mask with shape {attn_mask.shape} but shapes for q and k are: {q.shape} and {k.shape}"
+                )
+
+            big_neg = -2.3819763e38  # See gemma/modules.py
+            masked_logits = jnp.where(attn_mask[:, :, None, :, :], logits, big_neg)
+
+            probs = jax.nn.softmax(masked_logits, axis=-1).astype(dtype)
+
+            encoded = jnp.einsum("BKGTS,BSKH->BTKGH", probs, v)
+            encoded = einops.rearrange(encoded, "B T K G H -> B T (K G) H")
 
         out = []
         start = 0
@@ -288,13 +356,14 @@ class Block(nn.Module):
 
     dropout: float = 0.0
     dropout_bdims: tuple[int, ...] = ()
+    knowledge_insulation: bool = False
 
     @nn.compact
     def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic=True):  # noqa: FBT002
         xs = sharding.activation_sharding_constraint(xs)
         drop = nn.Dropout(self.dropout, self.dropout_bdims) if self.dropout else lambda x, _: x
 
-        attn = Attention(configs=self.configs, name="attn")
+        attn = Attention(configs=self.configs, knowledge_insulation=self.knowledge_insulation, name="attn")
 
         pre_attn = []
         gates = []
@@ -346,6 +415,7 @@ class Module(nn.Module):
     dropout: float = 0.0
     dropout_bdims: tuple[int, ...] = ()  # Every float is dropped independently.
     adarms: bool = False
+    knowledge_insulation: bool = False
 
     def setup(self):
         # all experts must have the same depth
@@ -378,12 +448,24 @@ class Module(nn.Module):
             configs=self.configs,
             dropout=self.dropout,
             dropout_bdims=self.dropout_bdims,
+            knowledge_insulation=self.knowledge_insulation,
         )
         self.final_norms = [RMSNorm(name=_name("final_norm", i)) for i in range(len(self.configs))]
 
     @at.typecheck
     def embed(self, tokens: at.Int[at.Array, "b t"]) -> at.Float[at.Array, "b t d"]:
         return self.embedder.encode(tokens).astype(self.embed_dtype)
+
+    @at.typecheck
+    def decode_logits(self, tokens: at.Float[at.Array, "b t d"]) -> at.Float[at.Array, "b t v"]:
+        """Vocabulary logits from hidden states (for CE training). `decode` returns argmax ids only."""
+        return self.embedder.decode(tokens).astype(jnp.float32)
+
+    @at.typecheck
+    def decode(self, tokens: at.Float[at.Array, "b t d"]) -> at.Int[at.Array, "b t"]:
+        logits = self.decode_logits(tokens)
+        tokens = jnp.argmax(logits, axis=-1)
+        return tokens.astype(jnp.int32)
 
     @at.typecheck
     def __call__(

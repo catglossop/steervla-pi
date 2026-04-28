@@ -22,10 +22,13 @@ import openpi.shared.nnx_utils as nnx_utils
 import openpi.training.checkpoints as _checkpoints
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
+import openpi.training.jax_distributed as jax_distributed
 import openpi.training.optimizer as _optimizer
 import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
+
+from openpi.visualizing.steervla_visualization import run_cot_visualization, run_visualization_evaluation
 
 
 def init_logging():
@@ -49,6 +52,10 @@ def init_logging():
 
 def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = False, enabled: bool = True):
     if not enabled:
+        wandb.init(mode="disabled")
+        return
+
+    if jax.process_index() != 0:
         wandb.init(mode="disabled")
         return
 
@@ -192,12 +199,24 @@ def train_step(
 
 
 def main(config: _config.TrainConfig):
+    jax_distributed.initialize_if_needed()
     init_logging()
-    logging.info(f"Running on: {platform.node()}")
+    logging.info(
+        "Running on: %s | jax.process_index=%s jax.process_count=%s jax.device_count=%s",
+        platform.node(),
+        jax.process_index(),
+        jax.process_count(),
+        jax.device_count(),
+    )
 
     if config.batch_size % jax.device_count() != 0:
         raise ValueError(
             f"Batch size {config.batch_size} must be divisible by the number of devices {jax.device_count()}."
+        )
+    if jax.process_count() > 1 and config.batch_size % jax.process_count() != 0:
+        raise ValueError(
+            f"Batch size {config.batch_size} must be divisible by jax.process_count() ({jax.process_count()}) "
+            "for multi-host data sharding."
         )
 
     jax.config.update("jax_compilation_cache_dir", str(epath.Path("~/.cache/jax").expanduser()))
@@ -227,11 +246,12 @@ def main(config: _config.TrainConfig):
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
     # Log images from first batch to sanity check.
-    images_to_log = [
-        wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
-        for i in range(min(5, len(next(iter(batch[0].images.values())))))
-    ]
-    wandb.log({"camera_views": images_to_log}, step=0)
+    if jax.process_index() == 0:
+        images_to_log = [
+            wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
+            for i in range(min(5, len(next(iter(batch[0].images.values())))))
+        ]
+        wandb.log({"camera_views": images_to_log}, step=0)
 
     train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
     jax.block_until_ready(train_state)
@@ -247,14 +267,21 @@ def main(config: _config.TrainConfig):
         donate_argnums=(1,),
     )
 
+    # Resolve eval visualization settings from the data config.
+    data_config = data_loader.data_config()
+    eval_action_dim = data_config.steervla_action_dim
+    eval_output_format = data_config.steervla_output_action_format.value if data_config.steervla_rlds else None
+
     start_step = int(train_state.step)
     pbar = tqdm.tqdm(
         range(start_step, config.num_train_steps),
         initial=start_step,
         total=config.num_train_steps,
         dynamic_ncols=True,
+        disable=jax.process_index() != 0,
     )
 
+    eval_rng = jax.random.key(config.seed + 1)
     infos = []
     for step in pbar:
         with sharding.set_mesh(mesh):
@@ -263,11 +290,33 @@ def main(config: _config.TrainConfig):
         if step % config.log_interval == 0:
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
-            info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
-            pbar.write(f"Step {step}: {info_str}")
-            wandb.log(reduced_info, step=step)
+            if jax.process_index() == 0:
+                info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
+                pbar.write(f"Step {step}: {info_str}")
+                wandb.log(reduced_info, step=step)
             infos = []
         batch = next(data_iter)
+
+        if config.eval_interval > 0 and step > 0 and step % config.eval_interval == 0:
+            if jax.process_index() == 0:
+                pbar.write(f"Running eval visualization at step {step}...")
+            eval_rng, vis_rng = jax.random.split(eval_rng)
+            vis_rng, cot_rng = jax.random.split(vis_rng)
+            with sharding.set_mesh(mesh):
+                run_visualization_evaluation(
+                    state=train_state,
+                    rng=vis_rng,
+                    batch=batch,
+                    step=step,
+                    action_dim=eval_action_dim,
+                    output_action_format=eval_output_format,
+                )
+                run_cot_visualization(
+                    state=train_state,
+                    rng=cot_rng,
+                    batch=batch,
+                    step=step,
+                )
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)

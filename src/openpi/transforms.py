@@ -267,6 +267,50 @@ class TokenizePrompt(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class TokenizeCoTPrompt(DataTransformFn):
+    """Tokenizes prompt, reasoning, and subtask for the Pi0-CoT model (prefix order: reasoning then subtask)."""
+
+    tokenizer: _tokenizer.CoTPaligemmaTokenizer
+
+    def __call__(self, data: DataDict) -> DataDict:
+        prompt = data.pop("prompt", None)
+        subtask = data.pop("subtask", None)
+        reasoning = data.pop("reasoning", None)
+
+        if prompt is None:
+            raise ValueError("prompt is required for CoT tokenization")
+        if subtask is None:
+            raise ValueError("subtask is required for CoT tokenization")
+        if reasoning is None:
+            raise ValueError("reasoning is required for CoT tokenization")
+
+        if not isinstance(prompt, str):
+            prompt = prompt.item()
+        if not isinstance(subtask, str):
+            subtask = subtask.item()
+        if not isinstance(reasoning, str):
+            reasoning = reasoning.item()
+
+        state = data.get("state")
+        if state is None:
+            raise ValueError("State is required for CoT tokenization")
+
+        prompt_tok, prompt_mask = self.tokenizer.tokenize_prompt(prompt, state)
+        reasoning_tok, reasoning_mask = self.tokenizer.tokenize_reasoning(reasoning)
+        subtask_tok, subtask_mask = self.tokenizer.tokenize_subtask(subtask)
+
+        return {
+            **data,
+            "tokenized_prompt": prompt_tok,
+            "tokenized_prompt_mask": prompt_mask,
+            "tokenized_subtask": subtask_tok,
+            "tokenized_subtask_mask": subtask_mask,
+            "tokenized_reasoning": reasoning_tok,
+            "tokenized_reasoning_mask": reasoning_mask,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
 class TokenizeFASTInputs(DataTransformFn):
     tokenizer: _tokenizer.FASTTokenizer
 

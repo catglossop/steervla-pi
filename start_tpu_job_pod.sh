@@ -1,9 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-USER=lovelace
-
-cd /home/$USER/steervla-pi
+cd /home/noam/steervla-pi
 export PATH="$HOME/.local/bin:$PATH"
 
 # Install crcmod for fast GCS transfers if not already built with C extension.
@@ -45,7 +43,7 @@ echo "Logging into Weights & Biases..."
 uv run wandb login "$WANDB_API_KEY"
 
 echo "Logging into Hugging Face..."
-hf auth login --token "$HF_TOKEN" --add-to-git-credential
+huggingface-cli login --token "$HF_TOKEN"
 
 echo "Starting training..."
 export JAX_COMPILATION_CACHE_DIR="$HOME/.cache/jax_compilation_cache"
