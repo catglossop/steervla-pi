@@ -137,6 +137,12 @@ class Pi0CoTConfig(_model.BaseModelConfig):
     cot_loss_weight: float = 1.0
     knowledge_insulation: bool = True
 
+    # If set, :meth:`Pi0CoT.sample_cot` / :meth:`Pi0CoT.sample_actions` pass this to
+    # ``preprocess_observation(..., image_keys=...)`` when the call does not pass
+    # ``image_keys`` explicitly. Example: ``("base_0_rgb",)`` for single-camera CARLA
+    # (skip wrist streams). ``None`` means use all :data:`openpi.models.model.IMAGE_KEYS`.
+    inference_image_keys: tuple[str, ...] | None = None
+
     pytorch_compile_mode: str | None = "max-autotune"
 
     @property

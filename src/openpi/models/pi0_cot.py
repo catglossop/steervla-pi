@@ -14,6 +14,7 @@ Losses: CE on reasoning + subtask (VLM), flow-matching on actions.
 """
 
 import logging
+from collections.abc import Sequence
 
 import einops
 import flax.nnx as nnx
@@ -78,6 +79,11 @@ class Pi0CoT(_model.BaseModel):
 
         self.max_subtask_len = config.max_subtask_len
         self.max_reasoning_len = config.max_reasoning_len
+        self._preprocess_image_keys: tuple[str, ...] = (
+            tuple(config.inference_image_keys)
+            if config.inference_image_keys is not None
+            else tuple(_model.IMAGE_KEYS)
+        )
 
         self.deterministic = True
 
@@ -318,6 +324,7 @@ class Pi0CoT(_model.BaseModel):
         temperature: float = 0.0,
         max_subtask_len: int | None = None,
         max_reasoning_len: int | None = None,
+        image_keys: Sequence[str] | None = None,
     ) -> dict[str, jnp.ndarray]:
         """Autoregressively sample reasoning then subtask from images + prompt prefix only.
 
@@ -326,8 +333,14 @@ class Pi0CoT(_model.BaseModel):
 
         Returns token ID buffers and boolean masks (True = generated timestep), same layout
         as training keys ``tokenized_subtask*`` / ``tokenized_reasoning*``.
+
+        Args:
+            image_keys: Subset of camera keys to resize/embed. If ``None``, uses
+                ``Pi0CoTConfig.inference_image_keys`` when set, else all ``IMAGE_KEYS``.
+                CARLA single-camera inference can pass ``("base_0_rgb",)`` or set that on the config.
         """
-        observation = _model.preprocess_observation(None, observation, train=False)
+        keys = tuple(image_keys) if image_keys is not None else self._preprocess_image_keys
+        observation = _model.preprocess_observation(None, observation, train=False, image_keys=keys)
         if observation.tokenized_prompt is None or observation.tokenized_prompt_mask is None:
             raise ValueError("sample_cot requires tokenized_prompt and tokenized_prompt_mask")
 
@@ -475,8 +488,10 @@ class Pi0CoT(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
+        image_keys: Sequence[str] | None = None,
     ) -> _model.Actions:
-        observation = _model.preprocess_observation(None, observation, train=False)
+        keys = tuple(image_keys) if image_keys is not None else self._preprocess_image_keys
+        observation = _model.preprocess_observation(None, observation, train=False, image_keys=keys)
         batch_size = observation.state.shape[0]
 
         # --- Build prefix: images + prompt + reasoning + subtask ---
