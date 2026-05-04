@@ -316,183 +316,6 @@ class Pi0CoT(_model.BaseModel):
     # Inference: sample_cot (autoregressive CoT, prompt-only conditioning)
     # ------------------------------------------------------------------
 
-    @nnx.jit(static_argnames=("mr", "temperature"))
-    def _sample_cot_reasoning_generation_scan(
-        self,
-        h: jnp.ndarray,
-        kv_cache,
-        abs_pos: jnp.ndarray,
-        prefix_mask: jnp.ndarray,
-        rng: jax.Array,
-        rea_buf: jnp.ndarray,
-        rea_m: jnp.ndarray,
-        *,
-        mr: int,
-        temperature: float,
-    ):
-        """``jax.lax.scan`` over reasoning decode with fixed-shape key mask ``(b, L+mr)``."""
-        b = prefix_mask.shape[0]
-        L = prefix_mask.shape[1]
-        big_k = jnp.concatenate([prefix_mask, jnp.zeros((b, mr), dtype=jnp.bool_)], axis=1)
-
-        def step(carry, j):
-            h_in, kv, absp, bk, rbuf, rm, rng_cur = carry
-            logits = self.PaliGemma.llm(h_in, method="decode_logits")[:, 0, :]
-            temp_gt0 = jnp.asarray(temperature, dtype=jnp.float32) > jnp.float32(0.0)
-
-            def _sample_tok(logits_rng):
-                logits_, rng_in = logits_rng
-                rng_a, rng_b = jax.random.split(rng_in)
-                tok_ = jax.random.categorical(
-                    rng_a, logits_ / jnp.maximum(jnp.asarray(temperature, dtype=logits_.dtype), 1e-6)
-                )
-                return tok_, rng_b
-
-            def _argmax_tok(logits_rng):
-                logits_, rng_in = logits_rng
-                return jnp.argmax(logits_, axis=-1), rng_in
-
-            tok, rng_next = jax.lax.cond(temp_gt0, _sample_tok, _argmax_tok, (logits, rng_cur))
-            rbuf = rbuf.at[:, j].set(tok)
-            rm = rm.at[:, j].set(True)
-            bk = bk.at[:, L + j].set(jnp.asarray(True, dtype=jnp.bool_))
-
-            def _forward(op):
-                tok_, h_, kv_, absp_, bk_ = op
-                emb = self._embed_text_tokens(tok_[:, None])
-                # Mask width must match KV length (L + j + 1), not padded L+mr.
-                attn = bk_[:, None, : L + j + 1]
-                (out, _), kv_new = self.PaliGemma.llm(
-                    [emb, None],
-                    mask=attn,
-                    positions=absp_,
-                    kv_cache=kv_,
-                )
-                assert out is not None
-                return out, kv_new, absp_ + 1
-
-            def _skip_forward(op):
-                _tok, h_, kv_, absp_, _bk = op
-                return h_, kv_, absp_
-
-            is_last = j >= (mr - 1)
-            h_out, kv_out, absp_out = jax.lax.cond(
-                is_last, _skip_forward, _forward, (tok, h_in, kv, absp, bk)
-            )
-            return (h_out, kv_out, absp_out, bk, rbuf, rm, rng_next), None
-
-        init = (h, kv_cache, abs_pos, big_k, rea_buf, rea_m, rng)
-        (h_f, kv_f, absp_f, bk_f, rbuf_f, rm_f, rng_f), _ = jax.lax.scan(step, init, jnp.arange(mr, dtype=jnp.int32))
-        return h_f, kv_f, absp_f, bk_f, rbuf_f, rm_f, rng_f
-
-    @nnx.jit(static_argnames=("mr",))
-    def _sample_cot_replay_scan(
-        self,
-        kv_prompt,
-        prefix_mask: jnp.ndarray,
-        prefix_out_prompt: jnp.ndarray,
-        rea_buf: jnp.ndarray,
-        rea_m: jnp.ndarray,
-        *,
-        mr: int,
-    ):
-        """Replay ``rea_buf`` under ``kv_prompt`` with fixed mask ``(b, L+mr)``."""
-        b = prefix_mask.shape[0]
-        Lpx = prefix_mask.shape[1]
-        abs_pos = jnp.sum(prefix_mask, axis=1, keepdims=True).astype(jnp.int32)
-        h = self._gather_last_valid_hidden(prefix_out_prompt, prefix_mask)
-        kv_cache = kv_prompt
-        big_k = jnp.concatenate([prefix_mask, jnp.zeros((b, mr), dtype=jnp.bool_)], axis=1)
-
-        def step(carry, t):
-            h_in, kv, absp, bk = carry
-            tok = rea_buf[:, t]
-            step_ok = rea_m[:, t]
-            emb = self._embed_text_tokens(tok[:, None])
-            bk = bk.at[:, Lpx + t].set(step_ok)
-            attn = bk[:, None, : Lpx + t + 1]
-            (out, _), kv_new = self.PaliGemma.llm(
-                [emb, None],
-                mask=attn,
-                positions=absp,
-                kv_cache=kv,
-            )
-            assert out is not None
-            h_out = jnp.where(step_ok[:, None, None], out, h_in)
-            return (h_out, kv_new, absp + 1, bk), None
-
-        init = (h, kv_cache, abs_pos, big_k)
-        (h_f, kv_f, absp_f, bk_f), _ = jax.lax.scan(step, init, jnp.arange(mr, dtype=jnp.int32))
-        return h_f, kv_f, absp_f, bk_f
-
-    @nnx.jit(static_argnames=("ms", "temperature"))
-    def _sample_cot_subtask_scan(
-        self,
-        h: jnp.ndarray,
-        kv_cache,
-        abs_pos: jnp.ndarray,
-        key_mask_prefix: jnp.ndarray,
-        rng: jax.Array,
-        sub_buf: jnp.ndarray,
-        sub_m: jnp.ndarray,
-        *,
-        ms: int,
-        temperature: float,
-    ):
-        """Subtask autoregression after replay; fixed mask ``(b, L_mr + ms)``."""
-        b = key_mask_prefix.shape[0]
-        L_mr = key_mask_prefix.shape[1]
-        big_k = jnp.concatenate([key_mask_prefix, jnp.zeros((b, ms), dtype=jnp.bool_)], axis=1)
-
-        def step(carry, i):
-            h_in, kv, absp, bk, sbuf, sm, rng_cur = carry
-            logits = self.PaliGemma.llm(h_in, method="decode_logits")[:, 0, :]
-            temp_gt0 = jnp.asarray(temperature, dtype=jnp.float32) > jnp.float32(0.0)
-
-            def _sample_tok(logits_rng):
-                logits_, rng_in = logits_rng
-                rng_a, rng_b = jax.random.split(rng_in)
-                tok_ = jax.random.categorical(
-                    rng_a, logits_ / jnp.maximum(jnp.asarray(temperature, dtype=logits_.dtype), 1e-6)
-                )
-                return tok_, rng_b
-
-            def _argmax_tok(logits_rng):
-                logits_, rng_in = logits_rng
-                return jnp.argmax(logits_, axis=-1), rng_in
-
-            tok, rng_next = jax.lax.cond(temp_gt0, _sample_tok, _argmax_tok, (logits, rng_cur))
-            sbuf = sbuf.at[:, i].set(tok)
-            sm = sm.at[:, i].set(True)
-            bk = bk.at[:, L_mr + i].set(jnp.asarray(True, dtype=jnp.bool_))
-
-            def _forward(op):
-                tok_, h_, kv_, absp_, bk_ = op
-                emb = self._embed_text_tokens(tok_[:, None])
-                attn = bk_[:, None, : L_mr + i + 1]
-                (out, _), kv_new = self.PaliGemma.llm(
-                    [emb, None],
-                    mask=attn,
-                    positions=absp_,
-                    kv_cache=kv_,
-                )
-                assert out is not None
-                return out, kv_new, absp_ + 1
-
-            def _skip_forward(op):
-                _tok, h_, kv_, absp_, _bk = op
-                return h_, kv_, absp_
-
-            is_last = i >= (ms - 1)
-            h_out, kv_out, absp_out = jax.lax.cond(
-                is_last, _skip_forward, _forward, (tok, h_in, kv, absp, bk)
-            )
-            return (h_out, kv_out, absp_out, bk, sbuf, sm, rng_next), None
-
-        init = (h, kv_cache, abs_pos, big_k, sub_buf, sub_m, rng)
-        (h_f, kv_f, absp_f, bk_f, sbuf_f, sm_f, rng_f), _ = jax.lax.scan(step, init, jnp.arange(ms, dtype=jnp.int32))
-        return h_f, kv_f, absp_f, bk_f, sbuf_f, sm_f, rng_f
-
     def sample_cot(
         self,
         rng: at.KeyArrayLike,
@@ -550,6 +373,7 @@ class Pi0CoT(_model.BaseModel):
         prefix_out_prompt = prefix_out
 
         h = self._gather_last_valid_hidden(prefix_out, prefix_mask)
+        key_mask = prefix_mask
         abs_pos = jnp.sum(prefix_mask, axis=1, keepdims=True).astype(jnp.int32)
 
         rea_buf = jnp.zeros((batch_size, mr), dtype=jnp.int32)
@@ -557,17 +381,30 @@ class Pi0CoT(_model.BaseModel):
         rng_cur = rng
 
         # Generate reasoning (first causal segment after the prompt)
-        h, kv_cache, abs_pos, _, rea_buf, rea_m, rng_cur = self._sample_cot_reasoning_generation_scan(
-            h,
-            kv_prompt,
-            abs_pos,
-            prefix_mask,
-            rng_cur,
-            rea_buf,
-            rea_m,
-            mr=mr,
-            temperature=temperature,
-        )
+        kv_cache = kv_prompt
+        for j in range(mr):
+            logits = self.PaliGemma.llm(h, method="decode_logits")[:, 0, :]
+            if temperature and temperature > 0:
+                rng_cur, step_rng = jax.random.split(rng_cur)
+                tok = jax.random.categorical(step_rng, logits / jnp.maximum(temperature, 1e-6))
+            else:
+                tok = jnp.argmax(logits, axis=-1)
+            rea_buf = rea_buf.at[:, j].set(tok)
+            rea_m = rea_m.at[:, j].set(True)
+            if j == mr - 1:
+                break
+            emb = self._embed_text_tokens(tok[:, None])
+            key_mask = jnp.concatenate([key_mask, jnp.ones((batch_size, 1), dtype=jnp.bool_)], axis=1)
+            attn_mask = key_mask[:, None, :]
+            (out, _), kv_cache = self.PaliGemma.llm(
+                [emb, None],
+                mask=attn_mask,
+                positions=abs_pos,
+                kv_cache=kv_cache,
+            )
+            assert out is not None
+            h = out
+            abs_pos = abs_pos + 1
 
         pos_r = jnp.arange(mr, dtype=jnp.int32)[None, :]
         matches_end_r = (rea_buf == END_OF_REASONING_ID) & rea_m
@@ -590,29 +427,52 @@ class Pi0CoT(_model.BaseModel):
         )
 
         # Replay reasoning + optional <start_of_subtask> from the prompt KV so h / cache match ``rea_buf``.
-        h, kv_cache, abs_pos, key_mask_mr = self._sample_cot_replay_scan(
-            kv_prompt,
-            prefix_mask,
-            prefix_out_prompt,
-            rea_buf,
-            rea_m,
-            mr=mr,
-        )
+        kv_cache = kv_prompt
+        key_mask = prefix_mask
+        abs_pos = jnp.sum(prefix_mask, axis=1, keepdims=True).astype(jnp.int32)
+        h = self._gather_last_valid_hidden(prefix_out_prompt, prefix_mask)
+        for t in range(mr):
+            tok = rea_buf[:, t]
+            step_ok = rea_m[:, t]
+            emb = self._embed_text_tokens(tok[:, None])
+            key_mask = jnp.concatenate([key_mask, step_ok[:, None]], axis=1)
+            attn_mask = key_mask[:, None, :]
+            (out, _), kv_cache = self.PaliGemma.llm(
+                [emb, None],
+                mask=attn_mask,
+                positions=abs_pos,
+                kv_cache=kv_cache,
+            )
+            assert out is not None
+            h = jnp.where(step_ok[:, None, None], out, h)
+            abs_pos = abs_pos + 1
 
         sub_buf = jnp.zeros((batch_size, ms), dtype=jnp.int32)
         sub_m = jnp.zeros((batch_size, ms), dtype=jnp.bool_)
 
-        _, _, _, _, sub_buf, sub_m, _ = self._sample_cot_subtask_scan(
-            h,
-            kv_cache,
-            abs_pos,
-            key_mask_mr,
-            rng_cur,
-            sub_buf,
-            sub_m,
-            ms=ms,
-            temperature=temperature,
-        )
+        for i in range(ms):
+            logits = self.PaliGemma.llm(h, method="decode_logits")[:, 0, :]
+            if temperature and temperature > 0:
+                rng_cur, step_rng = jax.random.split(rng_cur)
+                tok = jax.random.categorical(step_rng, logits / jnp.maximum(temperature, 1e-6))
+            else:
+                tok = jnp.argmax(logits, axis=-1)
+            sub_buf = sub_buf.at[:, i].set(tok)
+            sub_m = sub_m.at[:, i].set(True)
+            if i == ms - 1:
+                break
+            emb = self._embed_text_tokens(tok[:, None])
+            key_mask = jnp.concatenate([key_mask, jnp.ones((batch_size, 1), dtype=jnp.bool_)], axis=1)
+            attn_mask = key_mask[:, None, :]
+            (out, _), kv_cache = self.PaliGemma.llm(
+                [emb, None],
+                mask=attn_mask,
+                positions=abs_pos,
+                kv_cache=kv_cache,
+            )
+            assert out is not None
+            h = out
+            abs_pos = abs_pos + 1
 
         return {
             "tokenized_subtask": sub_buf,
