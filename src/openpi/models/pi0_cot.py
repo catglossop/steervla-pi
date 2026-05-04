@@ -481,6 +481,40 @@ class Pi0CoT(_model.BaseModel):
             "tokenized_reasoning_mask": rea_m,
         }
 
+    @nnx.jit
+    def _denoise_flow_step(
+        self,
+        observation: _model.Observation,
+        kv_cache,
+        prefix_mask: jnp.ndarray,
+        prefix_mask_no_reasoning: jnp.ndarray,
+        dt: jnp.ndarray,
+        x_t: jnp.ndarray,
+        t: jnp.ndarray,
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        """Single flow-matching step (suffix forward under frozen prefix ``kv_cache``)."""
+        b = observation.state.shape[0]
+        t_b = jnp.broadcast_to(t, (b,))
+        suffix_tokens, suffix_mask, suffix_ar_list, adarms_cond = self._embed_action_suffix(
+            observation, x_t, t_b
+        )
+        suffix_ar = jnp.array(suffix_ar_list)
+        suffix_attn_mask = pi0.make_attn_mask(suffix_mask, suffix_ar)
+        action_to_prefix = einops.repeat(
+            prefix_mask_no_reasoning, "b p -> b s p", s=suffix_tokens.shape[1]
+        )
+        full_attn_mask = jnp.concatenate([action_to_prefix, suffix_attn_mask], axis=-1)
+        positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+        (_, suffix_out), _ = self.PaliGemma.llm(
+            [None, suffix_tokens],
+            mask=full_attn_mask,
+            positions=positions,
+            kv_cache=kv_cache,
+            adarms_cond=[None, adarms_cond],
+        )
+        v_t = self.action_out_proj(suffix_out[:, -self.action_horizon:])
+        return x_t + dt * v_t, t + dt
+
     @override
     def sample_actions(
         self,
@@ -491,11 +525,16 @@ class Pi0CoT(_model.BaseModel):
         noise: at.Float[at.Array, "b ah ad"] | None = None,
         image_keys: Sequence[str] | None = None,
         low_memory_denoise: bool = False,
+        jit_denoise_steps: bool = False,
     ) -> _model.Actions:
         """Flow-match denoise from prefix KV + action suffix.
 
-        Set ``low_memory_denoise=True`` only when **not** wrapping this call in ``nnx.jit`` so
-        denoising runs as ``num_steps`` separate forwards (lower peak VRAM, higher latency).
+        ``jit_denoise_steps``: Python loop over ``num_steps``, each iteration calling this
+        module's jitted :meth:`_denoise_flow_step` (separate XLA program per step; usually
+        between fused ``while_loop`` and fully eager in peak VRAM and speed).
+
+        ``low_memory_denoise``: fully eager Python loop (no per-step ``nnx.jit``). Do not wrap
+        the whole :meth:`sample_actions` in ``nnx.jit`` when using either loop mode.
         """
         keys = tuple(image_keys) if image_keys is not None else self._preprocess_image_keys
         observation = _model.preprocess_observation(None, observation, train=False, image_keys=keys)
@@ -548,7 +587,7 @@ class Pi0CoT(_model.BaseModel):
         def step(carry):
             x_t, t = carry
             suffix_tokens, suffix_mask, suffix_ar_list, adarms_cond = self._embed_action_suffix(
-                observation, x_t, jnp.broadcast_to(t, batch_size)
+                observation, x_t, jnp.broadcast_to(t, (batch_size,))
             )
             suffix_ar = jnp.array(suffix_ar_list)
             suffix_attn_mask = pi0.make_attn_mask(suffix_mask, suffix_ar)
@@ -571,8 +610,17 @@ class Pi0CoT(_model.BaseModel):
             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon:])
             return x_t + dt * v_t, t + dt
 
-        if low_memory_denoise:
-            t0 = jnp.asarray(1.0, dtype=noise.dtype)
+        dt_arr = jnp.asarray(dt, dtype=noise.dtype)
+        t0 = jnp.asarray(1.0, dtype=noise.dtype)
+
+        if jit_denoise_steps:
+            x_cur, t_cur = noise, t0
+            for _ in range(n_steps_i):
+                x_cur, t_cur = self._denoise_flow_step(
+                    observation, kv_cache, prefix_mask, prefix_mask_no_reasoning, dt_arr, x_cur, t_cur
+                )
+            x_0 = x_cur
+        elif low_memory_denoise:
             carry = (noise, t0)
             for _ in range(n_steps_i):
                 carry = step(carry)
@@ -583,5 +631,5 @@ class Pi0CoT(_model.BaseModel):
                 _, t = carry
                 return t >= -dt / 2
 
-            x_0, _ = jax.lax.while_loop(cond, step, (noise, jnp.asarray(1.0, dtype=noise.dtype)))
+            x_0, _ = jax.lax.while_loop(cond, step, (noise, t0))
         return x_0

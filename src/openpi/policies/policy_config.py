@@ -19,6 +19,7 @@ def create_trained_policy(
     *,
     repack_transforms: transforms.Group | None = None,
     sample_kwargs: dict[str, Any] | None = None,
+    cot_sample_kwargs: dict[str, Any] | None = None,
     default_prompt: str | None = None,
     norm_stats: dict[str, transforms.NormStats] | None = None,
     pytorch_device: str | None = None,
@@ -31,6 +32,8 @@ def create_trained_policy(
         repack_transforms: Optional transforms that will be applied before any other transforms.
         sample_kwargs: The kwargs to pass to the `sample_actions` method. If not provided, the default
             kwargs will be used.
+        cot_sample_kwargs: Kwargs for :meth:`openpi.policies.policy.Policy.infer_with_cot` (passed to
+            ``model.sample_cot``), e.g. ``temperature`` or ``image_keys``.
         default_prompt: The default prompt to use for the policy. Will inject the prompt into the input
             data if it doesn't already exist.
         norm_stats: The norm stats to use for the policy. If not provided, the norm stats will be loaded
@@ -88,6 +91,7 @@ def create_trained_policy(
             *repack_transforms.outputs,
         ],
         sample_kwargs=sample_kwargs,
+        cot_sample_kwargs=cot_sample_kwargs,
         metadata=train_config.policy_metadata,
         is_pytorch=is_pytorch,
         pytorch_device=pytorch_device if is_pytorch else None,
