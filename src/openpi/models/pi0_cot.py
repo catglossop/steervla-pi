@@ -490,7 +490,13 @@ class Pi0CoT(_model.BaseModel):
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
         image_keys: Sequence[str] | None = None,
+        low_memory_denoise: bool = False,
     ) -> _model.Actions:
+        """Flow-match denoise from prefix KV + action suffix.
+
+        Set ``low_memory_denoise=True`` only when **not** wrapping this call in ``nnx.jit`` so
+        denoising runs as ``num_steps`` separate forwards (lower peak VRAM, higher latency).
+        """
         keys = tuple(image_keys) if image_keys is not None else self._preprocess_image_keys
         observation = _model.preprocess_observation(None, observation, train=False, image_keys=keys)
         batch_size = observation.state.shape[0]
@@ -526,7 +532,8 @@ class Pi0CoT(_model.BaseModel):
         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
         # --- Denoising loop ---
-        dt = -1.0 / num_steps
+        n_steps_i = int(num_steps)
+        dt = -1.0 / float(n_steps_i)
         if noise is None:
             noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
 
@@ -564,9 +571,17 @@ class Pi0CoT(_model.BaseModel):
             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon:])
             return x_t + dt * v_t, t + dt
 
-        def cond(carry):
-            _, t = carry
-            return t >= -dt / 2
+        if low_memory_denoise:
+            t0 = jnp.asarray(1.0, dtype=noise.dtype)
+            carry = (noise, t0)
+            for _ in range(n_steps_i):
+                carry = step(carry)
+            x_0, _ = carry
+        else:
 
-        x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
+            def cond(carry):
+                _, t = carry
+                return t >= -dt / 2
+
+            x_0, _ = jax.lax.while_loop(cond, step, (noise, jnp.asarray(1.0, dtype=noise.dtype)))
         return x_0
