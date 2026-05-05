@@ -143,6 +143,13 @@ class Pi0CoTConfig(_model.BaseModelConfig):
     # (skip wrist streams). ``None`` means use all :data:`openpi.models.model.IMAGE_KEYS`.
     inference_image_keys: tuple[str, ...] | None = None
 
+    # Optional shorter autoregressive caps for :meth:`Pi0CoT.sample_cot` only (faster inference).
+    # Resolution: ``sample_cot(max_reasoning_len=...)`` kwargs, then these fields, then
+    # ``max_reasoning_len`` / ``max_subtask_len``. Use ``None`` for either field to fall through
+    # to the next source (ending at the training maxima).
+    inference_max_reasoning_len: int | None = 48
+    inference_max_subtask_len: int | None = 24
+
     pytorch_compile_mode: str | None = "max-autotune"
 
     @property

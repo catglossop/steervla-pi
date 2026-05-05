@@ -80,6 +80,8 @@ class Pi0CoT(_model.BaseModel):
 
         self.max_subtask_len = config.max_subtask_len
         self.max_reasoning_len = config.max_reasoning_len
+        self._inference_max_reasoning_len = config.inference_max_reasoning_len
+        self._inference_max_subtask_len = config.inference_max_subtask_len
         self._preprocess_image_keys: tuple[str, ...] = (
             tuple(config.inference_image_keys)
             if config.inference_image_keys is not None
@@ -342,6 +344,10 @@ class Pi0CoT(_model.BaseModel):
         or ``END_OF_SUBTASK_ID`` (subtask), instead of always running ``max_reasoning_len`` /
         ``max_subtask_len`` steps. Replay skips trailing slots with mask false.
 
+        Length caps (``mr`` / ``ms``): optional kwargs ``max_reasoning_len`` / ``max_subtask_len``,
+        else :attr:`Pi0CoTConfig.inference_max_reasoning_len` / ``inference_max_subtask_len``, else
+        model ``max_reasoning_len`` / ``max_subtask_len``. Values are clamped to the model maxima.
+
         Args:
             image_keys: Subset of camera keys to resize/embed. If ``None``, uses
                 ``Pi0CoTConfig.inference_image_keys`` when set, else all ``IMAGE_KEYS``.
@@ -359,8 +365,25 @@ class Pi0CoT(_model.BaseModel):
             raise ValueError("sample_cot requires tokenized_prompt and tokenized_prompt_mask")
 
         batch_size = observation.state.shape[0]
-        ms = max_subtask_len if max_subtask_len is not None else self.max_subtask_len
-        mr = max_reasoning_len if max_reasoning_len is not None else self.max_reasoning_len
+
+        def _cap_mr() -> int:
+            v = max_reasoning_len
+            if v is None:
+                v = self._inference_max_reasoning_len
+            if v is None:
+                v = self.max_reasoning_len
+            return min(int(v), int(self.max_reasoning_len))
+
+        def _cap_ms() -> int:
+            v = max_subtask_len
+            if v is None:
+                v = self._inference_max_subtask_len
+            if v is None:
+                v = self.max_subtask_len
+            return min(int(v), int(self.max_subtask_len))
+
+        mr = _cap_mr()
+        ms = _cap_ms()
 
         _do_time = timing or timing_per_step
         _step_detail = timing_per_step
