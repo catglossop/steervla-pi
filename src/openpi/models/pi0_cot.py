@@ -334,6 +334,10 @@ class Pi0CoT(_model.BaseModel):
         Returns token ID buffers and boolean masks (True = generated timestep), same layout
         as training keys ``tokenized_subtask*`` / ``tokenized_reasoning*``.
 
+        Generation stops early when every batch row has emitted ``END_OF_REASONING_ID`` (reasoning)
+        or ``END_OF_SUBTASK_ID`` (subtask), instead of always running ``max_reasoning_len`` /
+        ``max_subtask_len`` steps. Replay skips trailing slots with mask false.
+
         Args:
             image_keys: Subset of camera keys to resize/embed. If ``None``, uses
                 ``Pi0CoTConfig.inference_image_keys`` when set, else all ``IMAGE_KEYS``.
@@ -391,6 +395,13 @@ class Pi0CoT(_model.BaseModel):
                 tok = jnp.argmax(logits, axis=-1)
             rea_buf = rea_buf.at[:, j].set(tok)
             rea_m = rea_m.at[:, j].set(True)
+            # Early exit once each row has produced ``<end_of_reasoning>`` (no extra decode forwards).
+            if bool(
+                jnp.all(
+                    jnp.any((rea_buf[:, : j + 1] == END_OF_REASONING_ID) & rea_m[:, : j + 1], axis=1)
+                )
+            ):
+                break
             if j == mr - 1:
                 break
             emb = self._embed_text_tokens(tok[:, None])
@@ -432,6 +443,8 @@ class Pi0CoT(_model.BaseModel):
         abs_pos = jnp.sum(prefix_mask, axis=1, keepdims=True).astype(jnp.int32)
         h = self._gather_last_valid_hidden(prefix_out_prompt, prefix_mask)
         for t in range(mr):
+            if not bool(jnp.any(rea_m[:, t])):
+                break
             tok = rea_buf[:, t]
             step_ok = rea_m[:, t]
             emb = self._embed_text_tokens(tok[:, None])
@@ -459,6 +472,12 @@ class Pi0CoT(_model.BaseModel):
                 tok = jnp.argmax(logits, axis=-1)
             sub_buf = sub_buf.at[:, i].set(tok)
             sub_m = sub_m.at[:, i].set(True)
+            if bool(
+                jnp.all(
+                    jnp.any((sub_buf[:, : i + 1] == END_OF_SUBTASK_ID) & sub_m[:, : i + 1], axis=1)
+                )
+            ):
+                break
             if i == ms - 1:
                 break
             emb = self._embed_text_tokens(tok[:, None])
