@@ -40,6 +40,11 @@ import openpi.training.sharding as sharding
 
 PALIGEMMA_VOCAB_SIZE = 257_152
 
+# Chunk size for greedy vocab projection in :meth:`Embedder.decode_argmax_chunked`.
+# Avoids materializing a full ``(..., PALIGEMMA_VOCAB_SIZE)`` logits tensor (saves peak VRAM).
+# Smaller chunks lower peak (logits + cuBLAS workspace) at the cost of more matmul steps.
+_DECODE_ARGMAX_VOCAB_CHUNK = 4096
+
 
 @dataclasses.dataclass
 class Config:
@@ -152,6 +157,36 @@ class Embedder(nn.Module):
 
     def decode(self, x):
         return jnp.dot(x, self.input_embedding_table.T)
+
+    def decode_argmax_chunked(self, x):
+        """Argmax token ids over the vocabulary without a full ``(vocab,)`` logits vector.
+
+        ``decode`` uses ``jnp.dot(x, table.T)``, which forces a large output and often a large
+        cuBLAS workspace (~hundreds of MiB). For greedy decoding (``temperature == 0``), only
+        the winning index matters; this path reduces peak memory at the cost of extra matmuls.
+        """
+        table = self.input_embedding_table
+        v = int(self.vocab_size)
+        chunk = _DECODE_ARGMAX_VOCAB_CHUNK
+        orig_shape = x.shape
+        d = orig_shape[-1]
+        x_flat = jnp.reshape(x, (-1, d))
+        n = x_flat.shape[0]
+        best_score = jnp.full((n,), -jnp.inf, dtype=jnp.float32)
+        best_idx = jnp.zeros((n,), dtype=jnp.int32)
+        num_chunks = (v + chunk - 1) // chunk
+        for i in range(num_chunks):
+            start = i * chunk
+            end = min(start + chunk, v)
+            subt = table[start:end]
+            # Keep matmul dtype (usually bf16); avoid a full float32 (n, chunk) logits tensor.
+            logits = jnp.dot(x_flat, subt.T)
+            local_max = jnp.max(logits, axis=-1).astype(jnp.float32)
+            local_idx = jnp.argmax(logits, axis=-1).astype(jnp.int32) + start
+            better = local_max > best_score
+            best_score = jnp.where(better, local_max, best_score)
+            best_idx = jnp.where(better, local_idx, best_idx)
+        return jnp.reshape(best_idx, orig_shape[:-1])
 
 
 @at.typecheck
@@ -460,6 +495,11 @@ class Module(nn.Module):
     def decode_logits(self, tokens: at.Float[at.Array, "b t d"]) -> at.Float[at.Array, "b t v"]:
         """Vocabulary logits from hidden states (for CE training). `decode` returns argmax ids only."""
         return self.embedder.decode(tokens).astype(jnp.float32)
+
+    @at.typecheck
+    def decode_argmax_chunked(self, tokens: at.Float[at.Array, "b t d"]) -> at.Int[at.Array, "b t"]:
+        """Greedy ids via chunked projection; see :meth:`Embedder.decode_argmax_chunked`."""
+        return self.embedder.decode_argmax_chunked(tokens).astype(jnp.int32)
 
     @at.typecheck
     def decode(self, tokens: at.Float[at.Array, "b t d"]) -> at.Int[at.Array, "b t"]:

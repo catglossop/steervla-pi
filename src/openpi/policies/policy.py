@@ -146,8 +146,10 @@ class Policy(BasePolicy):
 
         observation = _model.Observation.from_dict(inputs)
         cot_kwargs = dict(self._cot_sample_kwargs)
+        print(f"Sampling cot with kwargs: {cot_kwargs}")
 
         t_cot = time.monotonic()
+        print(f"Sampling cot...")
         cot_out = self._sample_cot(rng_cot, observation, **cot_kwargs)
         cot_ms = (time.monotonic() - t_cot) * 1000
 
@@ -159,6 +161,7 @@ class Policy(BasePolicy):
         )
 
         t_act = time.monotonic()
+        print(f"Sampling actions...")
         actions = self._sample_actions(rng_act, observation, **sample_kwargs)
         act_ms = (time.monotonic() - t_act) * 1000
 

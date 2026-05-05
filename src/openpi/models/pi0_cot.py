@@ -322,6 +322,11 @@ class Pi0CoT(_model.BaseModel):
         return self.PaliGemma.llm(h, method="decode_logits")[:, 0, :]
 
     @nnx.jit
+    def _cot_decode_argmax_row(self, h: jnp.ndarray) -> jnp.ndarray:
+        """Greedy next-token ids without full ``(vocab,)`` logits (lower peak VRAM than ``decode_logits``)."""
+        return self.PaliGemma.llm(h, method="decode_argmax_chunked")[:, 0]
+
+    @nnx.jit
     def _cot_forward_one_token(
         self,
         tok: jnp.ndarray,
@@ -476,15 +481,16 @@ class Pi0CoT(_model.BaseModel):
         kv_cache = kv_prompt
         for j in range(mr):
             t_l0 = time.perf_counter()
-            logits = self._cot_decode_logits_row(h)
-            logits = _maybe_sync(logits)
-            sum_r_logits_ms += (time.perf_counter() - t_l0) * 1000.0
-
             if temperature and temperature > 0:
+                logits = self._cot_decode_logits_row(h)
+                logits = _maybe_sync(logits)
                 rng_cur, step_rng = jax.random.split(rng_cur)
                 tok = jax.random.categorical(step_rng, logits / jnp.maximum(temperature, 1e-6))
             else:
-                tok = jnp.argmax(logits, axis=-1)
+                tok = self._cot_decode_argmax_row(h)
+                tok = _maybe_sync(tok)
+            sum_r_logits_ms += (time.perf_counter() - t_l0) * 1000.0
+
             rea_buf = rea_buf.at[:, j].set(tok)
             rea_m = rea_m.at[:, j].set(True)
 
@@ -595,15 +601,16 @@ class Pi0CoT(_model.BaseModel):
         n_s_fwd = 0
         for i in range(ms):
             t_l0 = time.perf_counter()
-            logits = self._cot_decode_logits_row(h)
-            logits = _maybe_sync(logits)
-            sum_s_logits_ms += (time.perf_counter() - t_l0) * 1000.0
-
             if temperature and temperature > 0:
+                logits = self._cot_decode_logits_row(h)
+                logits = _maybe_sync(logits)
                 rng_cur, step_rng = jax.random.split(rng_cur)
                 tok = jax.random.categorical(step_rng, logits / jnp.maximum(temperature, 1e-6))
             else:
-                tok = jnp.argmax(logits, axis=-1)
+                tok = self._cot_decode_argmax_row(h)
+                tok = _maybe_sync(tok)
+            sum_s_logits_ms += (time.perf_counter() - t_l0) * 1000.0
+
             sub_buf = sub_buf.at[:, i].set(tok)
             sub_m = sub_m.at[:, i].set(True)
 
