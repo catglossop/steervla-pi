@@ -30,6 +30,7 @@ from openpi.models import pi0_config
 import openpi.models.gemma as _gemma
 import openpi.models.siglip as _siglip
 from openpi.shared import array_typing as at
+from openpi.shared import nnx_utils
 
 logger = logging.getLogger("openpi")
 
@@ -80,8 +81,6 @@ class Pi0CoT(_model.BaseModel):
 
         self.max_subtask_len = config.max_subtask_len
         self.max_reasoning_len = config.max_reasoning_len
-        self._inference_max_reasoning_len = config.inference_max_reasoning_len
-        self._inference_max_subtask_len = config.inference_max_subtask_len
         self._preprocess_image_keys: tuple[str, ...] = (
             tuple(config.inference_image_keys)
             if config.inference_image_keys is not None
@@ -89,6 +88,11 @@ class Pi0CoT(_model.BaseModel):
         )
 
         self.deterministic = True
+
+        # ``module_jit`` one-token / decode_logits steps for ``sample_cot`` (separate XLA entry per call).
+        self._jit_cot_decode_logits = nnx_utils.module_jit(self._cot_decode_logits_row)
+        self._jit_cot_forward_one = nnx_utils.module_jit(self._cot_forward_one_token)
+        self._jit_cot_replay_one = nnx_utils.module_jit(self._cot_replay_one_token)
 
     # ------------------------------------------------------------------
     # Embedding helpers
@@ -316,6 +320,50 @@ class Pi0CoT(_model.BaseModel):
         return -jnp.sum(masked, axis=-1) / jnp.clip(jnp.sum(mask, axis=-1), 1.0)
 
     # ------------------------------------------------------------------
+    # Inference helpers: module_jit single-step kernels for sample_cot
+    # ------------------------------------------------------------------
+
+    def _cot_decode_logits_row(self, h: jnp.ndarray) -> jnp.ndarray:
+        return self.PaliGemma.llm(h, method="decode_logits")[:, 0, :]
+
+    def _cot_forward_one_token(
+        self,
+        tok: jnp.ndarray,
+        kv_cache,
+        abs_pos: jnp.ndarray,
+        attn_mask: jnp.ndarray,
+    ):
+        emb = self._embed_text_tokens(tok[:, None])
+        (out, _), kv_new = self.PaliGemma.llm(
+            [emb, None],
+            mask=attn_mask,
+            positions=abs_pos,
+            kv_cache=kv_cache,
+        )
+        assert out is not None
+        return out, kv_new, abs_pos + 1
+
+    def _cot_replay_one_token(
+        self,
+        tok: jnp.ndarray,
+        h: jnp.ndarray,
+        kv_cache,
+        abs_pos: jnp.ndarray,
+        attn_mask: jnp.ndarray,
+        step_ok: jnp.ndarray,
+    ):
+        emb = self._embed_text_tokens(tok[:, None])
+        (out, _), kv_new = self.PaliGemma.llm(
+            [emb, None],
+            mask=attn_mask,
+            positions=abs_pos,
+            kv_cache=kv_cache,
+        )
+        assert out is not None
+        h_new = jnp.where(step_ok[:, None, None], out, h)
+        return h_new, kv_new, abs_pos + 1
+
+    # ------------------------------------------------------------------
     # Inference: sample_cot (autoregressive CoT, prompt-only conditioning)
     # ------------------------------------------------------------------
 
@@ -344,9 +392,8 @@ class Pi0CoT(_model.BaseModel):
         or ``END_OF_SUBTASK_ID`` (subtask), instead of always running ``max_reasoning_len`` /
         ``max_subtask_len`` steps. Replay skips trailing slots with mask false.
 
-        Length caps (``mr`` / ``ms``): optional kwargs ``max_reasoning_len`` / ``max_subtask_len``,
-        else :attr:`Pi0CoTConfig.inference_max_reasoning_len` / ``inference_max_subtask_len``, else
-        model ``max_reasoning_len`` / ``max_subtask_len``. Values are clamped to the model maxima.
+        ``decode_logits`` and single-token forwards use :func:`openpi.shared.nnx_utils.module_jit`
+        wrappers (initialized in ``__init__``) so each step is a compiled XLA call.
 
         Args:
             image_keys: Subset of camera keys to resize/embed. If ``None``, uses
@@ -365,25 +412,8 @@ class Pi0CoT(_model.BaseModel):
             raise ValueError("sample_cot requires tokenized_prompt and tokenized_prompt_mask")
 
         batch_size = observation.state.shape[0]
-
-        def _cap_mr() -> int:
-            v = max_reasoning_len
-            if v is None:
-                v = self._inference_max_reasoning_len
-            if v is None:
-                v = self.max_reasoning_len
-            return min(int(v), int(self.max_reasoning_len))
-
-        def _cap_ms() -> int:
-            v = max_subtask_len
-            if v is None:
-                v = self._inference_max_subtask_len
-            if v is None:
-                v = self.max_subtask_len
-            return min(int(v), int(self.max_subtask_len))
-
-        mr = _cap_mr()
-        ms = _cap_ms()
+        ms = max_subtask_len if max_subtask_len is not None else self.max_subtask_len
+        mr = max_reasoning_len if max_reasoning_len is not None else self.max_reasoning_len
 
         _do_time = timing or timing_per_step
         _step_detail = timing_per_step
@@ -448,7 +478,7 @@ class Pi0CoT(_model.BaseModel):
         kv_cache = kv_prompt
         for j in range(mr):
             t_l0 = time.perf_counter()
-            logits = self.PaliGemma.llm(h, method="decode_logits")[:, 0, :]
+            logits = self._jit_cot_decode_logits(h)
             logits = _maybe_sync(logits)
             sum_r_logits_ms += (time.perf_counter() - t_l0) * 1000.0
 
@@ -478,16 +508,9 @@ class Pi0CoT(_model.BaseModel):
             if j == mr - 1:
                 break
             t_f0 = time.perf_counter()
-            emb = self._embed_text_tokens(tok[:, None])
             key_mask = jnp.concatenate([key_mask, jnp.ones((batch_size, 1), dtype=jnp.bool_)], axis=1)
             attn_mask = key_mask[:, None, :]
-            (out, _), kv_cache = self.PaliGemma.llm(
-                [emb, None],
-                mask=attn_mask,
-                positions=abs_pos,
-                kv_cache=kv_cache,
-            )
-            assert out is not None
+            out, kv_cache, abs_pos = self._jit_cot_forward_one(tok, kv_cache, abs_pos, attn_mask)
             out = _maybe_sync(out)
             fwd_ms = (time.perf_counter() - t_f0) * 1000.0
             sum_r_fwd_ms += fwd_ms
@@ -498,7 +521,6 @@ class Pi0CoT(_model.BaseModel):
                     flush=True,
                 )
             h = out
-            abs_pos = abs_pos + 1
 
         reasoning_gen_wall_ms = (time.perf_counter() - t_rg0) * 1000.0
         if _do_time:
@@ -543,17 +565,12 @@ class Pi0CoT(_model.BaseModel):
             tok = rea_buf[:, t]
             step_ok = rea_m[:, t]
             t_f0 = time.perf_counter()
-            emb = self._embed_text_tokens(tok[:, None])
             key_mask = jnp.concatenate([key_mask, step_ok[:, None]], axis=1)
             attn_mask = key_mask[:, None, :]
-            (out, _), kv_cache = self.PaliGemma.llm(
-                [emb, None],
-                mask=attn_mask,
-                positions=abs_pos,
-                kv_cache=kv_cache,
+            h, kv_cache, abs_pos = self._jit_cot_replay_one(
+                tok, h, kv_cache, abs_pos, attn_mask, step_ok
             )
-            assert out is not None
-            out = _maybe_sync(out)
+            _maybe_sync(h)
             fwd_ms = (time.perf_counter() - t_f0) * 1000.0
             sum_rep_fwd_ms += fwd_ms
             n_rep += 1
@@ -562,8 +579,6 @@ class Pi0CoT(_model.BaseModel):
                     f"[Pi0CoT.sample_cot timing] replay t={t} transformer_fwd_ms={fwd_ms:.2f}",
                     flush=True,
                 )
-            h = jnp.where(step_ok[:, None, None], out, h)
-            abs_pos = abs_pos + 1
 
         replay_wall_ms = (time.perf_counter() - t_rep0) * 1000.0
         if _do_time:
@@ -582,7 +597,7 @@ class Pi0CoT(_model.BaseModel):
         n_s_fwd = 0
         for i in range(ms):
             t_l0 = time.perf_counter()
-            logits = self.PaliGemma.llm(h, method="decode_logits")[:, 0, :]
+            logits = self._jit_cot_decode_logits(h)
             logits = _maybe_sync(logits)
             sum_s_logits_ms += (time.perf_counter() - t_l0) * 1000.0
 
@@ -611,16 +626,9 @@ class Pi0CoT(_model.BaseModel):
             if i == ms - 1:
                 break
             t_f0 = time.perf_counter()
-            emb = self._embed_text_tokens(tok[:, None])
             key_mask = jnp.concatenate([key_mask, jnp.ones((batch_size, 1), dtype=jnp.bool_)], axis=1)
             attn_mask = key_mask[:, None, :]
-            (out, _), kv_cache = self.PaliGemma.llm(
-                [emb, None],
-                mask=attn_mask,
-                positions=abs_pos,
-                kv_cache=kv_cache,
-            )
-            assert out is not None
+            out, kv_cache, abs_pos = self._jit_cot_forward_one(tok, kv_cache, abs_pos, attn_mask)
             out = _maybe_sync(out)
             fwd_ms = (time.perf_counter() - t_f0) * 1000.0
             sum_s_fwd_ms += fwd_ms
@@ -631,7 +639,6 @@ class Pi0CoT(_model.BaseModel):
                     flush=True,
                 )
             h = out
-            abs_pos = abs_pos + 1
 
         subtask_gen_wall_ms = (time.perf_counter() - t_sg0) * 1000.0
         if _do_time:
