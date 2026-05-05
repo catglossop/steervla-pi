@@ -143,6 +143,12 @@ class Pi0CoTConfig(_model.BaseModelConfig):
     # (skip wrist streams). ``None`` means use all :data:`openpi.models.model.IMAGE_KEYS`.
     inference_image_keys: tuple[str, ...] | None = None
 
+    # CoT autoregressive single-step kernels in :meth:`Pi0CoT.sample_cot` use ``nnx.jit`` by
+    # default. Set ``False`` independently for vocab decode vs transformer forwards to trade
+    # speed for lower peak device memory on some backends (e.g. TPU inference).
+    cot_jit_decode: bool = True
+    cot_jit_transformer_forward: bool = True
+
     pytorch_compile_mode: str | None = "max-autotune"
 
     @property

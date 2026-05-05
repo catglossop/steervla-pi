@@ -85,6 +85,8 @@ class Pi0CoT(_model.BaseModel):
             if config.inference_image_keys is not None
             else tuple(_model.IMAGE_KEYS)
         )
+        self._cot_jit_decode = bool(config.cot_jit_decode)
+        self._cot_jit_transformer_forward = bool(config.cot_jit_transformer_forward)
 
         self.deterministic = True
 
@@ -314,20 +316,31 @@ class Pi0CoT(_model.BaseModel):
         return -jnp.sum(masked, axis=-1) / jnp.clip(jnp.sum(mask, axis=-1), 1.0)
 
     # ------------------------------------------------------------------
-    # Inference helpers: nnx.jit single-step kernels for sample_cot
+    # Inference helpers: optional nnx.jit single-step kernels for sample_cot
     # ------------------------------------------------------------------
 
     @nnx.jit
-    def _cot_decode_logits_row(self, h: jnp.ndarray) -> jnp.ndarray:
+    def _cot_decode_logits_row_jit(self, h: jnp.ndarray) -> jnp.ndarray:
         return self.PaliGemma.llm(h, method="decode_logits")[:, 0, :]
 
     @nnx.jit
+    def _cot_decode_argmax_row_jit(self, h: jnp.ndarray) -> jnp.ndarray:
+        """Greedy ids via chunked projection (same as eager path)."""
+        return self.PaliGemma.llm(h, method="decode_argmax_chunked")[:, 0]
+
+    def _cot_decode_logits_row(self, h: jnp.ndarray) -> jnp.ndarray:
+        if self._cot_jit_decode:
+            return self._cot_decode_logits_row_jit(h)
+        return self.PaliGemma.llm(h, method="decode_logits")[:, 0, :]
+
     def _cot_decode_argmax_row(self, h: jnp.ndarray) -> jnp.ndarray:
         """Greedy next-token ids without full ``(vocab,)`` logits (lower peak VRAM than ``decode_logits``)."""
+        if self._cot_jit_decode:
+            return self._cot_decode_argmax_row_jit(h)
         return self.PaliGemma.llm(h, method="decode_argmax_chunked")[:, 0]
 
     @nnx.jit
-    def _cot_forward_one_token(
+    def _cot_forward_one_token_jit(
         self,
         tok: jnp.ndarray,
         kv_cache,
@@ -344,7 +357,46 @@ class Pi0CoT(_model.BaseModel):
         assert out is not None
         return out, kv_new, abs_pos + 1
 
+    def _cot_forward_one_token(
+        self,
+        tok: jnp.ndarray,
+        kv_cache,
+        abs_pos: jnp.ndarray,
+        attn_mask: jnp.ndarray,
+    ):
+        if self._cot_jit_transformer_forward:
+            return self._cot_forward_one_token_jit(tok, kv_cache, abs_pos, attn_mask)
+        emb = self._embed_text_tokens(tok[:, None])
+        (out, _), kv_new = self.PaliGemma.llm(
+            [emb, None],
+            mask=attn_mask,
+            positions=abs_pos,
+            kv_cache=kv_cache,
+        )
+        assert out is not None
+        return out, kv_new, abs_pos + 1
+
     @nnx.jit
+    def _cot_replay_one_token_jit(
+        self,
+        tok: jnp.ndarray,
+        h: jnp.ndarray,
+        kv_cache,
+        abs_pos: jnp.ndarray,
+        attn_mask: jnp.ndarray,
+        step_ok: jnp.ndarray,
+    ):
+        emb = self._embed_text_tokens(tok[:, None])
+        (out, _), kv_new = self.PaliGemma.llm(
+            [emb, None],
+            mask=attn_mask,
+            positions=abs_pos,
+            kv_cache=kv_cache,
+        )
+        assert out is not None
+        h_new = jnp.where(step_ok[:, None, None], out, h)
+        return h_new, kv_new, abs_pos + 1
+
     def _cot_replay_one_token(
         self,
         tok: jnp.ndarray,
@@ -354,6 +406,8 @@ class Pi0CoT(_model.BaseModel):
         attn_mask: jnp.ndarray,
         step_ok: jnp.ndarray,
     ):
+        if self._cot_jit_transformer_forward:
+            return self._cot_replay_one_token_jit(tok, h, kv_cache, abs_pos, attn_mask, step_ok)
         emb = self._embed_text_tokens(tok[:, None])
         (out, _), kv_new = self.PaliGemma.llm(
             [emb, None],
@@ -394,9 +448,11 @@ class Pi0CoT(_model.BaseModel):
         or ``END_OF_SUBTASK_ID`` (subtask), instead of always running ``max_reasoning_len`` /
         ``max_subtask_len`` steps. Replay skips trailing slots with mask false.
 
-        ``decode_logits`` and single-token forwards use :func:`flax.nnx.jit` on helper methods so
-        each step is a compiled call with **current** module weights (checkpoint loads after
-        ``__init__``; do not use ``module_jit`` here — it would freeze pre-restore state).
+        ``decode_logits`` / argmax helpers and single-token transformer forwards optionally use
+        :func:`flax.nnx.jit` per-step (defaults on); see ``Pi0CoTConfig.cot_jit_decode`` and
+        ``cot_jit_transformer_forward``. Jitted kernels use **current** module weights after
+        checkpoint restore (do not wrap these paths in ``module_jit``, which would freeze
+        pre-restore state).
 
         Args:
             image_keys: Subset of camera keys to resize/embed. If ``None``, uses

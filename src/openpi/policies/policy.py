@@ -132,6 +132,7 @@ class Policy(BasePolicy):
                 f"Got {type(self._model).__name__}."
             )
 
+        print(f"Inferring with cot for obs: {obs}")
         inputs = jax.tree.map(lambda x: x, obs)
         inputs = self._input_transform(inputs)
         inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
@@ -143,6 +144,8 @@ class Policy(BasePolicy):
             if noise.ndim == 2:
                 noise = noise[None, ...]
             sample_kwargs["noise"] = noise
+        
+        print(f"Inputs: {inputs}")
 
         observation = _model.Observation.from_dict(inputs)
         cot_kwargs = dict(self._cot_sample_kwargs)
