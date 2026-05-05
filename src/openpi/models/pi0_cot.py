@@ -14,6 +14,7 @@ Losses: CE on reasoning + subtask (VLM), flow-matching on actions.
 """
 
 import logging
+import time
 from collections.abc import Sequence
 
 import einops
@@ -325,6 +326,9 @@ class Pi0CoT(_model.BaseModel):
         max_subtask_len: int | None = None,
         max_reasoning_len: int | None = None,
         image_keys: Sequence[str] | None = None,
+        timing: bool = False,
+        timing_per_step: bool = False,
+        timing_sync: bool = True,
     ) -> dict[str, jnp.ndarray]:
         """Autoregressively sample reasoning then subtask from images + prompt prefix only.
 
@@ -342,6 +346,12 @@ class Pi0CoT(_model.BaseModel):
             image_keys: Subset of camera keys to resize/embed. If ``None``, uses
                 ``Pi0CoTConfig.inference_image_keys`` when set, else all ``IMAGE_KEYS``.
                 CARLA single-camera inference can pass ``("base_0_rgb",)`` or set that on the config.
+            timing: If True, print ``[Pi0CoT.sample_cot timing]`` lines with phase totals (prefill,
+                reasoning gen / replay / subtask). First call may include JAX compile time.
+            timing_per_step: If True (implies ``timing``), print per-step ``decode_logits`` and
+                transformer-forward milliseconds for reasoning and subtask loops (verbose).
+            timing_sync: When timing, ``jax.block_until_ready`` on measured arrays so GPU work is
+                finished before stopping the clock (more accurate; small overhead).
         """
         keys = tuple(image_keys) if image_keys is not None else self._preprocess_image_keys
         observation = _model.preprocess_observation(None, observation, train=False, image_keys=keys)
@@ -352,27 +362,50 @@ class Pi0CoT(_model.BaseModel):
         ms = max_subtask_len if max_subtask_len is not None else self.max_subtask_len
         mr = max_reasoning_len if max_reasoning_len is not None else self.max_reasoning_len
 
-        # Embed images
+        _do_time = timing or timing_per_step
+        _step_detail = timing_per_step
+        if timing_per_step:
+            timing = True
+
+        def _maybe_sync(x):
+            if timing_sync and _do_time and x is not None:
+                jax.block_until_ready(x)
+            return x
+
+        t_wall0 = time.perf_counter()
+
+        # Embed images + prompt and build prefix tensors
+        t_prep0 = time.perf_counter()
         img_tokens, img_masks, img_ar = self._embed_images(observation)
-        
+
         # Embed prompt
         prompt_emb = self._embed_text_tokens(observation.tokenized_prompt)
         prompt_mask = observation.tokenized_prompt_mask
-        
+
         # Construct prefix
         prefix_tokens = jnp.concatenate(img_tokens + [prompt_emb], axis=1)
         prefix_mask = jnp.concatenate(img_masks + [prompt_mask], axis=1)
         prefix_ar = jnp.array(img_ar + [False] * prompt_emb.shape[1])
-        
+
         # Build attention mask
         prefix_attn_mask = pi0.make_attn_mask(prefix_mask, prefix_ar)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        
+        prep_ms = (time.perf_counter() - t_prep0) * 1000.0
+
         # Prefill prefix (keep KV snapshot so we can replay truncated reasoning + <start_of_subtask>.)
+        t_pf0 = time.perf_counter()
         (prefix_out, _), kv_cache = self.PaliGemma.llm(
             [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
         )
         assert prefix_out is not None
+        _maybe_sync(prefix_out)
+        prefill_ms = (time.perf_counter() - t_pf0) * 1000.0
+        if _do_time:
+            print(
+                f"[Pi0CoT.sample_cot timing] mr={mr} ms={ms} batch={batch_size} "
+                f"prefix_prep_ms={prep_ms:.2f} prefill_ms={prefill_ms:.2f}",
+                flush=True,
+            )
         kv_prompt = kv_cache
         prefix_out_prompt = prefix_out
 
@@ -385,9 +418,17 @@ class Pi0CoT(_model.BaseModel):
         rng_cur = rng
 
         # Generate reasoning (first causal segment after the prompt)
+        t_rg0 = time.perf_counter()
+        sum_r_logits_ms = 0.0
+        sum_r_fwd_ms = 0.0
+        n_r_fwd = 0
         kv_cache = kv_prompt
         for j in range(mr):
+            t_l0 = time.perf_counter()
             logits = self.PaliGemma.llm(h, method="decode_logits")[:, 0, :]
+            logits = _maybe_sync(logits)
+            sum_r_logits_ms += (time.perf_counter() - t_l0) * 1000.0
+
             if temperature and temperature > 0:
                 rng_cur, step_rng = jax.random.split(rng_cur)
                 tok = jax.random.categorical(step_rng, logits / jnp.maximum(temperature, 1e-6))
@@ -395,15 +436,25 @@ class Pi0CoT(_model.BaseModel):
                 tok = jnp.argmax(logits, axis=-1)
             rea_buf = rea_buf.at[:, j].set(tok)
             rea_m = rea_m.at[:, j].set(True)
+
+            if _step_detail:
+                print(
+                    f"[Pi0CoT.sample_cot timing] reasoning_gen j={j} decode_logits_ms="
+                    f"{(time.perf_counter() - t_l0) * 1000.0:.2f}",
+                    flush=True,
+                )
+
             # Early exit once each row has produced ``<end_of_reasoning>`` (no extra decode forwards).
-            if bool(
+            end_all = bool(
                 jnp.all(
                     jnp.any((rea_buf[:, : j + 1] == END_OF_REASONING_ID) & rea_m[:, : j + 1], axis=1)
                 )
-            ):
+            )
+            if end_all:
                 break
             if j == mr - 1:
                 break
+            t_f0 = time.perf_counter()
             emb = self._embed_text_tokens(tok[:, None])
             key_mask = jnp.concatenate([key_mask, jnp.ones((batch_size, 1), dtype=jnp.bool_)], axis=1)
             attn_mask = key_mask[:, None, :]
@@ -414,8 +465,26 @@ class Pi0CoT(_model.BaseModel):
                 kv_cache=kv_cache,
             )
             assert out is not None
+            out = _maybe_sync(out)
+            fwd_ms = (time.perf_counter() - t_f0) * 1000.0
+            sum_r_fwd_ms += fwd_ms
+            n_r_fwd += 1
+            if _step_detail:
+                print(
+                    f"[Pi0CoT.sample_cot timing] reasoning_gen j={j} transformer_fwd_ms={fwd_ms:.2f}",
+                    flush=True,
+                )
             h = out
             abs_pos = abs_pos + 1
+
+        reasoning_gen_wall_ms = (time.perf_counter() - t_rg0) * 1000.0
+        if _do_time:
+            print(
+                f"[Pi0CoT.sample_cot timing] reasoning_gen wall_ms={reasoning_gen_wall_ms:.2f} "
+                f"sum_decode_logits_ms={sum_r_logits_ms:.2f} sum_transformer_fwd_ms={sum_r_fwd_ms:.2f} "
+                f"n_fwd={n_r_fwd}",
+                flush=True,
+            )
 
         pos_r = jnp.arange(mr, dtype=jnp.int32)[None, :]
         matches_end_r = (rea_buf == END_OF_REASONING_ID) & rea_m
@@ -438,6 +507,9 @@ class Pi0CoT(_model.BaseModel):
         )
 
         # Replay reasoning + optional <start_of_subtask> from the prompt KV so h / cache match ``rea_buf``.
+        t_rep0 = time.perf_counter()
+        sum_rep_fwd_ms = 0.0
+        n_rep = 0
         kv_cache = kv_prompt
         key_mask = prefix_mask
         abs_pos = jnp.sum(prefix_mask, axis=1, keepdims=True).astype(jnp.int32)
@@ -447,6 +519,7 @@ class Pi0CoT(_model.BaseModel):
                 break
             tok = rea_buf[:, t]
             step_ok = rea_m[:, t]
+            t_f0 = time.perf_counter()
             emb = self._embed_text_tokens(tok[:, None])
             key_mask = jnp.concatenate([key_mask, step_ok[:, None]], axis=1)
             attn_mask = key_mask[:, None, :]
@@ -457,14 +530,39 @@ class Pi0CoT(_model.BaseModel):
                 kv_cache=kv_cache,
             )
             assert out is not None
+            out = _maybe_sync(out)
+            fwd_ms = (time.perf_counter() - t_f0) * 1000.0
+            sum_rep_fwd_ms += fwd_ms
+            n_rep += 1
+            if _step_detail:
+                print(
+                    f"[Pi0CoT.sample_cot timing] replay t={t} transformer_fwd_ms={fwd_ms:.2f}",
+                    flush=True,
+                )
             h = jnp.where(step_ok[:, None, None], out, h)
             abs_pos = abs_pos + 1
+
+        replay_wall_ms = (time.perf_counter() - t_rep0) * 1000.0
+        if _do_time:
+            print(
+                f"[Pi0CoT.sample_cot timing] replay wall_ms={replay_wall_ms:.2f} "
+                f"sum_transformer_fwd_ms={sum_rep_fwd_ms:.2f} n_fwd={n_rep}",
+                flush=True,
+            )
 
         sub_buf = jnp.zeros((batch_size, ms), dtype=jnp.int32)
         sub_m = jnp.zeros((batch_size, ms), dtype=jnp.bool_)
 
+        t_sg0 = time.perf_counter()
+        sum_s_logits_ms = 0.0
+        sum_s_fwd_ms = 0.0
+        n_s_fwd = 0
         for i in range(ms):
+            t_l0 = time.perf_counter()
             logits = self.PaliGemma.llm(h, method="decode_logits")[:, 0, :]
+            logits = _maybe_sync(logits)
+            sum_s_logits_ms += (time.perf_counter() - t_l0) * 1000.0
+
             if temperature and temperature > 0:
                 rng_cur, step_rng = jax.random.split(rng_cur)
                 tok = jax.random.categorical(step_rng, logits / jnp.maximum(temperature, 1e-6))
@@ -472,14 +570,24 @@ class Pi0CoT(_model.BaseModel):
                 tok = jnp.argmax(logits, axis=-1)
             sub_buf = sub_buf.at[:, i].set(tok)
             sub_m = sub_m.at[:, i].set(True)
-            if bool(
+
+            if _step_detail:
+                print(
+                    f"[Pi0CoT.sample_cot timing] subtask_gen i={i} decode_logits_ms="
+                    f"{(time.perf_counter() - t_l0) * 1000.0:.2f}",
+                    flush=True,
+                )
+
+            end_all_s = bool(
                 jnp.all(
                     jnp.any((sub_buf[:, : i + 1] == END_OF_SUBTASK_ID) & sub_m[:, : i + 1], axis=1)
                 )
-            ):
+            )
+            if end_all_s:
                 break
             if i == ms - 1:
                 break
+            t_f0 = time.perf_counter()
             emb = self._embed_text_tokens(tok[:, None])
             key_mask = jnp.concatenate([key_mask, jnp.ones((batch_size, 1), dtype=jnp.bool_)], axis=1)
             attn_mask = key_mask[:, None, :]
@@ -490,8 +598,32 @@ class Pi0CoT(_model.BaseModel):
                 kv_cache=kv_cache,
             )
             assert out is not None
+            out = _maybe_sync(out)
+            fwd_ms = (time.perf_counter() - t_f0) * 1000.0
+            sum_s_fwd_ms += fwd_ms
+            n_s_fwd += 1
+            if _step_detail:
+                print(
+                    f"[Pi0CoT.sample_cot timing] subtask_gen i={i} transformer_fwd_ms={fwd_ms:.2f}",
+                    flush=True,
+                )
             h = out
             abs_pos = abs_pos + 1
+
+        subtask_gen_wall_ms = (time.perf_counter() - t_sg0) * 1000.0
+        if _do_time:
+            print(
+                f"[Pi0CoT.sample_cot timing] subtask_gen wall_ms={subtask_gen_wall_ms:.2f} "
+                f"sum_decode_logits_ms={sum_s_logits_ms:.2f} sum_transformer_fwd_ms={sum_s_fwd_ms:.2f} "
+                f"n_fwd={n_s_fwd}",
+                flush=True,
+            )
+            total_ms = (time.perf_counter() - t_wall0) * 1000.0
+            print(
+                f"[Pi0CoT.sample_cot timing] TOTAL sample_cot_ms={total_ms:.2f} "
+                f"(prep+prefill + reasoning_gen + replay + subtask_gen)",
+                flush=True,
+            )
 
         return {
             "tokenized_subtask": sub_buf,
