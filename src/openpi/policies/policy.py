@@ -65,8 +65,19 @@ class Policy(BasePolicy):
             self._sample_actions = model.sample_actions
             self._sample_cot: Callable[..., Any] | None = getattr(model, "sample_cot", None)
         else:
-            # JAX model setup
-            self._sample_actions = nnx_utils.module_jit(model.sample_actions)
+            # JAX model setup: Pi0/Pi0-CoT pass Python kwargs (steps, booleans, image key names)
+            # alongside arrays; jax.jit must treat those as compile-time constants.
+            self._sample_actions = nnx_utils.module_jit(
+                model.sample_actions,
+                static_argnames=(
+                    "num_steps",
+                    "image_keys",
+                    "low_memory_denoise",
+                    "jit_denoise_steps",
+                    "max_decoding_steps",
+                    "temperature",
+                ),
+            )
             # Eager CoT sampling avoids compiling the full autoregressive graph (see Pi0-CoT / SteerVLA notes).
             self._sample_cot = getattr(model, "sample_cot", None)
             self._rng = rng or jax.random.key(0)
@@ -132,7 +143,6 @@ class Policy(BasePolicy):
                 f"Got {type(self._model).__name__}."
             )
 
-        print(f"Inferring with cot for obs: {obs}")
         inputs = jax.tree.map(lambda x: x, obs)
         inputs = self._input_transform(inputs)
         inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
@@ -144,15 +154,11 @@ class Policy(BasePolicy):
             if noise.ndim == 2:
                 noise = noise[None, ...]
             sample_kwargs["noise"] = noise
-        
-        print(f"Inputs: {inputs}")
 
         observation = _model.Observation.from_dict(inputs)
         cot_kwargs = dict(self._cot_sample_kwargs)
-        print(f"Sampling cot with kwargs: {cot_kwargs}")
 
         t_cot = time.monotonic()
-        print(f"Sampling cot...")
         cot_out = self._sample_cot(rng_cot, observation, **cot_kwargs)
         cot_ms = (time.monotonic() - t_cot) * 1000
 
@@ -164,7 +170,6 @@ class Policy(BasePolicy):
         )
 
         t_act = time.monotonic()
-        print(f"Sampling actions...")
         actions = self._sample_actions(rng_act, observation, **sample_kwargs)
         act_ms = (time.monotonic() - t_act) * 1000
 
