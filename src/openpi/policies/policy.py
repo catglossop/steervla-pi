@@ -53,8 +53,12 @@ class Policy(BasePolicy):
         self._model = model
         self._input_transform = _transforms.compose(transforms)
         self._output_transform = _transforms.compose(output_transforms)
-        self._sample_kwargs = sample_kwargs or {}
-        self._cot_sample_kwargs = cot_sample_kwargs or {}
+        # ``sample_actions`` is ``module_jit``'d with ``image_keys`` static; JAX requires hashable static args (tuple OK, list not).
+        self._sample_kwargs = dict(sample_kwargs or {})
+        self._cot_sample_kwargs = dict(cot_sample_kwargs or {})
+        for _kw in (self._sample_kwargs, self._cot_sample_kwargs):
+            if _kw.get("image_keys") is not None:
+                _kw["image_keys"] = tuple(_kw["image_keys"])
         self._metadata = metadata or {}
         self._is_pytorch_model = is_pytorch
         self._pytorch_device = pytorch_device
