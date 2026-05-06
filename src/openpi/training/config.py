@@ -1385,7 +1385,7 @@ _CONFIGS = [
     TrainConfig(
         name="pi05_steervla_cot_ki",
         model=pi0_config.Pi0CoTConfig(
-            action_dim=32,
+            action_dim=4,
             action_horizon=10,
             max_token_len=112,
             max_subtask_len=48,
