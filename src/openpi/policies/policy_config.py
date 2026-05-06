@@ -33,7 +33,8 @@ def create_trained_policy(
         sample_kwargs: The kwargs to pass to the `sample_actions` method. If not provided, the default
             kwargs will be used.
         cot_sample_kwargs: Kwargs for :meth:`openpi.policies.policy.Policy.infer_with_cot` (passed to
-            ``model.sample_cot``), e.g. ``temperature``, ``image_keys``, or ``timing=True`` for phase logs.
+            ``model.sample_cot``), e.g. ``temperature``, ``image_keys``, ``timing=True`` for phase logs,
+            or ``replay_reasoning=False`` for faster batch-1 online inference.
         default_prompt: The default prompt to use for the policy. Will inject the prompt into the input
             data if it doesn't already exist.
         norm_stats: The norm stats to use for the policy. If not provided, the norm stats will be loaded

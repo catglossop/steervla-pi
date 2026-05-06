@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-USER=lovelace
+USER=carla
 
 cd /home/$USER/steervla-pi
 export PATH="$HOME/.local/bin:$PATH"

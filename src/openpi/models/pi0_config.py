@@ -143,11 +143,14 @@ class Pi0CoTConfig(_model.BaseModelConfig):
     # (skip wrist streams). ``None`` means use all :data:`openpi.models.model.IMAGE_KEYS`.
     inference_image_keys: tuple[str, ...] | None = None
 
-    # CoT autoregressive single-step kernels in :meth:`Pi0CoT.sample_cot` use ``nnx.jit`` by
-    # default. Set ``False`` independently for vocab decode vs transformer forwards to trade
-    # speed for lower peak device memory on some backends (e.g. TPU inference).
+    # CoT autoregressive single-step kernels in :meth:`Pi0CoT.sample_cot` use lazy post-restore
+    # ``module_jit`` by default. Set ``False`` independently for vocab decode vs transformer
+    # forwards to trade speed for lower peak device memory on some backends.
     cot_jit_decode: bool = True
     cot_jit_transformer_forward: bool = True
+    # Replay generated reasoning from the prompt KV before subtask generation. This matches the
+    # masked/padded training layout, but is expensive for batch-1 online inference.
+    cot_replay_reasoning: bool = True
 
     pytorch_compile_mode: str | None = "max-autotune"
 

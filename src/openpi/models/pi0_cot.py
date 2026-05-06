@@ -30,6 +30,7 @@ from openpi.models import pi0_config
 import openpi.models.gemma as _gemma
 import openpi.models.siglip as _siglip
 from openpi.shared import array_typing as at
+import openpi.shared.nnx_utils as nnx_utils
 
 logger = logging.getLogger("openpi")
 
@@ -40,6 +41,8 @@ START_OF_SUBTASK_ID = _gemma.PALIGEMMA_VOCAB_SIZE - 1 - _COT_SKIP_LAST - 1
 END_OF_SUBTASK_ID = _gemma.PALIGEMMA_VOCAB_SIZE - 1 - _COT_SKIP_LAST - 2
 START_OF_REASONING_ID = _gemma.PALIGEMMA_VOCAB_SIZE - 1 - _COT_SKIP_LAST - 3
 END_OF_REASONING_ID = _gemma.PALIGEMMA_VOCAB_SIZE - 1 - _COT_SKIP_LAST - 4
+
+_COT_MODULE_JIT_CACHE: dict[int, dict[str, object]] = {}
 
 
 class Pi0CoT(_model.BaseModel):
@@ -87,7 +90,7 @@ class Pi0CoT(_model.BaseModel):
         )
         self._cot_jit_decode = bool(config.cot_jit_decode)
         self._cot_jit_transformer_forward = bool(config.cot_jit_transformer_forward)
-
+        self._cot_replay_reasoning = bool(config.cot_replay_reasoning)
         self.deterministic = True
 
     # ------------------------------------------------------------------
@@ -316,31 +319,36 @@ class Pi0CoT(_model.BaseModel):
         return -jnp.sum(masked, axis=-1) / jnp.clip(jnp.sum(mask, axis=-1), 1.0)
 
     # ------------------------------------------------------------------
-    # Inference helpers: optional nnx.jit single-step kernels for sample_cot
+    # Inference helpers: optional post-restore module_jit kernels for sample_cot
     # ------------------------------------------------------------------
 
-    @nnx.jit
-    def _cot_decode_logits_row_jit(self, h: jnp.ndarray) -> jnp.ndarray:
+    def _cot_module_jit(self, name: str, meth):
+        cache = _COT_MODULE_JIT_CACHE.setdefault(id(self), {})
+        fn = cache.get(name)
+        if fn is None:
+            fn = nnx_utils.module_jit(meth)
+            cache[name] = fn
+        return fn
+
+    def _cot_decode_logits_row_impl(self, h: jnp.ndarray) -> jnp.ndarray:
         return self.PaliGemma.llm(h, method="decode_logits")[:, 0, :]
 
-    @nnx.jit
-    def _cot_decode_argmax_row_jit(self, h: jnp.ndarray) -> jnp.ndarray:
+    def _cot_decode_argmax_row_impl(self, h: jnp.ndarray) -> jnp.ndarray:
         """Greedy ids via chunked projection (same as eager path)."""
         return self.PaliGemma.llm(h, method="decode_argmax_chunked")[:, 0]
 
     def _cot_decode_logits_row(self, h: jnp.ndarray) -> jnp.ndarray:
         if self._cot_jit_decode:
-            return self._cot_decode_logits_row_jit(h)
-        return self.PaliGemma.llm(h, method="decode_logits")[:, 0, :]
+            return self._cot_module_jit("decode_logits_row", self._cot_decode_logits_row_impl)(h)
+        return self._cot_decode_logits_row_impl(h)
 
     def _cot_decode_argmax_row(self, h: jnp.ndarray) -> jnp.ndarray:
         """Greedy next-token ids without full ``(vocab,)`` logits (lower peak VRAM than ``decode_logits``)."""
         if self._cot_jit_decode:
-            return self._cot_decode_argmax_row_jit(h)
-        return self.PaliGemma.llm(h, method="decode_argmax_chunked")[:, 0]
+            return self._cot_module_jit("decode_argmax_row", self._cot_decode_argmax_row_impl)(h)
+        return self._cot_decode_argmax_row_impl(h)
 
-    @nnx.jit
-    def _cot_forward_one_token_jit(
+    def _cot_forward_one_token_impl(
         self,
         tok: jnp.ndarray,
         kv_cache,
@@ -365,19 +373,12 @@ class Pi0CoT(_model.BaseModel):
         attn_mask: jnp.ndarray,
     ):
         if self._cot_jit_transformer_forward:
-            return self._cot_forward_one_token_jit(tok, kv_cache, abs_pos, attn_mask)
-        emb = self._embed_text_tokens(tok[:, None])
-        (out, _), kv_new = self.PaliGemma.llm(
-            [emb, None],
-            mask=attn_mask,
-            positions=abs_pos,
-            kv_cache=kv_cache,
-        )
-        assert out is not None
-        return out, kv_new, abs_pos + 1
+            return self._cot_module_jit("forward_one_token", self._cot_forward_one_token_impl)(
+                tok, kv_cache, abs_pos, attn_mask
+            )
+        return self._cot_forward_one_token_impl(tok, kv_cache, abs_pos, attn_mask)
 
-    @nnx.jit
-    def _cot_replay_one_token_jit(
+    def _cot_replay_one_token_impl(
         self,
         tok: jnp.ndarray,
         h: jnp.ndarray,
@@ -407,17 +408,10 @@ class Pi0CoT(_model.BaseModel):
         step_ok: jnp.ndarray,
     ):
         if self._cot_jit_transformer_forward:
-            return self._cot_replay_one_token_jit(tok, h, kv_cache, abs_pos, attn_mask, step_ok)
-        emb = self._embed_text_tokens(tok[:, None])
-        (out, _), kv_new = self.PaliGemma.llm(
-            [emb, None],
-            mask=attn_mask,
-            positions=abs_pos,
-            kv_cache=kv_cache,
-        )
-        assert out is not None
-        h_new = jnp.where(step_ok[:, None, None], out, h)
-        return h_new, kv_new, abs_pos + 1
+            return self._cot_module_jit("replay_one_token", self._cot_replay_one_token_impl)(
+                tok, h, kv_cache, abs_pos, attn_mask, step_ok
+            )
+        return self._cot_replay_one_token_impl(tok, h, kv_cache, abs_pos, attn_mask, step_ok)
 
     # ------------------------------------------------------------------
     # Inference: sample_cot (autoregressive CoT, prompt-only conditioning)
@@ -432,6 +426,7 @@ class Pi0CoT(_model.BaseModel):
         max_subtask_len: int | None = None,
         max_reasoning_len: int | None = None,
         image_keys: Sequence[str] | None = None,
+        replay_reasoning: bool | None = None,
         timing: bool = False,
         timing_per_step: bool = False,
         timing_sync: bool = True,
@@ -447,17 +442,20 @@ class Pi0CoT(_model.BaseModel):
         Generation stops early when every batch row has emitted ``END_OF_REASONING_ID`` (reasoning)
         or ``END_OF_SUBTASK_ID`` (subtask), instead of always running ``max_reasoning_len`` /
         ``max_subtask_len`` steps. Replay skips trailing slots with mask false.
+        Set ``replay_reasoning=False`` for faster single-row inference: it keeps the generation KV
+        cache and only forwards the final reasoning token plus optional ``<start_of_subtask>``.
 
         ``decode_logits`` / argmax helpers and single-token transformer forwards optionally use
-        :func:`flax.nnx.jit` per-step (defaults on); see ``Pi0CoTConfig.cot_jit_decode`` and
-        ``cot_jit_transformer_forward``. Jitted kernels use **current** module weights after
-        checkpoint restore (do not wrap these paths in ``module_jit``, which would freeze
-        pre-restore state).
+        post-restore :func:`openpi.shared.nnx_utils.module_jit` per step (defaults on); see
+        ``Pi0CoTConfig.cot_jit_decode`` and ``cot_jit_transformer_forward``. Kernels are cached
+        lazily on first inference call so checkpoint-restored weights are what get frozen.
 
         Args:
             image_keys: Subset of camera keys to resize/embed. If ``None``, uses
                 ``Pi0CoTConfig.inference_image_keys`` when set, else all ``IMAGE_KEYS``.
                 CARLA single-camera inference can pass ``("base_0_rgb",)`` or set that on the config.
+            replay_reasoning: If ``False``, skip the full prompt-to-reasoning replay. This is intended
+                for batch-1 online inference; batched generation still uses full replay semantics.
             timing: If True, print ``[Pi0CoT.sample_cot timing]`` lines with phase totals (prefill,
                 reasoning gen / replay / subtask). First call may include JAX compile time.
             timing_per_step: If True (implies ``timing``), print per-step ``decode_logits`` and
@@ -473,6 +471,9 @@ class Pi0CoT(_model.BaseModel):
         batch_size = observation.state.shape[0]
         ms = max_subtask_len if max_subtask_len is not None else self.max_subtask_len
         mr = max_reasoning_len if max_reasoning_len is not None else self.max_reasoning_len
+        do_replay_reasoning = self._cot_replay_reasoning if replay_reasoning is None else bool(replay_reasoning)
+        if not do_replay_reasoning and batch_size != 1:
+            raise ValueError("sample_cot(replay_reasoning=False) is only supported for batch_size=1.")
 
         _do_time = timing or timing_per_step
         _step_detail = timing_per_step
@@ -535,6 +536,7 @@ class Pi0CoT(_model.BaseModel):
         sum_r_fwd_ms = 0.0
         n_r_fwd = 0
         kv_cache = kv_prompt
+        forwarded_reasoning = 0
         for j in range(mr):
             t_l0 = time.perf_counter()
             if temperature and temperature > 0:
@@ -575,6 +577,7 @@ class Pi0CoT(_model.BaseModel):
             fwd_ms = (time.perf_counter() - t_f0) * 1000.0
             sum_r_fwd_ms += fwd_ms
             n_r_fwd += 1
+            forwarded_reasoning = j + 1
             if _step_detail:
                 print(
                     f"[Pi0CoT.sample_cot timing] reasoning_gen j={j} transformer_fwd_ms={fwd_ms:.2f}",
@@ -615,11 +618,19 @@ class Pi0CoT(_model.BaseModel):
         t_rep0 = time.perf_counter()
         sum_rep_fwd_ms = 0.0
         n_rep = 0
-        kv_cache = kv_prompt
-        key_mask = prefix_mask
-        abs_pos = jnp.sum(prefix_mask, axis=1, keepdims=True).astype(jnp.int32)
-        h = self._gather_last_valid_hidden(prefix_out_prompt, prefix_mask)
-        for t in range(mr):
+        if do_replay_reasoning:
+            kv_cache = kv_prompt
+            key_mask = prefix_mask
+            abs_pos = jnp.sum(prefix_mask, axis=1, keepdims=True).astype(jnp.int32)
+            h = self._gather_last_valid_hidden(prefix_out_prompt, prefix_mask)
+            replay_start = 0
+            replay_stop = mr
+            replay_mode = "full"
+        else:
+            replay_start = forwarded_reasoning
+            replay_stop = int(total_len_r[0])
+            replay_mode = "catch_up"
+        for t in range(replay_start, replay_stop):
             if not bool(jnp.any(rea_m[:, t])):
                 break
             tok = rea_buf[:, t]
@@ -636,7 +647,8 @@ class Pi0CoT(_model.BaseModel):
             n_rep += 1
             if _step_detail:
                 print(
-                    f"[Pi0CoT.sample_cot timing] replay t={t} transformer_fwd_ms={fwd_ms:.2f}",
+                    f"[Pi0CoT.sample_cot timing] replay mode={replay_mode} t={t} "
+                    f"transformer_fwd_ms={fwd_ms:.2f}",
                     flush=True,
                 )
 
@@ -644,7 +656,7 @@ class Pi0CoT(_model.BaseModel):
         if _do_time:
             print(
                 f"[Pi0CoT.sample_cot timing] replay wall_ms={replay_wall_ms:.2f} "
-                f"sum_transformer_fwd_ms={sum_rep_fwd_ms:.2f} n_fwd={n_rep}",
+                f"sum_transformer_fwd_ms={sum_rep_fwd_ms:.2f} n_fwd={n_rep} mode={replay_mode}",
                 flush=True,
             )
 

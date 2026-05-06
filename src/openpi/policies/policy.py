@@ -135,7 +135,7 @@ class Policy(BasePolicy):
 
         ``cot_sample_kwargs`` can include ``timing=True`` (and ``timing_per_step=True``,
         ``timing_sync=True``) to print ``[Pi0CoT.sample_cot timing]`` breakdowns to stdout
-        (e.g. in Jupyter).
+        (e.g. in Jupyter), or ``replay_reasoning=False`` for faster batch-1 online inference.
 
         JAX only; PyTorch models raise :class:`NotImplementedError`.
         """

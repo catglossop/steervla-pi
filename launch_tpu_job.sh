@@ -4,7 +4,7 @@ set -euo pipefail
 VM_NAME="${1:?Usage: $0 <vm-name> <config-name>}"
 CONFIG_NAME="${2:?Usage: $0 <vm-name> <config-name>}"
 ZONE=us-central2-b
-USER=lovelace
+USER=carla
 
 echo "Launching TPU job on $VM_NAME with config=$CONFIG_NAME ..."
 
@@ -17,12 +17,12 @@ gcloud compute tpus tpu-vm ssh "$VM_NAME" --zone="$ZONE" --command="echo ok" || 
 
 # Now get the SSH args for rsync via --dry-run.
 SSH_CMD=$(gcloud compute tpus tpu-vm ssh "$VM_NAME" --zone="$ZONE" --dry-run 2>&1)
-SSH_ARGS=$(echo "$SSH_CMD" | grep -oP '(?<=/usr/bin/ssh ).*(?= lovelace@)') || {
+SSH_ARGS=$(echo "$SSH_CMD" | grep -oP '(?<=/usr/bin/ssh ).*(?= carla@)') || {
     echo "ERROR: Could not parse SSH args from dry-run output:"
     echo "$SSH_CMD"
     exit 1
 }
-TARGET_HOST=$(echo "$SSH_CMD" | grep -oP 'lovelace@[\d.]+') || {
+TARGET_HOST=$(echo "$SSH_CMD" | grep -oP 'carla@[\d.]+') || {
     echo "ERROR: Could not parse target host from dry-run output:"
     echo "$SSH_CMD"
     exit 1

@@ -3,6 +3,7 @@ import functools
 import logging
 import platform
 from typing import Any
+import datetime
 
 import etils.epath as epath
 import flax.nnx as nnx
@@ -67,7 +68,7 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
         wandb.init(id=run_id, resume="must", project=config.project_name)
     else:
         wandb.init(
-            name=config.exp_name,
+            name=config.exp_name + "_" + datetime.now().strftime("%Y%m%d_%H%M%S"),
             config=dataclasses.asdict(config),
             project=config.project_name,
         )
@@ -229,7 +230,7 @@ def main(config: _config.TrainConfig):
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
     checkpoint_manager, resuming = _checkpoints.initialize_checkpoint_dir(
-        config.checkpoint_dir,
+        config.checkpoint_dir / config.exp_name + "_" + datetime.now().strftime("%Y%m%d_%H%M%S"),
         keep_period=config.keep_period,
         overwrite=config.overwrite,
         resume=config.resume,
