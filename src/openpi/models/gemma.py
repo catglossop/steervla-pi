@@ -249,10 +249,22 @@ class Attention(nn.Module):
         # should still be half-precision here (if input was half-precision)
         assert q.dtype == k.dtype == v.dtype == dtype
 
+        kv_cache_out = None
         if kv_cache is not None:
-            cache_k, cache_v = kv_cache
-            k = jnp.concatenate([cache_k, k], axis=1)
-            v = jnp.concatenate([cache_v, v], axis=1)
+            if len(kv_cache) == 3:
+                cache_idx, cache_k, cache_v = kv_cache
+                cache_dtype = cache_k.dtype
+                update_idx = jnp.asarray(cache_idx, dtype=jnp.int32)
+                update_len = k.shape[1]
+                k = jax.lax.dynamic_update_slice(cache_k, k.astype(cache_dtype), (0, update_idx, 0, 0))
+                v = jax.lax.dynamic_update_slice(cache_v, v.astype(cache_v.dtype), (0, update_idx, 0, 0))
+                kv_cache_out = (cache_idx + update_len, k, v)
+            else:
+                cache_k, cache_v = kv_cache
+                k = jnp.concatenate([cache_k, k], axis=1)
+                v = jnp.concatenate([cache_v, v], axis=1)
+        if kv_cache_out is None:
+            kv_cache_out = (k, v)
 
         num_kv_heads = self.configs[0].num_kv_heads
 
@@ -349,7 +361,7 @@ class Attention(nn.Module):
             else:
                 out.append(None)
 
-        return out, (k, v)
+        return out, kv_cache_out
 
 
 @at.typecheck
