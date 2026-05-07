@@ -449,7 +449,14 @@ class Block(nn.Module):
         return xs, kv_cache
 
 
-KVCache: TypeAlias = tuple[at.Float[at.Array, "l b _t _k _h"], at.Float[at.Array, "l b _t _v _h"]]
+KVCache: TypeAlias = (
+    tuple[at.Float[at.Array, "l b _t _k _h"], at.Float[at.Array, "l b _t _v _h"]]
+    | tuple[
+        at.Int[at.Array, "l"],
+        at.Float[at.Array, "l b _t _k _h"],
+        at.Float[at.Array, "l b _t _v _h"],
+    ]
+)
 
 
 @at.typecheck
