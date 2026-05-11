@@ -1452,6 +1452,7 @@ _CONFIGS = [
             max_reasoning_len=96,
             cot_loss_weight=1.0,
             knowledge_insulation=True,
+            inference_image_keys=("base_0_rgb",),
         ),
         data=RLDSSteerVLACoTDataConfig(
             repo_id="steervla_simlingo_cot",
@@ -1504,7 +1505,6 @@ _CONFIGS = [
         save_interval=5000,
         num_workers=0,
         checkpoint_base_dir="gs://cat-logs",
-        inference_image_keys=("base_0_rgb",),
     ),
     TrainConfig(
         name="pi05_steervla_finetune",
