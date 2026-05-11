@@ -1505,6 +1505,7 @@ _CONFIGS = [
         save_interval=5000,
         num_workers=0,
         checkpoint_base_dir="gs://cat-logs",
+        ema_decay=None,
     ),
     TrainConfig(
         name="pi05_steervla_finetune",
