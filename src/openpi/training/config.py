@@ -1504,6 +1504,7 @@ _CONFIGS = [
         save_interval=5000,
         num_workers=0,
         checkpoint_base_dir="gs://cat-logs",
+        inference_image_keys=("base_0_rgb",),
     ),
     TrainConfig(
         name="pi05_steervla_finetune",
