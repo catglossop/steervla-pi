@@ -646,13 +646,8 @@ class Pi0CoT(_model.BaseModel):
         max_subtask_len: int | None = None,
         max_reasoning_len: int | None = None,
         image_keys: Sequence[str] | None = None,
-        replay_reasoning: bool | None = None,
-        timing: bool = False,
-        timing_per_step: bool = False,
-        timing_sync: bool = True,
     ) -> dict[str, jnp.ndarray]:
         """Autoregressively sample reasoning then subtask from images + prompt prefix only."""
-        del replay_reasoning, timing, timing_per_step, timing_sync
         keys = tuple(image_keys) if image_keys is not None else self._preprocess_image_keys
         observation = _model.preprocess_observation(None, observation, train=False, image_keys=keys)
         if observation.tokenized_prompt is None or observation.tokenized_prompt_mask is None:
@@ -728,8 +723,6 @@ class Pi0CoT(_model.BaseModel):
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
         image_keys: Sequence[str] | None = None,
-        low_memory_denoise: bool = False,
-        jit_denoise_steps: bool = False,
     ) -> _model.Actions:
         """Flow-match denoise from prefix KV + action suffix.
 
@@ -814,26 +807,12 @@ class Pi0CoT(_model.BaseModel):
             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon:])
             return x_t + dt * v_t, t + dt
 
-        dt_arr = jnp.asarray(dt, dtype=noise.dtype)
+
         t0 = jnp.asarray(1.0, dtype=noise.dtype)
 
-        if jit_denoise_steps:
-            x_cur, t_cur = noise, t0
-            for _ in range(n_steps_i):
-                x_cur, t_cur = self._denoise_flow_step(
-                    observation, kv_cache, prefix_mask, prefix_mask_no_reasoning, dt_arr, x_cur, t_cur
-                )
-            x_0 = x_cur
-        elif low_memory_denoise:
-            carry = (noise, t0)
-            for _ in range(n_steps_i):
-                carry = step(carry)
-            x_0, _ = carry
-        else:
+        def cond(carry):
+            _, t = carry
+            return t >= -dt / 2
 
-            def cond(carry):
-                _, t = carry
-                return t >= -dt / 2
-
-            x_0, _ = jax.lax.while_loop(cond, step, (noise, t0))
+        x_0, _ = jax.lax.while_loop(cond, step, (noise, t0))
         return x_0
