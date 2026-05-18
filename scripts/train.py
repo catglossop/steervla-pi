@@ -51,7 +51,15 @@ def init_logging():
     logger.handlers[0].setFormatter(formatter)
 
 
-def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = False, enabled: bool = True):
+def init_wandb(
+    config: _config.TrainConfig,
+    *,
+    resuming: bool,
+    run_dir: epath.Path,
+    start_step: int = 0,
+    log_code: bool = False,
+    enabled: bool = True,
+):
     if not enabled:
         wandb.init(mode="disabled")
         return
@@ -60,19 +68,24 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
         wandb.init(mode="disabled")
         return
 
+    # Always start a fresh wandb run (even when resuming training). The training
+    # loop calls wandb.log(..., step=step) with the absolute step from the
+    # restored TrainState, so the new run picks up at the right step without
+    # needing wandb's own resume machinery (which was brittle / errored out).
     ckpt_dir = config.checkpoint_dir
     if not ckpt_dir.exists():
         raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
+
+    run_name = run_dir.name
     if resuming:
-        run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
-        wandb.init(id=run_id, resume="must", project=config.project_name)
-    else:
-        wandb.init(
-            name=config.exp_name + "_" + datetime.now().strftime("%Y%m%d_%H%M%S"),
-            config=dataclasses.asdict(config),
-            project=config.project_name,
-        )
-        (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
+        run_name = f"{run_name}_resumed_from_step_{start_step}"
+
+    wandb.init(
+        name=run_name,
+        config=dataclasses.asdict(config),
+        project=config.project_name,
+    )
+    (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
 
     if log_code:
         wandb.run.log_code(epath.Path(__file__).parent.parent)
@@ -155,15 +168,24 @@ def train_step(
     def loss_fn(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
     ):
-        chunked_loss = model.compute_loss(rng, observation, actions, train=True)
-        return jnp.mean(chunked_loss)
+        if hasattr(model, "compute_loss_with_aux"):
+            chunked_loss, aux_metrics = model.compute_loss_with_aux(rng, observation, actions, train=True)
+        else:
+            chunked_loss = model.compute_loss(rng, observation, actions, train=True)
+            aux_metrics = {}
+
+        loss = jnp.mean(chunked_loss)
+        reduced_aux_metrics = {f"train/{k}": jnp.mean(v) for k, v in aux_metrics.items()}
+        return loss, reduced_aux_metrics
 
     train_rng = jax.random.fold_in(rng, state.step)
     observation, actions = batch
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+    (loss, aux_metrics), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(
+        model, train_rng, observation, actions
+    )
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
@@ -196,7 +218,70 @@ def train_step(
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
     }
+    info.update(aux_metrics)
     return new_state, info
+
+
+def _assert_shape_dtype(name: str, value: Any, expected_shape: tuple[int, ...], expected_dtype: Any) -> None:
+    arr = np.asarray(value)
+    if tuple(arr.shape) != tuple(expected_shape):
+        raise ValueError(f"{name} shape mismatch: got {tuple(arr.shape)}, expected {tuple(expected_shape)}")
+    if arr.dtype != np.dtype(expected_dtype):
+        raise ValueError(f"{name} dtype mismatch: got {arr.dtype}, expected {np.dtype(expected_dtype)}")
+
+
+def _validate_batch_against_model_spec(
+    config: _config.TrainConfig,
+    batch: tuple[_model.Observation, _model.Actions],
+    *,
+    batch_idx: int,
+) -> None:
+    """Validate incoming batch leaves against model input spec.
+
+    This catches data-loader shape/dtype issues before the first jitted train step,
+    which otherwise may fail with opaque XLA buffer mismatch errors.
+    """
+    observation, actions = batch
+    expected_obs, expected_actions = config.model.inputs_spec(batch_size=config.batch_size)
+
+    # Actions.
+    _assert_shape_dtype("actions", actions, expected_actions.shape, expected_actions.dtype)
+
+    # Core observation leaves.
+    _assert_shape_dtype("observation.state", observation.state, expected_obs.state.shape, expected_obs.state.dtype)
+
+    # Images + masks.
+    for key, exp in expected_obs.images.items():
+        if key not in observation.images:
+            raise ValueError(f"observation.images missing expected key: {key}")
+        _assert_shape_dtype(f"observation.images[{key!r}]", observation.images[key], exp.shape, exp.dtype)
+    for key, exp in expected_obs.image_masks.items():
+        if key not in observation.image_masks:
+            raise ValueError(f"observation.image_masks missing expected key: {key}")
+        _assert_shape_dtype(f"observation.image_masks[{key!r}]", observation.image_masks[key], exp.shape, exp.dtype)
+
+    # Optional fields (present in CoT/FAST variants).
+    optional_fields = (
+        "tokenized_prompt",
+        "tokenized_prompt_mask",
+        "token_ar_mask",
+        "token_loss_mask",
+        "tokenized_subtask",
+        "tokenized_subtask_mask",
+        "tokenized_reasoning",
+        "tokenized_reasoning_mask",
+        "action_loss_mask",
+    )
+    for field_name in optional_fields:
+        exp = getattr(expected_obs, field_name)
+        got = getattr(observation, field_name)
+        if exp is None:
+            continue
+        if got is None:
+            raise ValueError(f"observation.{field_name} is missing but required by model input spec")
+        _assert_shape_dtype(f"observation.{field_name}", got, exp.shape, exp.dtype)
+
+    logging.info("Batch validation passed for batch index %d.", batch_idx)
 
 
 def main(config: _config.TrainConfig):
@@ -229,25 +314,60 @@ def main(config: _config.TrainConfig):
     data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(sharding.DATA_AXIS))
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
+    if config.resume_dir is not None:
+        run_dir = epath.Path(config.resume_dir)
+        resume_flag = True
+    else:
+        run_dir = config.checkpoint_dir / (
+            config.exp_name + "_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        )
+        resume_flag = config.resume
+
     checkpoint_manager, resuming = _checkpoints.initialize_checkpoint_dir(
-        config.checkpoint_dir / config.exp_name + "_" + datetime.now().strftime("%Y%m%d_%H%M%S"),
+        run_dir,
         keep_period=config.keep_period,
         overwrite=config.overwrite,
-        resume=config.resume,
+        resume=resume_flag,
     )
-    init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+    if config.resume_dir is not None and not resuming:
+        raise FileNotFoundError(
+            f"resume_dir={config.resume_dir} was provided but the directory does not exist or is empty."
+        )
 
+    resume_start_step = int(checkpoint_manager.latest_step()) if resuming else 0
+    init_wandb(
+        config,
+        resuming=resuming,
+        run_dir=run_dir,
+        start_step=resume_start_step,
+        enabled=config.wandb_enabled,
+    )
+
+    # Train data loader
     data_loader = _data_loader.create_data_loader(
         config,
         sharding=data_sharding,
         shuffle=True,
     )
     data_iter = iter(data_loader)
+    
+    # Eval data loader
+    eval_batch_size = config.batch_size // jax.device_count()
+    eval_config = dataclasses.replace(config, batch_size=eval_batch_size)
+    eval_data_loader = _data_loader.create_data_loader(
+        eval_config,
+        sharding=data_sharding,
+        shuffle=False,
+        split="val",
+    )
+    eval_data_iter = iter(eval_data_loader)
+    
     batch = next(data_iter)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
+    _validate_batch_against_model_spec(config, batch, batch_idx=0)
 
     # Log images from first batch to sanity check.
-    if jax.process_index() == 0:
+    if jax.process_index() == 0 and not resuming:
         images_to_log = [
             wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
             for i in range(min(5, len(next(iter(batch[0].images.values())))))
@@ -284,7 +404,10 @@ def main(config: _config.TrainConfig):
 
     eval_rng = jax.random.key(config.seed + 1)
     infos = []
+    validate_num_batches = 4
     for step in pbar:
+        if step < start_step + validate_num_batches:
+            _validate_batch_against_model_spec(config, batch, batch_idx=step - start_step)
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
         infos.append(info)
@@ -296,9 +419,12 @@ def main(config: _config.TrainConfig):
                 pbar.write(f"Step {step}: {info_str}")
                 wandb.log(reduced_info, step=step)
             infos = []
+            
         batch = next(data_iter)
 
         if config.eval_interval > 0 and step > 0 and step % config.eval_interval == 0:
+            # change eval batch size 
+            eval_batch = next(eval_data_iter)
             if jax.process_index() == 0:
                 pbar.write(f"Running eval visualization at step {step}...")
             eval_rng, vis_rng = jax.random.split(eval_rng)
@@ -307,7 +433,7 @@ def main(config: _config.TrainConfig):
                 run_visualization_evaluation(
                     state=train_state,
                     rng=vis_rng,
-                    batch=batch,
+                    batch=eval_batch,
                     step=step,
                     action_dim=eval_action_dim,
                     output_action_format=eval_output_format,
@@ -315,7 +441,7 @@ def main(config: _config.TrainConfig):
                 run_cot_visualization(
                     state=train_state,
                     rng=cot_rng,
-                    batch=batch,
+                    batch=eval_batch,
                     step=step,
                 )
 

@@ -187,10 +187,9 @@ class Pi0CoT(_model.BaseModel):
     # Training: compute_loss
     # ------------------------------------------------------------------
 
-    @override
-    def compute_loss(
+    def _compute_loss_and_metrics(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
-    ) -> at.Float[at.Array, "*b ah"]:
+    ) -> tuple[jnp.ndarray, dict[str, jnp.ndarray]]:
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
@@ -252,6 +251,10 @@ class Pi0CoT(_model.BaseModel):
         # --- Action flow-matching loss ---
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon:])
         flow_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)  # (batch, horizon)
+        if observation.action_loss_mask is not None:
+            # Allow disabling action-head supervision for selected samples/timesteps
+            # while still training CoT targets on the same batch.
+            flow_loss = flow_loss * observation.action_loss_mask.astype(flow_loss.dtype)
 
         # --- VLM cross-entropy loss on reasoning and subtask ---
         # Project VLM outputs back to vocab logits via the shared embedder
@@ -260,7 +263,7 @@ class Pi0CoT(_model.BaseModel):
         subtask_start = reasoning_start + n_reasoning
         subtask_out = prefix_out[:, subtask_start:subtask_start + n_subtask]
 
-        # Logits via embedder (shared embedding weights); do not use method="decode" (that returns argmax ids).
+        # Logits via embedder (shared embedding weights)
         reasoning_logits = self.PaliGemma.llm(reasoning_out, method="decode_logits")
         subtask_logits = self.PaliGemma.llm(subtask_out, method="decode_logits")
 
@@ -307,7 +310,27 @@ class Pi0CoT(_model.BaseModel):
         # Combine: flow loss is per-timestep (batch, horizon), cot_loss is scalar per batch
         # Broadcast cot_loss to match flow_loss shape for the return
         combined = flow_loss + self.cot_loss_weight * cot_loss[:, None]
+        metrics = {
+            "flow_loss": jnp.mean(flow_loss, axis=-1),
+            "cot_loss": cot_loss,
+            "cot_reasoning_ce": reasoning_ce,
+            "cot_subtask_ce": subtask_ce,
+            "cot_first_reasoning_ce": first_reasoning_ce,
+            "cot_first_subtask_ce": first_subtask_ce,
+        }
+        return combined, metrics
+
+    @override
+    def compute_loss(
+        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+    ) -> at.Float[at.Array, "*b ah"]:
+        combined, _ = self._compute_loss_and_metrics(rng, observation, actions, train=train)
         return combined
+
+    def compute_loss_with_aux(
+        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+    ) -> tuple[jnp.ndarray, dict[str, jnp.ndarray]]:
+        return self._compute_loss_and_metrics(rng, observation, actions, train=train)
 
     @staticmethod
     def _token_cross_entropy(logits, targets, mask):
@@ -490,15 +513,18 @@ class Pi0CoT(_model.BaseModel):
 
         def reasoning_body(carry):
             j, rng, h, kv_cache, abs_pos, key_mask, cur_pos, rea_buf, rea_m, done = carry
+            active = ~done
             rng, tok = self._cot_decode_token(h, rng, temperature)
+            tok = jnp.where(active, tok, jnp.int32(0))
             rea_buf = rea_buf.at[:, j].set(tok)
-            rea_m = rea_m.at[:, j].set(True)
-            done = done | (tok == END_OF_REASONING_ID)
-            should_forward = (j < (mr - 1)) & (~jnp.all(done))
+            rea_m = rea_m.at[:, j].set(active)
+            done = done | (active & (tok == END_OF_REASONING_ID))
+            should_forward = (j < (mr - 1)) & jnp.any(~done)
 
             def do_forward(args):
                 h, kv_cache, abs_pos, key_mask, cur_pos = args
-                step_ok = jnp.ones((batch_size,), dtype=jnp.bool_)
+                # Forward the token for rows that decoded at this step.
+                step_ok = active
                 return self._cot_forward_fixed(tok, h, kv_cache, abs_pos, key_mask, cur_pos, step_ok)
 
             h, kv_cache, abs_pos, key_mask, cur_pos = jax.lax.cond(
@@ -526,25 +552,44 @@ class Pi0CoT(_model.BaseModel):
             (0, rng, h, kv_cache, abs_pos, key_mask, cur_pos, rea_buf, rea_m, done_r),
         )
 
-        pos_r = jnp.arange(mr, dtype=jnp.int32)[None, :]
+        rr = jnp.arange(mr, dtype=jnp.int32)[None, :]
+        pos_r = rr
+        generated_len_r = jnp.sum(rea_m, axis=-1, dtype=jnp.int32)
         matches_end_r = (rea_buf == END_OF_REASONING_ID) & rea_m
         has_end_r = jnp.any(matches_end_r, axis=-1)
         first_end_r = jnp.min(jnp.where(matches_end_r, pos_r, mr), axis=-1)
-        body_len_r = jnp.where(has_end_r, first_end_r + 1, mr)
-        last_tok_r = jnp.take_along_axis(rea_buf, jnp.clip(body_len_r - 1, 0)[:, None], axis=1).squeeze(-1)
-        need_sos = last_tok_r != START_OF_SUBTASK_ID
-        total_len_r = jnp.minimum(body_len_r + need_sos.astype(jnp.int32), mr)
-        rr = jnp.arange(mr, dtype=jnp.int32)[None, :]
-        rea_m = rr < total_len_r[:, None]
-        rea_buf = jnp.where(
-            rr < body_len_r[:, None],
-            rea_buf,
-            jnp.where(
-                (rr == body_len_r[:, None]) & need_sos[:, None] & (total_len_r[:, None] > body_len_r[:, None]),
-                START_OF_SUBTASK_ID,
-                0,
-            ),
-        )
+        # End marker position in the normalized reasoning segment.
+        end_pos_r = jnp.where(has_end_r, first_end_r, generated_len_r)
+        sos_pos_r = end_pos_r + 1
+        can_append_pair = sos_pos_r < mr
+        overflow_pair = ~can_append_pair
+
+        # Keep existing generated tokens only.
+        rea_m = rr < generated_len_r[:, None]
+        rea_buf = jnp.where(rea_m, rea_buf, 0)
+
+        if mr > 0:
+            safe_end_pos = jnp.clip(end_pos_r, 0, mr - 1)
+            write_end = (~overflow_pair)[:, None] & (rr == safe_end_pos[:, None])
+            rea_buf = jnp.where(write_end, END_OF_REASONING_ID, rea_buf)
+            rea_m = rea_m | write_end
+
+        if mr > 1:
+            write_sos = (~overflow_pair)[:, None] & (rr == sos_pos_r[:, None])
+            rea_buf = jnp.where(write_sos, START_OF_SUBTASK_ID, rea_buf)
+            rea_m = rea_m | write_sos
+
+        # If we ran out of reasoning budget, force a valid boundary at the tail.
+        if mr == 1:
+            # Degenerate budget: prioritize starting the subtask phase.
+            rea_buf = jnp.where(overflow_pair[:, None], START_OF_SUBTASK_ID, rea_buf)
+            rea_m = jnp.where(overflow_pair[:, None], jnp.ones_like(rea_m), rea_m)
+        elif mr > 1:
+            tail_end = overflow_pair[:, None] & (rr == (mr - 2))
+            tail_sos = overflow_pair[:, None] & (rr == (mr - 1))
+            rea_buf = jnp.where(tail_end, END_OF_REASONING_ID, rea_buf)
+            rea_buf = jnp.where(tail_sos, START_OF_SUBTASK_ID, rea_buf)
+            rea_m = jnp.where(overflow_pair[:, None], rr < mr, rea_m)
 
         def catchup_cond(carry):
             t, *_ = carry
@@ -566,7 +611,8 @@ class Pi0CoT(_model.BaseModel):
             )
             return t + 1, h, kv_cache, abs_pos, key_mask, cur_pos
 
-        catchup_start = jnp.maximum(_j - 1, 0)
+        # Replaying from 0 guarantees per-row boundary edits are reflected in KV/hidden.
+        catchup_start = jnp.asarray(0, dtype=jnp.int32)
         _, h, kv_cache, abs_pos, key_mask, cur_pos = jax.lax.while_loop(
             catchup_cond,
             catchup_body,
@@ -583,15 +629,18 @@ class Pi0CoT(_model.BaseModel):
 
         def subtask_body(carry):
             i, rng, h, kv_cache, abs_pos, key_mask, cur_pos, sub_buf, sub_m, done = carry
+            active = ~done
             rng, tok = self._cot_decode_token(h, rng, temperature)
+            tok = jnp.where(active, tok, jnp.int32(0))
             sub_buf = sub_buf.at[:, i].set(tok)
-            sub_m = sub_m.at[:, i].set(True)
-            done = done | (tok == END_OF_SUBTASK_ID)
-            should_forward = (i < (ms - 1)) & (~jnp.all(done))
+            sub_m = sub_m.at[:, i].set(active)
+            done = done | (active & (tok == END_OF_SUBTASK_ID))
+            should_forward = (i < (ms - 1)) & jnp.any(~done)
 
             def do_forward(args):
                 h, kv_cache, abs_pos, key_mask, cur_pos = args
-                step_ok = jnp.ones((batch_size,), dtype=jnp.bool_)
+                # Forward the token for rows that decoded at this step.
+                step_ok = active
                 return self._cot_forward_fixed(tok, h, kv_cache, abs_pos, key_mask, cur_pos, step_ok)
 
             h, kv_cache, abs_pos, key_mask, cur_pos = jax.lax.cond(

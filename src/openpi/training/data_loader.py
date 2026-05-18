@@ -158,6 +158,7 @@ def create_rlds_dataset(
     batch_size: int,
     *,
     shuffle: bool = False,
+    split: str = "train",
 ) -> Dataset:
     if data_config.steervla_rlds:
         return SteerVLARldsDataset(
@@ -165,6 +166,12 @@ def create_rlds_dataset(
             batch_size=batch_size,
             datasets=data_config.steervla_datasets,
             dataset_format=data_config.steervla_dataset_format,
+            hl_datasets=data_config.steervla_hl_datasets,
+            hl_dataset_format=data_config.steervla_hl_dataset_format,
+            cot_reasoning_key=data_config.steervla_cot_reasoning_key,
+            cot_subtask_key=data_config.steervla_cot_subtask_key,
+            hl_cot_reasoning_key=data_config.steervla_hl_cot_reasoning_key,
+            hl_cot_subtask_key=data_config.steervla_hl_cot_subtask_key,
             shuffle=shuffle,
             action_chunk_size=action_horizon,
             include_ego_history=data_config.steervla_include_ego_history,
@@ -176,6 +183,7 @@ def create_rlds_dataset(
             routing_command_in_prompt=data_config.steervla_routing_command_in_prompt,
             add_suffix_to_prompt=data_config.steervla_add_suffix_to_prompt,
             enable_cot=data_config.steervla_enable_cot,
+            split=split,
         )
     return DroidRldsDataset(
         data_dir=data_config.rlds_data_dir,
@@ -246,6 +254,7 @@ def create_data_loader(
     num_batches: int | None = None,
     skip_norm_stats: bool = False,
     framework: Literal["jax", "pytorch"] = "jax",
+    split: str = "train",
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -270,6 +279,7 @@ def create_data_loader(
             num_batches=num_batches,
             skip_norm_stats=skip_norm_stats,
             framework=framework,
+            split=split,
         )
     return create_torch_data_loader(
         data_config,
@@ -365,6 +375,7 @@ def create_rlds_data_loader(
     shuffle: bool = False,
     num_batches: int | None = None,
     framework: str = "jax",
+    split: str = "train",
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create an RLDS data loader for training.
 
@@ -384,7 +395,7 @@ def create_rlds_data_loader(
     """
     if framework == "pytorch":
         raise NotImplementedError("PyTorch RLDS data loader is not supported yet")
-    dataset = create_rlds_dataset(data_config, action_horizon, batch_size, shuffle=shuffle)
+    dataset = create_rlds_dataset(data_config, action_horizon, batch_size, shuffle=shuffle, split=split)
     dataset = transform_iterable_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats, is_batched=True)
 
     data_loader = RLDSDataLoader(

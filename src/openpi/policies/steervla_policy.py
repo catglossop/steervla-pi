@@ -125,6 +125,8 @@ class SteerVLAInputs(transforms.DataTransformFn):
 
         if "actions" in data:
             inputs["actions"] = np.asarray(data["actions"], dtype=np.float32)
+        if "action_loss_mask" in data:
+            inputs["action_loss_mask"] = np.asarray(data["action_loss_mask"], dtype=np.bool_)
 
         if "prompt" in data:
             prompt = data["prompt"]

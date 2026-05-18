@@ -103,6 +103,13 @@ class DataConfig:
     steervla_rlds: bool = False
     steervla_datasets: Sequence[steervla_rlds_dataset.SteerVLARLDSDataset] = ()
     steervla_dataset_format: steervla_rlds_dataset.DatasetFormat = steervla_rlds_dataset.DatasetFormat.NUSCENES
+    # Optional high-level (reasoning/subtask-only) datasets for CoT training.
+    steervla_hl_datasets: Sequence[steervla_rlds_dataset.SteerVLARLDSDataset] = ()
+    steervla_hl_dataset_format: steervla_rlds_dataset.DatasetFormat = steervla_rlds_dataset.DatasetFormat.NUSCENES
+    steervla_cot_reasoning_key: str = "commentary"
+    steervla_cot_subtask_key: str = "gemini_refined_label"
+    steervla_hl_cot_reasoning_key: str = "gemini_refined_label"
+    steervla_hl_cot_subtask_key: str = "prompt"
     steervla_include_ego_history: bool = True
     steervla_include_xy_action: bool = False
     steervla_speed_in_prompt: bool = True
@@ -590,6 +597,15 @@ class RLDSSteerVLACoTDataConfig(RLDSSteerVLADataConfig):
     # CoT-specific token lengths.
     max_subtask_len: int = 48
     max_reasoning_len: int = 96
+    # Optional high-level (reasoning/subtask-only) datasets.
+    hl_dataset_name_weight_mappings: tyro.conf.Suppress[dict[str, float] | None] = None
+    hl_dataset_version: tyro.conf.Suppress[str | None] = None
+    hl_dataset_format: tyro.conf.Suppress[steervla_rlds_dataset.DatasetFormat | None] = None
+    # Source keys for CoT targets.
+    cot_reasoning_key: str = "commentary"
+    cot_subtask_key: str = "gemini_refined_label"
+    hl_cot_reasoning_key: str | None = "gemini_refined_label"
+    hl_cot_subtask_key: str | None = "prompt"
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -604,6 +620,17 @@ class RLDSSteerVLACoTDataConfig(RLDSSteerVLADataConfig):
 
         assert len(resolved_datasets) > 0
 
+        resolved_hl_datasets: list[steervla_rlds_dataset.SteerVLARLDSDataset] = []
+        if self.hl_dataset_name_weight_mappings is not None:
+            for name, weight in self.hl_dataset_name_weight_mappings.items():
+                resolved_hl_datasets.append(
+                    steervla_rlds_dataset.SteerVLARLDSDataset(
+                        name=name, 
+                        weight=weight, 
+                        version=self.hl_dataset_version,
+                    )
+                )
+
         repack_transform = _transforms.Group(
             inputs=[
                 _transforms.RepackTransform(
@@ -612,6 +639,7 @@ class RLDSSteerVLACoTDataConfig(RLDSSteerVLADataConfig):
                         "observation/state": "observation/state",
                         "observation/current_speed": "observation/current_speed",
                         "actions": "actions",
+                        "action_loss_mask": "action_loss_mask",
                         "prompt": "prompt",
                         "subtask": "subtask",
                         "reasoning": "reasoning",
@@ -656,6 +684,12 @@ class RLDSSteerVLACoTDataConfig(RLDSSteerVLADataConfig):
             rlds_data_dir=self.rlds_data_dir,
             steervla_datasets=tuple(resolved_datasets),
             steervla_dataset_format=self.dataset_format,
+            steervla_hl_datasets=tuple(resolved_hl_datasets),
+            steervla_hl_dataset_format=self.hl_dataset_format or self.dataset_format,
+            steervla_cot_reasoning_key=self.cot_reasoning_key,
+            steervla_cot_subtask_key=self.cot_subtask_key,
+            steervla_hl_cot_reasoning_key=self.hl_cot_reasoning_key or "gemini_refined_label",
+            steervla_hl_cot_subtask_key=self.hl_cot_subtask_key or "prompt",
             steervla_include_ego_history=self.include_ego_history,
             steervla_include_xy_action=self.include_xy_action,
             steervla_speed_in_prompt=False,
@@ -776,6 +810,11 @@ class TrainConfig:
     overwrite: bool = False
     # If true, will resume training from the last checkpoint.
     resume: bool = False
+    # If set, resume training from this exact run directory (the timestamped
+    # directory that contains numbered step subdirs). When provided, this
+    # overrides the fresh-timestamp run directory that train.py would otherwise
+    # create, and implies resume=True. May be a local path or a `gs://...` URI.
+    resume_dir: str | None = None
 
     # If true, will enable wandb logging.
     wandb_enabled: bool = True
@@ -809,6 +848,8 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+        if self.resume_dir and self.overwrite:
+            raise ValueError("Cannot resume_dir and overwrite at the same time.")
 
 
 # Use `get_config` if you need to get a config by name in your code.
@@ -1432,7 +1473,7 @@ _CONFIGS = [
             decay_steps=100_000,
             decay_lr=1e-5,
         ),
-        num_train_steps=100_000,
+        num_train_steps=200_000,
         batch_size=24,
         fsdp_devices=4,
         log_interval=1,
@@ -1440,6 +1481,73 @@ _CONFIGS = [
         save_interval=5000,
         num_workers=0,
         checkpoint_base_dir="gs://cat-logs",
+    ),
+    TrainConfig(
+        name="pi05_steervla_cot_ki_simplified_reasoning",
+        model=pi0_config.Pi0CoTConfig(
+            action_dim=32,
+            action_horizon=10,
+            max_token_len=112,
+            max_subtask_len=64,
+            max_reasoning_len=64,
+            cot_loss_weight=1.0,
+            knowledge_insulation=True,
+        ),
+        data=RLDSSteerVLACoTDataConfig(
+            repo_id="steervla_simlingo_cot",
+            rlds_data_dir="/raid/datasets/steervla",
+            dataset_format=steervla_rlds_dataset.DatasetFormat.SIMLINGO,
+            include_ego_history=False,
+            include_xy_action=False,
+            speed_in_prompt=True,
+            proprio_norm=True,
+            action_dim=4,
+            output_action_format=steervla_rlds_dataset.OutputActionFormat.DELTA_XY_T_DELTA_XY_SPACE,
+            lang_label_type=steervla_rlds_dataset.LangLabelType.ROUTING_COMMAND,
+            dataset_name_weight_mappings={
+                "simlingo_dataset_all_img512_1116": 1.0,
+                "simlingo_dataset_acceleration_negative5_img512_1116": 0.2,
+                "simlingo_dataset_acceleration_negative1_img512_1116": 0.1,
+                "simlingo_dataset_acceleration_positive1_img512_1116": 0.1,
+                "simlingo_dataset_acceleration_positive5_img512_1116": 0.2,
+                "simlingo_dataset_lateral_control12_img512_1116": 0.1,
+                "simlingo_dataset_lateral_control_higher5_img512_1116": 0.3,
+                "simlingo_dataset_start_from_stop_img512_1116": 0.2,
+                "simlingo_dataset_vehicle_front_img512_1116": 0.3,
+                "simlingo_dataset_vehicle_side_img512_1116": 0.1,
+                "simlingo_dataset_leading_object_vehicle_img512_1116": 0.05,
+                "simlingo_dataset_leading_object_traffic_stop_img512_1116": 0.2,
+                "simlingo_dataset_leading_object_traffic_light_img512_1116": 0.2,
+                "simlingo_dataset_leading_object_walker_img512_1116": 0.2,
+                "simlingo_dataset_changed_route_img512_1116": 0.2,
+                "simlingo_dataset_parking_lane_img512_1116": 0.3,
+            },
+            hl_dataset_name_weight_mappings={
+                "simplified_reasoning_dataset": 1.85,
+            },
+            hl_dataset_format=steervla_rlds_dataset.DatasetFormat.SIMLINGO,
+            hl_cot_reasoning_key="gemini_refined_label",
+            hl_cot_subtask_key="prompt",
+            
+            max_subtask_len=64,
+            max_reasoning_len=64,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=1e-4,
+            decay_steps=200_000,
+            decay_lr=1e-5,
+        ),
+        num_train_steps=200_000,
+        batch_size=256,
+        fsdp_devices=4,
+        log_interval=1,
+        eval_interval=100,
+        save_interval=2000,
+        num_workers=0,
+        checkpoint_base_dir="gs://cat-logs",
+        resume=True,
     ),
     TrainConfig(
         name="pi05_steervla_finetune",

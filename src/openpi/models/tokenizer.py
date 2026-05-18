@@ -81,7 +81,12 @@ class CoTPaligemmaTokenizer:
             self._tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
 
     def _pad_or_truncate(
-        self, tokens: list[int], mask: list[bool], max_len: int
+        self,
+        tokens: list[int],
+        mask: list[bool],
+        max_len: int,
+        *,
+        segment_name: str,
     ) -> tuple[np.ndarray, np.ndarray]:
         if len(tokens) < max_len:
             pad = [False] * (max_len - len(tokens))
@@ -89,7 +94,7 @@ class CoTPaligemmaTokenizer:
             mask = mask + pad
         elif len(tokens) > max_len:
             logging.warning(
-                f"Token length ({len(tokens)}) exceeds max ({max_len}), truncating."
+                f"{segment_name} token length ({len(tokens)}) exceeds max ({max_len}), truncating."
             )
             tokens = tokens[:max_len]
             mask = mask[:max_len]
@@ -107,7 +112,7 @@ class CoTPaligemmaTokenizer:
         )
         tokens = self._tokenizer.encode(text, add_bos=True) + [self._start_of_reasoning()]
         mask = [True] * len(tokens)
-        return self._pad_or_truncate(tokens, mask, self._max_prompt_len)
+        return self._pad_or_truncate(tokens, mask, self._max_prompt_len, segment_name="prompt")
 
     def tokenize_subtask(self, subtask: str) -> tuple[np.ndarray, np.ndarray]:
         """Tokenize subtask body (causal segment; follows reasoning in the prefix)."""
@@ -115,7 +120,7 @@ class CoTPaligemmaTokenizer:
         text = f"{cleaned};"
         tokens = self._tokenizer.encode(text) + [self._end_of_subtask()] + [self._tokenizer.eos_id()]
         mask = [True] * len(tokens)
-        return self._pad_or_truncate(tokens, mask, self._max_subtask_len)
+        return self._pad_or_truncate(tokens, mask, self._max_subtask_len, segment_name="subtask")
 
     def tokenize_reasoning(self, reasoning: str) -> tuple[np.ndarray, np.ndarray]:
         """Tokenize reasoning body (causal segment; first generated segment after the prompt)."""
@@ -123,7 +128,7 @@ class CoTPaligemmaTokenizer:
         text = f"{cleaned};"
         tokens = self._tokenizer.encode(text) + [self._end_of_reasoning()] + [self._start_of_subtask()]
         mask = [True] * len(tokens)
-        return self._pad_or_truncate(tokens, mask, self._max_reasoning_len)
+        return self._pad_or_truncate(tokens, mask, self._max_reasoning_len, segment_name="reasoning")
 
     @property
     def vocab_size(self) -> int:

@@ -114,6 +114,8 @@ class Observation(Generic[ArrayT]):
     # Ground-truth reasoning/commentary tokens and mask.
     tokenized_reasoning: at.Int[ArrayT, "*b lr"] | None = None
     tokenized_reasoning_mask: at.Bool[ArrayT, "*b lr"] | None = None
+    # Optional per-timestep action loss mask (e.g., disable action supervision on HL-only samples).
+    action_loss_mask: at.Bool[ArrayT, "*b ah"] | None = None
 
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
@@ -139,6 +141,7 @@ class Observation(Generic[ArrayT]):
             tokenized_subtask_mask=data.get("tokenized_subtask_mask"),
             tokenized_reasoning=data.get("tokenized_reasoning"),
             tokenized_reasoning_mask=data.get("tokenized_reasoning_mask"),
+            action_loss_mask=data.get("action_loss_mask"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -222,6 +225,7 @@ def preprocess_observation(
         tokenized_subtask_mask=observation.tokenized_subtask_mask,
         tokenized_reasoning=observation.tokenized_reasoning,
         tokenized_reasoning_mask=observation.tokenized_reasoning_mask,
+        action_loss_mask=observation.action_loss_mask,
     )
 
 

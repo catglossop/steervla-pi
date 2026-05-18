@@ -189,6 +189,7 @@ class Pi0CoTConfig(_model.BaseModelConfig):
                 tokenized_subtask_mask=jax.ShapeDtypeStruct([batch_size, self.max_subtask_len], bool),
                 tokenized_reasoning=jax.ShapeDtypeStruct([batch_size, self.max_reasoning_len], jnp.int32),
                 tokenized_reasoning_mask=jax.ShapeDtypeStruct([batch_size, self.max_reasoning_len], bool),
+                action_loss_mask=jax.ShapeDtypeStruct([batch_size, self.action_horizon], jnp.bool_),
             )
         action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
 

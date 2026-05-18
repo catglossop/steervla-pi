@@ -181,12 +181,21 @@ def run_visualization_evaluation(
         pred_actions = np.asarray(eval_info["pred_actions"])
         gt_actions = np.asarray(eval_info["gt_actions"])
 
+        # Determine which samples carry action supervision (i.e., are NOT high-level / CoT-only).
+        # HL samples have action_loss_mask=False for all timesteps and should be excluded
+        # from action-level eval metrics.
+        observation = batch[0]
+        if observation.action_loss_mask is not None:
+            action_loss_mask = np.asarray(jax.device_get(observation.action_loss_mask))
+            non_hl_mask = np.any(action_loss_mask, axis=-1)
+        else:
+            non_hl_mask = np.ones(pred_actions.shape[0], dtype=bool)
+
         # Denormalize
         pred_denorm = denormalize_actions(pred_actions, action_dim, output_action_format)
         gt_denorm = denormalize_actions(gt_actions, action_dim, output_action_format)
 
         # Extract initial speeds from state (last value before normalization, ×20 to undo /20)
-        observation = batch[0]
         states = np.asarray(jax.device_get(observation.state))
         initial_speeds = states[:, -2] * 20.0 if states.shape[-1] >= 2 else np.zeros(states.shape[0])
 
@@ -194,50 +203,80 @@ def run_visualization_evaluation(
         pred_wp = compute_waypoints(pred_denorm, initial_speeds, dt, output_action_format)
         gt_wp = compute_waypoints(gt_denorm, initial_speeds, dt, output_action_format)
 
-        # Metrics
-        metrics = compute_trajectory_metrics(pred_wp, gt_wp)
+        # Restrict action-level eval metrics to non-HL samples only.
+        metrics: dict[str, float] = {}
+        n_non_hl = int(non_hl_mask.sum())
+        metrics["eval/num_non_hl_samples"] = float(n_non_hl)
+        if n_non_hl > 0:
+            pred_wp_eval = pred_wp[non_hl_mask]
+            gt_wp_eval = gt_wp[non_hl_mask]
+            metrics.update(compute_trajectory_metrics(pred_wp_eval, gt_wp_eval))
+
+            act_mse = np.mean(
+                (pred_actions[non_hl_mask, ..., :action_dim] - gt_actions[non_hl_mask, ..., :action_dim]) ** 2
+            )
+            metrics["eval/action_mse"] = float(act_mse)
+        else:
+            logging.warning("run_visualization_evaluation: no non-HL samples in eval batch; skipping action metrics.")
+
         metrics["eval/loss"] = float(eval_info["loss"])
 
-        # Action-level errors (on normalized actions, first action_dim dims)
-        act_mse = np.mean((pred_actions[..., :action_dim] - gt_actions[..., :action_dim]) ** 2)
-        metrics["eval/action_mse"] = float(act_mse)
-
-        n_vis = min(vis_samples, pred_wp.shape[0])
         images_dict = jax.device_get(observation.images)
         base_key = next(iter(images_dict))
         base_images = np.asarray(images_dict[base_key])
 
-        figures = []
-        for i in range(n_vis):
-            fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+        def _make_trajectory_figures(sample_indices: np.ndarray, group_label: str) -> list:
+            figs = []
+            for sample_i in sample_indices:
+                sample_i = int(sample_i)
+                fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
-            ax = axes[0]
-            ax.plot(gt_wp[i, :, 1], gt_wp[i, :, 0], "g.-", label="Ground Truth", linewidth=2)
-            ax.plot(pred_wp[i, :, 1], pred_wp[i, :, 0], "b.--", label="Predicted", linewidth=2)
-            ax.plot(0, 0, "ko", markersize=8)
-            ax.set_xlabel("Y (m)")
-            ax.set_ylabel("X (m)")
-            ax.set_title(f"Trajectory — sample {i}")
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-            ax.axis("equal")
+                ax = axes[0]
+                ax.plot(
+                    gt_wp[sample_i, :, 1], gt_wp[sample_i, :, 0],
+                    "g.-", label="Ground Truth", linewidth=2,
+                )
+                ax.plot(
+                    pred_wp[sample_i, :, 1], pred_wp[sample_i, :, 0],
+                    "b.--", label="Predicted", linewidth=2,
+                )
+                ax.plot(0, 0, "ko", markersize=8)
+                ax.set_xlabel("Y (m)")
+                ax.set_ylabel("X (m)")
+                ax.set_title(f"Trajectory — {group_label} sample {sample_i}")
+                ax.legend()
+                ax.grid(True, alpha=0.3)
+                ax.axis("equal")
 
-            ax = axes[1]
-            img = base_images[i]
-            if np.issubdtype(img.dtype, np.floating):
-                img = np.clip(img * 255, 0, 255).astype(np.uint8) if img.max() <= 1.0 else np.clip(img, 0, 255).astype(np.uint8)
-            ax.imshow(img)
-            ax.set_title("Camera view")
-            ax.axis("off")
+                ax = axes[1]
+                img = base_images[sample_i]
+                if np.issubdtype(img.dtype, np.floating):
+                    img = np.clip(img * 255, 0, 255).astype(np.uint8) if img.max() <= 1.0 else np.clip(img, 0, 255).astype(np.uint8)
+                ax.imshow(img)
+                ax.set_title("Camera view")
+                ax.axis("off")
 
-            fig.tight_layout()
+                fig.tight_layout()
 
-            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-                fig.savefig(tmp.name, format="png", bbox_inches="tight", dpi=100)
-                plt.close(fig)
-                figures.append(wandb.Image(tmp.name, caption=f"step {step} sample {i}"))
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                    fig.savefig(tmp.name, format="png", bbox_inches="tight", dpi=100)
+                    plt.close(fig)
+                    figs.append(wandb.Image(
+                        tmp.name,
+                        caption=f"step {step} {group_label} sample {sample_i}",
+                    ))
+            return figs
 
-        wandb.log({**metrics, "eval/trajectories": figures}, step=step)
+        non_hl_indices = np.flatnonzero(non_hl_mask)[:vis_samples]
+        hl_indices = np.flatnonzero(~non_hl_mask)[:vis_samples]
+
+        log_dict: dict = {**metrics}
+        if non_hl_indices.size > 0:
+            log_dict["eval/trajectories_non_hl"] = _make_trajectory_figures(non_hl_indices, "non-HL")
+        if hl_indices.size > 0:
+            log_dict["eval/trajectories_hl"] = _make_trajectory_figures(hl_indices, "HL")
+
+        wandb.log(log_dict, step=step)
         logging.info(
             f"Eval step {step}: "
             + ", ".join(f"{k}={v:.4f}" for k, v in metrics.items())

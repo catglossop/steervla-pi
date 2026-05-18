@@ -53,6 +53,12 @@ class SteerVLARldsDataset:
         datasets: Sequence[SteerVLARLDSDataset],
         *,
         dataset_format: DatasetFormat = DatasetFormat.NUSCENES,
+        hl_datasets: Sequence[SteerVLARLDSDataset] = (),
+        hl_dataset_format: DatasetFormat | None = None,
+        cot_reasoning_key: str = "commentary",
+        cot_subtask_key: str = "gemini_refined_label",
+        hl_cot_reasoning_key: str = "gemini_refined_label",
+        hl_cot_subtask_key: str = "prompt",
         shuffle: bool = True,
         action_chunk_size: int = 6,
         include_ego_history: bool = True,
@@ -69,6 +75,7 @@ class SteerVLARldsDataset:
         num_parallel_reads: int = -1,
         num_parallel_calls: int = -1,
         image_size: int = 512,
+        split: str = "train",
     ):
         import dlimp as dl
         import tensorflow as tf
@@ -76,12 +83,27 @@ class SteerVLARldsDataset:
 
         tf.config.set_visible_devices([], "GPU")
 
-        # Weights are normalized internally by sample_from_datasets; no need to sum to 1.0.
-        total_weight = sum(d.weight for d in datasets)
-        assert total_weight > 0, "Total dataset weight must be positive"
-        normalized_weights = [d.weight / total_weight for d in datasets]
+        if hl_datasets and not enable_cot:
+            raise ValueError("High-level datasets require enable_cot=True.")
 
-        def _build_nuscenes_restructure(traj_map_tf=tf):
+        source_specs: list[tuple[SteerVLARLDSDataset, DatasetFormat, bool, str, str]] = [
+            (d, dataset_format, True, cot_reasoning_key, cot_subtask_key) for d in datasets
+        ]
+        source_specs += [
+            (d, hl_dataset_format or dataset_format, False, hl_cot_reasoning_key, hl_cot_subtask_key)
+            for d in hl_datasets
+        ]
+
+        # Weights are normalized internally by sample_from_datasets; no need to sum to 1.0.
+        total_weight = sum(d.weight for d, _, _, _, _ in source_specs)
+        assert total_weight > 0, "Total dataset weight must be positive"
+        normalized_weights = [d.weight / total_weight for d, _, _, _, _ in source_specs]
+
+        def _build_nuscenes_restructure(
+            traj_map_tf=tf,
+            *,
+            action_supervision: bool = True,
+        ):
             """Build the nuScenes restructure function."""
 
             def restructure(traj):
@@ -127,6 +149,11 @@ class SteerVLARldsDataset:
                     ego_xy = traj_map_tf.stack([x_ego, y_ego], axis=-1) / delta_xy_norm
                     actions = traj_map_tf.concat([actions, ego_xy], axis=-1)
 
+                action_loss_mask = traj_map_tf.fill(
+                    [traj_len, traj_map_tf.shape(actions)[1]],
+                    traj_map_tf.cast(action_supervision, traj_map_tf.bool),
+                )
+
                 instruction = traj["language_instruction"]
                 if speed_in_prompt:
                     speed_str = traj_map_tf.strings.as_string(current_speed)
@@ -137,6 +164,7 @@ class SteerVLARldsDataset:
 
                 return {
                     "actions": actions,
+                    "action_loss_mask": action_loss_mask,
                     "observation": {
                         "image": front_image,
                         "state": ego_state,
@@ -147,7 +175,12 @@ class SteerVLARldsDataset:
 
             return restructure
 
-        def _build_simlingo_restructure():
+        def _build_simlingo_restructure(
+            *,
+            action_supervision: bool = True,
+            cot_reasoning_source_key: str = "commentary",
+            cot_subtask_source_key: str = "gemini_refined_label",
+        ):
             """Build the SimLingo restructure function."""
 
             def restructure(traj):
@@ -208,8 +241,11 @@ class SteerVLARldsDataset:
                     raise ValueError(f"Unknown output_action_format: {oaf}")
 
                 actions = actions[:, :action_chunk_size, :]
+                action_loss_mask = tf.fill(
+                    [traj_len, action_chunk_size], tf.cast(action_supervision, tf.bool)
+                )
 
-                # Select language label
+                # Select language label 
                 llt = lang_label_type
                 if llt == LangLabelType.COMMENTARY:
                     instruction = traj["commentary"]
@@ -218,12 +254,12 @@ class SteerVLARldsDataset:
                 elif llt == LangLabelType.GEMINI_LONGER:
                     instruction = traj["gemini_refined_label_longer"]
                 elif llt == LangLabelType.ROUTING_COMMAND:
-                    instruction = tf.strings.regex_replace(traj["routing_command"], "^Command: ", "")
+                    instruction = tf.strings.regex_replace(traj["routing_command"], "(?i)^command:\\s*", "")
                 else:
                     raise ValueError(f"Unknown lang_label_type: {llt}")
 
                 if routing_command_in_prompt and llt != LangLabelType.ROUTING_COMMAND:
-                    rc = tf.strings.regex_replace(traj["routing_command"], "^Command: ", "")
+                    rc = tf.strings.regex_replace(traj["routing_command"], "(?i)^command:\\s*", "")
                     instruction = tf.strings.join([rc, instruction], separator=" ")
 
                 if speed_in_prompt:
@@ -244,6 +280,7 @@ class SteerVLARldsDataset:
 
                 result = {
                     "actions": actions,
+                    "action_loss_mask": action_loss_mask,
                     "observation": {
                         "image": front_image,
                         "state": ego_state,
@@ -253,45 +290,60 @@ class SteerVLARldsDataset:
                 }
 
                 if enable_cot:
-                    # routing_cmd = tf.strings.regex_replace(traj["routing_command"], "^Command: ", "")
-                    result["subtask"] = traj["gemini_refined_label"]
-                    result["reasoning"] = traj["commentary"]
+                    result["subtask"] = traj[cot_subtask_source_key]
+                    result["reasoning"] = traj[cot_reasoning_source_key]
 
                 return result
 
             return restructure
 
-        def prepare_single_dataset(dataset_cfg: SteerVLARLDSDataset):
+        def prepare_single_dataset(
+            dataset_cfg: SteerVLARLDSDataset,
+            source_dataset_format: DatasetFormat,
+            *,
+            action_supervision: bool,
+            cot_reasoning_source_key: str,
+            cot_subtask_source_key: str,
+            split: str = "train",
+        ):
             builder_kwargs = {"data_dir": data_dir}
             if dataset_cfg.version is not None:
                 builder_kwargs["version"] = dataset_cfg.version
             builder = tfds.builder(dataset_cfg.name, **builder_kwargs)
             dataset = dl.DLataset.from_rlds(
-                builder, split="train", shuffle=shuffle, num_parallel_reads=num_parallel_reads
+                builder, split=split, shuffle=shuffle, num_parallel_reads=num_parallel_reads
             )
             dataset = dataset.repeat()
 
-            if dataset_format == DatasetFormat.NUSCENES:
-                restructure_fn = _build_nuscenes_restructure(tf)
-            elif dataset_format == DatasetFormat.SIMLINGO:
-                restructure_fn = _build_simlingo_restructure()
+            if source_dataset_format == DatasetFormat.NUSCENES:
+                restructure_fn = _build_nuscenes_restructure(tf, action_supervision=action_supervision)
+            elif source_dataset_format == DatasetFormat.SIMLINGO:
+                restructure_fn = _build_simlingo_restructure(
+                    action_supervision=action_supervision,
+                    cot_reasoning_source_key=cot_reasoning_source_key,
+                    cot_subtask_source_key=cot_subtask_source_key,
+                )
             else:
-                raise ValueError(f"Unknown dataset_format: {dataset_format}")
+                raise ValueError(f"Unknown dataset_format: {source_dataset_format}")
 
             dataset = dataset.traj_map(restructure_fn, num_parallel_calls)
 
-            if dataset_format == DatasetFormat.NUSCENES:
+            if source_dataset_format == DatasetFormat.NUSCENES:
                 # nuScenes: actions are already chunked in action_chunk field,
                 # but may need trimming/padding to action_chunk_size.
                 def chunk_actions(traj):
                     current_chunk_size = tf.shape(traj["actions"])[1]
                     if current_chunk_size >= action_chunk_size:
                         traj["actions"] = traj["actions"][:, :action_chunk_size, :]
+                        traj["action_loss_mask"] = traj["action_loss_mask"][:, :action_chunk_size]
                     else:
                         pad_size = action_chunk_size - current_chunk_size
                         last_actions = traj["actions"][:, -1:, :]
+                        last_mask = traj["action_loss_mask"][:, -1:]
                         padding = tf.repeat(last_actions, pad_size, axis=1)
+                        mask_padding = tf.repeat(last_mask, pad_size, axis=1)
                         traj["actions"] = tf.concat([traj["actions"], padding], axis=1)
+                        traj["action_loss_mask"] = tf.concat([traj["action_loss_mask"], mask_padding], axis=1)
                     return traj
 
                 dataset = dataset.traj_map(chunk_actions, num_parallel_calls)
@@ -308,14 +360,29 @@ class SteerVLARldsDataset:
 
             return dataset.frame_map(decode_images, num_parallel_calls)
 
-        logging.info(f"Preparing {len(datasets)} SteerVLA datasets ({dataset_format.name})...")
+        logging.info(f"Preparing {len(source_specs)} SteerVLA datasets...")
         logging.info("-" * 50)
-        for ds, nw in zip(datasets, normalized_weights):
+        for (ds, ds_format, action_supervision, cot_reason_key, cot_subtask_key), nw in zip(source_specs, normalized_weights):
             ver = ds.version or "default"
-            logging.info(f"    {ds.name} (v{ver}) weight={ds.weight:.3f} (normalized={nw:.4f})")
+            logging.info(
+                f"    {ds.name} (v{ver}) format={ds_format.name} "
+                f"cot_reasoning_key={cot_reason_key} cot_subtask_key={cot_subtask_key} "
+                f"action_supervision={action_supervision} "
+                f"weight={ds.weight:.3f} (normalized={nw:.4f})"
+            )
         logging.info("-" * 50)
 
-        all_datasets = [prepare_single_dataset(ds) for ds in datasets]
+        all_datasets = [
+            prepare_single_dataset(
+                ds,
+                ds_format,
+                action_supervision=action_supervision,
+                cot_reasoning_source_key=cot_reason_key,
+                cot_subtask_source_key=cot_subtask_key,
+                split=split,
+            )
+            for ds, ds_format, action_supervision, cot_reason_key, cot_subtask_key in source_specs
+        ]
 
         final_dataset = dl.DLataset.sample_from_datasets(all_datasets, weights=normalized_weights)
         if shuffle:
