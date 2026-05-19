@@ -23,6 +23,7 @@ import openpi.policies.libero_policy as libero_policy
 import openpi.policies.steervla_policy as steervla_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
+import openpi.shared.nnx_utils as nnx_utils
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.steervla_rlds_dataset as steervla_rlds_dataset
 import openpi.training.misc.polaris_config as polaris_config
@@ -1481,6 +1482,71 @@ _CONFIGS = [
         save_interval=5000,
         num_workers=0,
         checkpoint_base_dir="gs://cat-logs",
+    ),
+    TrainConfig(
+        name="pi05_steervla_cot_ki_inference",
+        model=pi0_config.Pi0CoTConfig(
+            action_dim=32,
+            action_horizon=10,
+            max_token_len=112,
+            max_subtask_len=48,
+            max_reasoning_len=96,
+            cot_loss_weight=1.0,
+            knowledge_insulation=True,
+            inference_image_keys=("base_0_rgb",),
+        ),
+        data=RLDSSteerVLACoTDataConfig(
+            repo_id="steervla_simlingo_cot",
+            rlds_data_dir="gs://tian-us-central2/tensorflow_datasets",
+            dataset_format=steervla_rlds_dataset.DatasetFormat.SIMLINGO,
+            include_ego_history=False,
+            include_xy_action=False,
+            speed_in_prompt=True,
+            proprio_norm=True,
+            action_dim=4,
+            output_action_format=steervla_rlds_dataset.OutputActionFormat.DELTA_XY_T_DELTA_XY_SPACE,
+            lang_label_type=steervla_rlds_dataset.LangLabelType.ROUTING_COMMAND,
+            dataset_name_weight_mappings={
+                "simlingo_dataset_all_img512_1116": 1.0,
+                "simlingo_dataset_acceleration_negative5_img512_1116": 0.2,
+                "simlingo_dataset_acceleration_negative1_img512_1116": 0.1,
+                "simlingo_dataset_acceleration_positive1_img512_1116": 0.1,
+                "simlingo_dataset_acceleration_positive5_img512_1116": 0.2,
+                "simlingo_dataset_lateral_control12_img512_1116": 0.1,
+                "simlingo_dataset_lateral_control_higher5_img512_1116": 0.3,
+                "simlingo_dataset_start_from_stop_img512_1116": 0.2,
+                "simlingo_dataset_vehicle_front_img512_1116": 0.3,
+                "simlingo_dataset_vehicle_side_img512_1116": 0.1,
+                "simlingo_dataset_leading_object_vehicle_img512_1116": 0.05,
+                "simlingo_dataset_leading_object_traffic_stop_img512_1116": 0.2,
+                "simlingo_dataset_leading_object_traffic_light_img512_1116": 0.2,
+                "simlingo_dataset_leading_object_walker_img512_1116": 0.2,
+                "simlingo_dataset_changed_route_img512_1116": 0.2,
+                "simlingo_dataset_parking_lane_img512_1116": 0.3,
+            },
+            max_subtask_len=48,
+            max_reasoning_len=96,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        # Train only action_out_proj + time_mlp*; freeze everything else.
+        # Since TrainConfig.trainable_filter = All(Param, Not(freeze_filter)),
+        # using Not(PathRegex("...")) as freeze_filter keeps only regex-matching params trainable.
+        freeze_filter=nnx.Not(nnx_utils.PathRegex(".*(action_out_proj|time_mlp).*")),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=1e-4,
+            decay_steps=100_000,
+            decay_lr=1e-5,
+        ),
+        num_train_steps=100_000,
+        batch_size=24,
+        fsdp_devices=1,
+        log_interval=1,
+        eval_interval=100,
+        save_interval=5000,
+        num_workers=0,
+        checkpoint_base_dir="gs://cat-logs",
+        ema_decay=None,
     ),
     TrainConfig(
         name="pi05_steervla_cot_ki_simplified_reasoning",
