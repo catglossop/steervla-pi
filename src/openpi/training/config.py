@@ -816,6 +816,11 @@ class TrainConfig:
     # overrides the fresh-timestamp run directory that train.py would otherwise
     # create, and implies resume=True. May be a local path or a `gs://...` URI.
     resume_dir: str | None = None
+    # If set, restore from this exact step subdirectory inside `resume_dir`
+    # (or the standard run directory). If unset, the latest available step is
+    # used. Useful when the run directory contains multiple checkpoints and
+    # you want to pin to a specific one.
+    resume_step: int | None = None
 
     # If true, will enable wandb logging.
     wandb_enabled: bool = True
@@ -1426,6 +1431,7 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi05_steervla_cot_ki",
+        exp_name="pi05_steervla_cot_ki",
         model=pi0_config.Pi0CoTConfig(
             action_dim=32,
             action_horizon=10,
@@ -1437,7 +1443,8 @@ _CONFIGS = [
         ),
         data=RLDSSteerVLACoTDataConfig(
             repo_id="steervla_simlingo_cot",
-            rlds_data_dir="gs://tian-us-central2/tensorflow_datasets",
+            # rlds_data_dir="gs://tian-us-central2/tensorflow_datasets",
+            rlds_data_dir="/raid/datasets/steervla",
             dataset_format=steervla_rlds_dataset.DatasetFormat.SIMLINGO,
             include_ego_history=False,
             include_xy_action=False,
@@ -1475,13 +1482,20 @@ _CONFIGS = [
             decay_lr=1e-5,
         ),
         num_train_steps=200_000,
-        batch_size=24,
+        batch_size=256,
         fsdp_devices=4,
         log_interval=1,
         eval_interval=100,
         save_interval=5000,
         num_workers=0,
         checkpoint_base_dir="gs://cat-logs",
+        # Resume from the step-90000 checkpoint of the previous run. The run dir
+        # is the parent of the step subdir (i.e., gs://.../pi05_steervla_cot_ki).
+        # The bucket also has later steps (95000, 99999) so resume_step pins to
+        # 90000 explicitly instead of letting orbax pick the latest.
+        resume=True,
+        resume_dir="gs://cat-logs/pi05_steervla_cot_ki/pi05_steervla_cot_ki",
+        resume_step=99999,
     ),
     TrainConfig(
         name="pi05_steervla_cot_ki_inference",

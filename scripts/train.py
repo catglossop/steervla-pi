@@ -50,6 +50,23 @@ def init_logging():
     logger.setLevel(logging.INFO)
     logger.handlers[0].setFormatter(formatter)
 
+    # Suppress noisy orbax CheckpointManager logs about missing per-step
+    # `metrics/metrics` files. Those errors are caught inside orbax (see
+    # checkpoint_manager.py `metrics()`), so they're harmless but spam the logs
+    # when resuming from a checkpoint that was saved without metrics tracking.
+    class _OrbaxMetricsFilter(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            if record.filename == "checkpoint_manager.py" and record.lineno in (1654, 1655):
+                return False
+            msg = record.getMessage()
+            if "Missing metrics for step" in msg:
+                return False
+            if "/metrics/metrics not found" in msg:
+                return False
+            return True
+
+    logger.addFilter(_OrbaxMetricsFilter())
+
 
 def init_wandb(
     config: _config.TrainConfig,
@@ -379,7 +396,9 @@ def main(config: _config.TrainConfig):
     logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
 
     if resuming:
-        train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
+        train_state = _checkpoints.restore_state(
+            checkpoint_manager, train_state, data_loader, step=config.resume_step
+        )
 
     ptrain_step = jax.jit(
         functools.partial(train_step, config),

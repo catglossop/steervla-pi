@@ -297,6 +297,32 @@ def _decode_tokens(token_ids: np.ndarray, mask: np.ndarray, tokenizer) -> str:
     return tokenizer.decode(valid.tolist())
 
 
+def _decode_cot_segment(
+    token_ids: np.ndarray,
+    mask: np.ndarray,
+    tokenizer,
+    *,
+    start_id: int,
+    end_id: int,
+) -> str:
+    """Decode a CoT segment, dropping the leading ``<start_of_*>`` delimiter
+    and truncating at the first ``<end_of_*>`` delimiter if either is present
+    in the valid (mask=True) portion.
+
+    Both segments emitted by ``CoTPaligemmaTokenizer`` are framed as
+    ``[<start_of_X>, ...body..., <end_of_X>, (eos)]``; the model's
+    ``sample_cot`` also bootstraps each segment with ``<start_of_X>``, so this
+    helper strips them out of both ground-truth and predicted strings.
+    """
+    valid = token_ids[mask.astype(bool)]
+    if valid.size > 0 and int(valid[0]) == start_id:
+        valid = valid[1:]
+    end_positions = np.where(valid == end_id)[0]
+    if end_positions.size > 0:
+        valid = valid[: end_positions[0]]
+    return tokenizer.decode(valid.tolist())
+
+
 _LOC_RE = re.compile(r"(?:<loc\d+>)+")
 
 
@@ -333,10 +359,10 @@ def run_cot_visualization(
             return
 
         tokenizer = CoTPaligemmaTokenizer()
-        start_of_subtask_text = _decode_tokens(np.array([tokenizer._start_of_subtask()]), np.array([True]), tokenizer._tokenizer)
-        end_of_subtask_text = _decode_tokens(np.array([tokenizer._end_of_subtask()]), np.array([True]), tokenizer._tokenizer)
-        start_of_reasoning_text = _decode_tokens(np.array([tokenizer._start_of_reasoning()]), np.array([True]), tokenizer._tokenizer)
-        end_of_reasoning_text = _decode_tokens(np.array([tokenizer._end_of_reasoning()]), np.array([True]), tokenizer._tokenizer)
+        start_of_subtask_id = tokenizer._start_of_subtask()
+        end_of_subtask_id = tokenizer._end_of_subtask()
+        start_of_reasoning_id = tokenizer._start_of_reasoning()
+        end_of_reasoning_id = tokenizer._end_of_reasoning()
         model = nnx.merge(state.model_def, state.params)
         model.eval()
 
@@ -378,21 +404,31 @@ def run_cot_visualization(
 
         for i in range(n_vis):
             prompt_text = _decode_tokens(prompt_ids[i], prompt_mask[i], tokenizer._tokenizer)
-            subtask_gt = _decode_tokens(subtask_ids[i], subtask_mask[i], tokenizer._tokenizer)
-            reasoning_gt = _decode_tokens(reasoning_ids[i], reasoning_mask[i], tokenizer._tokenizer)
+            subtask_gt = _decode_cot_segment(
+                subtask_ids[i], subtask_mask[i], tokenizer._tokenizer,
+                start_id=start_of_subtask_id, end_id=end_of_subtask_id,
+            )
+            reasoning_gt = _decode_cot_segment(
+                reasoning_ids[i], reasoning_mask[i], tokenizer._tokenizer,
+                start_id=start_of_reasoning_id, end_id=end_of_reasoning_id,
+            )
 
             if pred_subtask_ids is not None:
-                subtask_pred = _decode_tokens(pred_subtask_ids[i], pred_subtask_mask[i], tokenizer._tokenizer)
-                reasoning_pred = _decode_tokens(pred_reasoning_ids[i], pred_reasoning_mask[i], tokenizer._tokenizer)
+                subtask_pred = _decode_cot_segment(
+                    pred_subtask_ids[i], pred_subtask_mask[i], tokenizer._tokenizer,
+                    start_id=start_of_subtask_id, end_id=end_of_subtask_id,
+                )
+                reasoning_pred = _decode_cot_segment(
+                    pred_reasoning_ids[i], pred_reasoning_mask[i], tokenizer._tokenizer,
+                    start_id=start_of_reasoning_id, end_id=end_of_reasoning_id,
+                )
             else:
                 subtask_pred = "(no sample_cot on this model)"
                 reasoning_pred = "(no sample_cot on this model)"
 
-            # Strip tails after the first end markers (segment order in tokens: reasoning, then subtask).
-            subtask_gt = subtask_gt.split(end_of_subtask_text)[0]
-            reasoning_gt = reasoning_gt.split(end_of_reasoning_text)[0]
-            subtask_pred = _strip_loc_spans(subtask_pred.split(end_of_subtask_text)[0])
-            reasoning_pred = _strip_loc_spans(reasoning_pred.split(end_of_reasoning_text)[0])
+            # Strip spurious ``<locN>`` spans from predictions (LM prior noise).
+            subtask_pred = _strip_loc_spans(subtask_pred)
+            reasoning_pred = _strip_loc_spans(reasoning_pred)
             subtask_gt = _strip_loc_spans(subtask_gt)
             reasoning_gt = _strip_loc_spans(reasoning_gt)
 

@@ -2,10 +2,24 @@
 
 Prefix layout (language, after image tokens; see ``CoTPaligemmaTokenizer``):
 
-    Prompt:...;Reasoning:<start_of_reasoning>
-    |--- bidirectional ---|...|--- causal: reasoning body + <end_of_reasoning> ---|
-    ;Subtask:<start_of_subtask>...<end_of_subtask>
-    |--- causal ---|
+    [Prompt:...;State:...;]                                           <-- bidirectional
+    [<start_of_reasoning> reasoning_body <end_of_reasoning>]          <-- causal
+    [<start_of_subtask>   subtask_body   <end_of_subtask> <eos>]      <-- causal
+
+Each segment owns its start/end delimiters: ``tokenize_reasoning`` and
+``tokenize_subtask`` in ``CoTPaligemmaTokenizer`` prepend ``<start_of_*>`` and
+append ``<end_of_*>`` themselves. The bidirectional prompt segment has no CoT
+delimiters of its own.
+
+Supervision (see ``_compute_loss_and_metrics``):
+    - ``first_reasoning_ce`` predicts ``<start_of_reasoning>`` from the last
+      valid image+prompt hidden.
+    - ``reasoning_ce`` (shifted CE) predicts reasoning body and
+      ``<end_of_reasoning>``.
+    - ``first_subtask_ce`` predicts ``<start_of_subtask>`` from the hidden at
+      ``<end_of_reasoning>``.
+    - ``subtask_ce`` (shifted CE) predicts subtask body, ``<end_of_subtask>``
+      and the trailing EOS.
 
 Suffix (Action expert, adaRMS):
     [action tokens] — attend to images + prompt + subtask (not reasoning).
@@ -261,7 +275,6 @@ class Pi0CoT(_model.BaseModel):
         reasoning_out = prefix_out[:, reasoning_start:reasoning_start + n_reasoning]
         subtask_start = reasoning_start + n_reasoning
         subtask_out = prefix_out[:, subtask_start:subtask_start + n_subtask]
-
         # Logits via embedder (shared embedding weights)
         reasoning_logits = self.PaliGemma.llm(reasoning_out, method="decode_logits")
         subtask_logits = self.PaliGemma.llm(subtask_out, method="decode_logits")
@@ -505,6 +518,26 @@ class Pi0CoT(_model.BaseModel):
         rea_m = jnp.zeros((batch_size, mr), dtype=jnp.bool_)
         done_r = jnp.zeros((batch_size,), dtype=jnp.bool_)
 
+        # Bootstrap reasoning with <start_of_reasoning>. The model is also
+        # trained (via first_reasoning_ce) to predict this token from the last
+        # prompt hidden, but force-injecting it keeps the segment anchored even
+        # when the start prediction is noisy, mirroring the subtask bootstrap
+        # below.
+        if mr > 0:
+            rng, sor_tok = self._cot_decode_token(h, rng, temperature)
+            sor_tok = jnp.where(sor_tok == START_OF_REASONING_ID, sor_tok, START_OF_REASONING_ID)
+            rea_buf = rea_buf.at[:, 0].set(sor_tok)
+            rea_m = rea_m.at[:, 0].set(True)
+            h, kv_cache, abs_pos, key_mask, cur_pos = self._cot_forward_fixed(
+                sor_tok,
+                h,
+                kv_cache,
+                abs_pos,
+                key_mask,
+                cur_pos,
+                jnp.ones((batch_size,), dtype=jnp.bool_),
+            )
+
         def reasoning_cond(carry):
             j, *_rest, done = carry
             return (j < mr) & (~jnp.all(done))
@@ -533,6 +566,7 @@ class Pi0CoT(_model.BaseModel):
             )
             return j + 1, rng, h, kv_cache, abs_pos, key_mask, cur_pos, rea_buf, rea_m, done
 
+        rea_start = jnp.asarray(1 if mr > 0 else 0, dtype=jnp.int32)
         (
             _j,
             rng,
@@ -547,7 +581,7 @@ class Pi0CoT(_model.BaseModel):
         ) = jax.lax.while_loop(
             reasoning_cond,
             reasoning_body,
-            (0, rng, h, kv_cache, abs_pos, key_mask, cur_pos, rea_buf, rea_m, done_r),
+            (rea_start, rng, h, kv_cache, abs_pos, key_mask, cur_pos, rea_buf, rea_m, done_r),
         )
 
         rr = jnp.arange(mr, dtype=jnp.int32)[None, :]
