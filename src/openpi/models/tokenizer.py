@@ -103,30 +103,35 @@ class CoTPaligemmaTokenizer:
     def tokenize_prompt(
         self, prompt: str, state: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Tokenize the bidirectional prefix: through ``<start_of_reasoning>`` (exclusive of reasoning body)."""
+        """Tokenize the bidirectional prefix (prompt + state; no CoT delimiters)."""
         cleaned = prompt.strip().replace("_", " ").replace("\n", " ")
         discretized = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
         state_str = " ".join(map(str, discretized))
         text = (
             f"Prompt:{cleaned};State:{state_str};"
         )
-        tokens = self._tokenizer.encode(text, add_bos=True) + [self._start_of_reasoning()]
+        tokens = self._tokenizer.encode(text, add_bos=True)
         mask = [True] * len(tokens)
         return self._pad_or_truncate(tokens, mask, self._max_prompt_len, segment_name="prompt")
 
     def tokenize_subtask(self, subtask: str) -> tuple[np.ndarray, np.ndarray]:
-        """Tokenize subtask body (causal segment; follows reasoning in the prefix)."""
+        """Tokenize subtask segment (causal; follows reasoning in the prefix)."""
         cleaned = subtask.strip().replace("_", " ").replace("\n", " ")
         text = f"{cleaned};"
-        tokens = self._tokenizer.encode(text) + [self._end_of_subtask()] + [self._tokenizer.eos_id()]
+        tokens = (
+            [self._start_of_subtask()]
+            + self._tokenizer.encode(text)
+            + [self._end_of_subtask()]
+            + [self._tokenizer.eos_id()]
+        )
         mask = [True] * len(tokens)
         return self._pad_or_truncate(tokens, mask, self._max_subtask_len, segment_name="subtask")
 
     def tokenize_reasoning(self, reasoning: str) -> tuple[np.ndarray, np.ndarray]:
-        """Tokenize reasoning body (causal segment; first generated segment after the prompt)."""
+        """Tokenize reasoning segment (causal; first generated segment after the prompt)."""
         cleaned = reasoning.strip().replace("_", " ").replace("\n", " ")
         text = f"{cleaned};"
-        tokens = self._tokenizer.encode(text) + [self._end_of_reasoning()] + [self._start_of_subtask()]
+        tokens = [self._start_of_reasoning()] + self._tokenizer.encode(text) + [self._end_of_reasoning()]
         mask = [True] * len(tokens)
         return self._pad_or_truncate(tokens, mask, self._max_reasoning_len, segment_name="reasoning")
 

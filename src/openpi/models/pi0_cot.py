@@ -137,7 +137,6 @@ class Pi0CoT(_model.BaseModel):
     # ------------------------------------------------------------------
     # Custom attention mask builder
     # ------------------------------------------------------------------
-
     @staticmethod
     def _build_attention_mask(
         prefix_mask: jnp.ndarray,
@@ -279,11 +278,10 @@ class Pi0CoT(_model.BaseModel):
             subtask_logits[:, :-1], subtask_targets[:, 1:], subtask_mask[:, 1:]
         )
 
-        # Boundary terms omitted by the slices above (same next-token layout as ``sample_cot``):
-        # - first reasoning body token is predicted from the last valid image+prompt hidden
-        #   (after ``<start_of_reasoning>``, not from reasoning_logits[:, 0]);
-        # - first subtask body token is predicted from the last valid reasoning hidden
-        #   (after ``<start_of_subtask>``), i.e. not from subtask_logits[:, 0].
+        # Boundary terms omitted by the shifted slices above (same layout as ``sample_cot``):
+        # - ``<start_of_reasoning>`` is predicted from the last valid image+prompt hidden;
+        # - ``<start_of_subtask>`` is predicted from the last valid reasoning hidden
+        #   (after ``<end_of_reasoning>``). End delimiters are covered by the shifted CE.
         prompt_prefix_out = prefix_out[:, :reasoning_start]
         prompt_prefix_mask = jnp.concatenate(img_masks + [prompt_mask], axis=1)
         h_after_prompt = self._gather_last_valid_hidden(prompt_prefix_out, prompt_prefix_mask)
@@ -560,9 +558,8 @@ class Pi0CoT(_model.BaseModel):
         first_end_r = jnp.min(jnp.where(matches_end_r, pos_r, mr), axis=-1)
         # End marker position in the normalized reasoning segment.
         end_pos_r = jnp.where(has_end_r, first_end_r, generated_len_r)
-        sos_pos_r = end_pos_r + 1
-        can_append_pair = sos_pos_r < mr
-        overflow_pair = ~can_append_pair
+        can_append_end = end_pos_r < mr
+        overflow_end = ~can_append_end
 
         # Keep existing generated tokens only.
         rea_m = rr < generated_len_r[:, None]
@@ -570,26 +567,18 @@ class Pi0CoT(_model.BaseModel):
 
         if mr > 0:
             safe_end_pos = jnp.clip(end_pos_r, 0, mr - 1)
-            write_end = (~overflow_pair)[:, None] & (rr == safe_end_pos[:, None])
+            write_end = (~overflow_end)[:, None] & (rr == safe_end_pos[:, None])
             rea_buf = jnp.where(write_end, END_OF_REASONING_ID, rea_buf)
             rea_m = rea_m | write_end
 
-        if mr > 1:
-            write_sos = (~overflow_pair)[:, None] & (rr == sos_pos_r[:, None])
-            rea_buf = jnp.where(write_sos, START_OF_SUBTASK_ID, rea_buf)
-            rea_m = rea_m | write_sos
-
-        # If we ran out of reasoning budget, force a valid boundary at the tail.
+        # If we ran out of reasoning budget, force end-of-reasoning at the tail slot.
         if mr == 1:
-            # Degenerate budget: prioritize starting the subtask phase.
-            rea_buf = jnp.where(overflow_pair[:, None], START_OF_SUBTASK_ID, rea_buf)
-            rea_m = jnp.where(overflow_pair[:, None], jnp.ones_like(rea_m), rea_m)
+            rea_buf = jnp.where(overflow_end[:, None], END_OF_REASONING_ID, rea_buf)
+            rea_m = jnp.where(overflow_end[:, None], jnp.ones_like(rea_m), rea_m)
         elif mr > 1:
-            tail_end = overflow_pair[:, None] & (rr == (mr - 2))
-            tail_sos = overflow_pair[:, None] & (rr == (mr - 1))
+            tail_end = overflow_end[:, None] & (rr == (mr - 1))
             rea_buf = jnp.where(tail_end, END_OF_REASONING_ID, rea_buf)
-            rea_buf = jnp.where(tail_sos, START_OF_SUBTASK_ID, rea_buf)
-            rea_m = jnp.where(overflow_pair[:, None], rr < mr, rea_m)
+            rea_m = jnp.where(overflow_end[:, None], rr < mr, rea_m)
 
         def catchup_cond(carry):
             t, *_ = carry
@@ -623,6 +612,22 @@ class Pi0CoT(_model.BaseModel):
         sub_m = jnp.zeros((batch_size, ms), dtype=jnp.bool_)
         done_s = jnp.zeros((batch_size,), dtype=jnp.bool_)
 
+        # Bootstrap subtask with <start_of_subtask> (sampled from h or appended).
+        if ms > 0:
+            rng, sos_tok = self._cot_decode_token(h, rng, temperature)
+            sos_tok = jnp.where(sos_tok == START_OF_SUBTASK_ID, sos_tok, START_OF_SUBTASK_ID)
+            sub_buf = sub_buf.at[:, 0].set(sos_tok)
+            sub_m = sub_m.at[:, 0].set(True)
+            h, kv_cache, abs_pos, key_mask, cur_pos = self._cot_forward_fixed(
+                sos_tok,
+                h,
+                kv_cache,
+                abs_pos,
+                key_mask,
+                cur_pos,
+                jnp.ones((batch_size,), dtype=jnp.bool_),
+            )
+
         def subtask_cond(carry):
             i, *_rest, done = carry
             return (i < ms) & (~jnp.all(done))
@@ -651,10 +656,11 @@ class Pi0CoT(_model.BaseModel):
             )
             return i + 1, rng, h, kv_cache, abs_pos, key_mask, cur_pos, sub_buf, sub_m, done
 
+        sub_start = jnp.asarray(1 if ms > 0 else 0, dtype=jnp.int32)
         _, _, _, _, _, _, _, sub_buf, sub_m, _ = jax.lax.while_loop(
             subtask_cond,
             subtask_body,
-            (0, rng, h, kv_cache, abs_pos, key_mask, cur_pos, sub_buf, sub_m, done_s),
+            (sub_start, rng, h, kv_cache, abs_pos, key_mask, cur_pos, sub_buf, sub_m, done_s),
         )
         pos_s = jnp.arange(ms, dtype=jnp.int32)[None, :]
         matches_end_s = (sub_buf == END_OF_SUBTASK_ID) & sub_m
