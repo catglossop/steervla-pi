@@ -331,6 +331,84 @@ def _strip_loc_spans(text: str) -> str:
     return _LOC_RE.sub("", text).strip()
 
 
+def _decode_fast_segment(token_ids: np.ndarray, mask: np.ndarray, tokenizer) -> str:
+    """Decode the FAST action token segment (``Action: ... |`` layout)."""
+    valid = token_ids[mask.astype(bool)]
+    if valid.size == 0:
+        return ""
+    return tokenizer._tokenizer.decode(valid.tolist())
+
+
+def _make_gt_vs_fast_trajectory_figure(
+    gt_wp: np.ndarray,
+    fast_wp: np.ndarray,
+    image: np.ndarray,
+    *,
+    sample_i: int,
+    step: int,
+    group_label: str,
+) -> wandb.Image:
+    """Side-by-side camera + trajectory: GT continuous actions vs FAST token reconstruction."""
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+    ax = axes[0]
+    ax.plot(gt_wp[:, 1], gt_wp[:, 0], "g.-", label="GT actions", linewidth=2)
+    ax.plot(fast_wp[:, 1], fast_wp[:, 0], "m.--", label="FAST tokens (recon)", linewidth=2)
+    ax.plot(0, 0, "ko", markersize=8)
+    ax.set_xlabel("Y (m)")
+    ax.set_ylabel("X (m)")
+    ax.set_title(f"FAST recon trajectory — {group_label} sample {sample_i}")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.axis("equal")
+
+    ax = axes[1]
+    ax.imshow(image)
+    ax.set_title("Camera view")
+    ax.axis("off")
+
+    fig.tight_layout()
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        fig.savefig(tmp.name, format="png", bbox_inches="tight", dpi=100)
+        plt.close(fig)
+        return wandb.Image(
+            tmp.name,
+            caption=f"step {step} {group_label} sample {sample_i} — GT vs FAST token trajectory",
+        )
+
+
+def _fast_reconstruction_metrics(
+    gt_wp: np.ndarray,
+    fast_wp: np.ndarray,
+) -> dict[str, float]:
+    """ADE/FDE between GT waypoints and FAST-reconstructed waypoints."""
+    metrics: dict[str, float] = {}
+    for n in [2, 4, 6]:
+        if n > gt_wp.shape[0]:
+            continue
+        dists = np.sqrt(np.sum((fast_wp[:n] - gt_wp[:n]) ** 2, axis=-1))
+        metrics[f"eval/fast_recon_ade_wp{n}"] = float(np.mean(dists))
+        metrics[f"eval/fast_recon_fde_wp{n}"] = float(dists[-1])
+    return metrics
+
+
+def _cot_aux_metrics_from_eval(
+    model,
+    rng: at.KeyArrayLike,
+    observation: _model.Observation,
+    actions: _model.Actions,
+) -> dict[str, float]:
+    """Teacher-forced CoT / flow aux losses on an eval batch (for wandb)."""
+    if not hasattr(model, "compute_loss_with_aux"):
+        return {}
+    _, aux_metrics = model.compute_loss_with_aux(rng, observation, actions, train=False)
+    out: dict[str, float] = {}
+    for key, value in aux_metrics.items():
+        if key.startswith("cot_") or key == "flow_loss":
+            out[f"eval/{key}"] = float(np.mean(jax.device_get(value)))
+    return out
+
+
 def run_cot_visualization(
     state: training_utils.TrainState,
     rng: at.KeyArrayLike,
@@ -339,11 +417,21 @@ def run_cot_visualization(
     step: int,
     vis_samples: int = 5,
     temperature: float = 0.0,
+    use_fast_tokens: bool = False,
+    action_horizon: int = 10,
+    action_dim: int = 32,
+    model_action_dim: int | None = None,
+    output_action_format: str | None = None,
+    dt: float = 0.5,
 ) -> None:
     """Log CoT visuals: autoregressive ``sample_cot`` vs ground-truth reasoning/subtask.
 
     Requires ground-truth CoT token fields on the batch. If the model has no
     ``sample_cot`` (e.g. not ``Pi0CoT``), prediction columns show a placeholder.
+
+    When ``use_fast_tokens`` is enabled, logs teacher-forced ``eval/cot_fast_ce`` and
+    related aux metrics, adds a FAST action segment column to the wandb table, and
+    logs trajectory figures comparing GT actions to actions reconstructed from FAST tokens.
 
     Runs only on process 0; other hosts synchronize on a barrier (no duplicate work).
     """
@@ -358,13 +446,16 @@ def run_cot_visualization(
         if observation.tokenized_prompt is None or observation.tokenized_prompt_mask is None:
             return
 
-        tokenizer = CoTPaligemmaTokenizer()
+        tokenizer = CoTPaligemmaTokenizer(use_fast_tokens=use_fast_tokens)
         start_of_subtask_id = tokenizer._start_of_subtask()
         end_of_subtask_id = tokenizer._end_of_subtask()
         start_of_reasoning_id = tokenizer._start_of_reasoning()
         end_of_reasoning_id = tokenizer._end_of_reasoning()
         model = nnx.merge(state.model_def, state.params)
         model.eval()
+
+        gt_actions = batch[1]
+        cot_metrics = _cot_aux_metrics_from_eval(model, rng, observation, gt_actions)
 
         if hasattr(model, "sample_cot"):
             cot_rng = jax.random.fold_in(rng, step)
@@ -383,24 +474,67 @@ def run_cot_visualization(
         reasoning_ids = np.asarray(jax.device_get(observation.tokenized_reasoning))
         reasoning_mask = np.asarray(jax.device_get(observation.tokenized_reasoning_mask))
 
+        has_fast = (
+            use_fast_tokens
+            and observation.tokenized_fast is not None
+            and observation.tokenized_fast_mask is not None
+        )
+        if has_fast:
+            fast_ids = np.asarray(jax.device_get(observation.tokenized_fast))
+            fast_mask = np.asarray(jax.device_get(observation.tokenized_fast_mask))
+
+        if observation.action_loss_mask is not None:
+            action_loss_mask = np.asarray(jax.device_get(observation.action_loss_mask))
+            non_hl_mask = np.any(action_loss_mask, axis=-1)
+        else:
+            non_hl_mask = np.ones(prompt_ids.shape[0], dtype=bool)
+
+        gt_actions_np = np.asarray(jax.device_get(gt_actions))
+        states = np.asarray(jax.device_get(observation.state))
+        initial_speeds = states[:, -2] * 20.0 if states.shape[-1] >= 2 else np.zeros(states.shape[0])
+
+        fast_recon_actions = None
+        fast_recon_wp = None
+        gt_wp_all = None
+        decode_action_dim = model_action_dim if model_action_dim is not None else action_dim
+        if has_fast and tokenizer.use_fast_tokens:
+            fast_recon_actions = np.stack(
+                [
+                    tokenizer.extract_fast_actions(
+                        fast_ids[i],
+                        action_horizon,
+                        decode_action_dim,
+                        mask=fast_mask[i],
+                    )
+                    for i in range(fast_ids.shape[0])
+                ],
+                axis=0,
+            )
+            gt_denorm = denormalize_actions(gt_actions_np, action_dim, output_action_format)
+            fast_denorm = denormalize_actions(fast_recon_actions, action_dim, output_action_format)
+            gt_wp_all = compute_waypoints(gt_denorm, initial_speeds, dt, output_action_format)
+            fast_recon_wp = compute_waypoints(fast_denorm, initial_speeds, dt, output_action_format)
+
         images_dict = jax.device_get(observation.images)
         base_key = next(iter(images_dict))
         base_images = np.asarray(images_dict[base_key])
 
         n_vis = min(vis_samples, prompt_ids.shape[0])
 
-        table = wandb.Table(
-            columns=[
-                "sample",
-                "image",
-                "prompt",
-                "reasoning (GT)",
-                "subtask (GT)",
-                "reasoning (pred)",
-                "subtask (pred)",
-            ]
-        )
+        table_columns = [
+            "sample",
+            "image",
+            "prompt",
+            "reasoning (GT)",
+            "subtask (GT)",
+            "reasoning (pred)",
+            "subtask (pred)",
+        ]
+        if has_fast:
+            table_columns.append("FAST actions (GT)")
+        table = wandb.Table(columns=table_columns)
         figures = []
+        fast_traj_figures = []
 
         for i in range(n_vis):
             prompt_text = _decode_tokens(prompt_ids[i], prompt_mask[i], tokenizer._tokenizer)
@@ -432,6 +566,15 @@ def run_cot_visualization(
             subtask_gt = _strip_loc_spans(subtask_gt)
             reasoning_gt = _strip_loc_spans(reasoning_gt)
 
+            fast_gt = ""
+            if has_fast:
+                fast_gt = _decode_fast_segment(fast_ids[i], fast_mask[i], tokenizer)
+                if fast_recon_actions is not None:
+                    fast_gt = (
+                        f"{fast_gt}\n(recon Δ: "
+                        f"{np.round(fast_recon_actions[i, ..., :action_dim], 3).tolist()})"
+                    )
+
             img = base_images[i]
             if np.issubdtype(img.dtype, np.floating):
                 img = np.clip(img * 255, 0, 255).astype(np.uint8) if img.max() <= 1.0 else np.clip(img, 0, 255).astype(np.uint8)
@@ -448,6 +591,8 @@ def run_cot_visualization(
                 f"Subtask (GT):\n{subtask_gt}\n\n"
                 f"Subtask (pred):\n{subtask_pred}"
             )
+            if has_fast:
+                text_block += f"\n\nFAST actions (GT):\n{fast_gt}"
             fig.text(
                 0.5, -0.02, text_block,
                 ha="center", va="top", fontsize=8,
@@ -462,7 +607,7 @@ def run_cot_visualization(
                 figures.append(wandb.Image(tmp.name, caption=f"step {step} sample {i}"))
 
             wb_img = wandb.Image(img)
-            table.add_data(
+            row = [
                 i,
                 wb_img,
                 prompt_text,
@@ -470,8 +615,50 @@ def run_cot_visualization(
                 subtask_gt,
                 reasoning_pred,
                 subtask_pred,
-            )
+            ]
+            if has_fast:
+                row.append(fast_gt)
+            table.add_data(*row)
 
-        wandb.log({"eval/cot_figures": figures, "eval/cot_table": table}, step=step)
+            if (
+                fast_recon_wp is not None
+                and gt_wp_all is not None
+                and non_hl_mask[i]
+                and np.any(fast_mask[i])
+            ):
+                group = "non-HL" if non_hl_mask[i] else "HL"
+                fast_traj_figures.append(
+                    _make_gt_vs_fast_trajectory_figure(
+                        gt_wp_all[i],
+                        fast_recon_wp[i],
+                        img,
+                        sample_i=i,
+                        step=step,
+                        group_label=group,
+                    )
+                )
+
+        if fast_recon_wp is not None and gt_wp_all is not None:
+            recon_indices = [
+                i
+                for i in range(min(n_vis, fast_ids.shape[0]))
+                if non_hl_mask[i] and np.any(fast_mask[i])
+            ]
+            if recon_indices:
+                recon_sums: dict[str, float] = {}
+                for i in recon_indices:
+                    for k, v in _fast_reconstruction_metrics(gt_wp_all[i], fast_recon_wp[i]).items():
+                        recon_sums[k] = recon_sums.get(k, 0.0) + v
+                cot_metrics.update({k: v / len(recon_indices) for k, v in recon_sums.items()})
+
+        log_dict: dict = {"eval/cot_figures": figures, "eval/cot_table": table, **cot_metrics}
+        if fast_traj_figures:
+            log_dict["eval/cot_fast_trajectories"] = fast_traj_figures
+        wandb.log(log_dict, step=step)
+        if cot_metrics:
+            logging.info(
+                f"CoT eval step {step}: "
+                + ", ".join(f"{k}={v:.4f}" for k, v in cot_metrics.items())
+            )
     finally:
         multihost_utils.sync_global_devices("steervla_cot_viz")

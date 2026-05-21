@@ -598,6 +598,7 @@ class RLDSSteerVLACoTDataConfig(RLDSSteerVLADataConfig):
     # CoT-specific token lengths.
     max_subtask_len: int = 48
     max_reasoning_len: int = 96
+    max_fast_len: int = 64
     # Optional high-level (reasoning/subtask-only) datasets.
     hl_dataset_name_weight_mappings: tyro.conf.Suppress[dict[str, float] | None] = None
     hl_dataset_version: tyro.conf.Suppress[str | None] = None
@@ -661,18 +662,22 @@ class RLDSSteerVLACoTDataConfig(RLDSSteerVLADataConfig):
         )
 
         from openpi.models.tokenizer import CoTPaligemmaTokenizer
+
+        use_fast_tokens = getattr(model_config, "use_fast_tokens", False)
+        prompt_state_dim = 8 if self.include_ego_history else 2
         cot_tokenizer = CoTPaligemmaTokenizer(
             max_prompt_len=model_config.max_token_len,
             max_subtask_len=self.max_subtask_len,
             max_reasoning_len=self.max_reasoning_len,
+            max_fast_len=self.max_fast_len,
+            use_fast_tokens=use_fast_tokens,
         )
-        model_transforms = _transforms.Group(
-            inputs=[
-                _transforms.ResizeImages(224, 224),
-                _transforms.TokenizeCoTPrompt(cot_tokenizer),
-                _transforms.PadStatesAndActions(model_config.action_dim),
-            ],
-        )
+        tokenize_inputs: list = [
+            _transforms.ResizeImages(224, 224),
+            _transforms.PadStatesAndActions(model_config.action_dim),
+            _transforms.TokenizeCoTPrompt(cot_tokenizer, prompt_state_dim=prompt_state_dim),
+        ]
+        model_transforms = _transforms.Group(inputs=tokenize_inputs)
 
         assert self.rlds_data_dir is not None
 
@@ -1371,6 +1376,53 @@ _CONFIGS = [
     # and commentary as reasoning (chain-of-thought).
     #
     TrainConfig(
+        name="pi05_steervla_cot_fast",
+        model=pi0_config.Pi0CoTConfig(
+            action_dim=32,
+            action_horizon=10,
+            max_token_len=112,
+            max_subtask_len=48,
+            max_reasoning_len=96,
+            max_fast_len=64,
+            cot_loss_weight=1.0,
+            use_fast_tokens=True,
+            knowledge_insulation=False,
+        ),
+        data=RLDSSteerVLACoTDataConfig(
+            repo_id="steervla_simlingo_cot",
+            rlds_data_dir="gs://tian-us-central2/tensorflow_datasets",
+            dataset_format=steervla_rlds_dataset.DatasetFormat.SIMLINGO,
+            include_ego_history=False,
+            include_xy_action=False,
+            speed_in_prompt=True,
+            proprio_norm=True,
+            action_dim=4,
+            output_action_format=steervla_rlds_dataset.OutputActionFormat.DELTA_XY_T_DELTA_XY_SPACE,
+            lang_label_type=steervla_rlds_dataset.LangLabelType.ROUTING_COMMAND,
+            dataset_name_weight_mappings={
+                "simlingo_dataset_all_img512_1116": 1.0,
+            },
+            max_subtask_len=48,
+            max_reasoning_len=96,
+            max_fast_len=64,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=1e-4,
+            decay_steps=100_000,
+            decay_lr=1e-5,
+        ),
+        num_train_steps=100_000,
+        batch_size=24,
+        fsdp_devices=4,
+        log_interval=1,
+        eval_interval=500,
+        save_interval=5000,
+        num_workers=0,
+        checkpoint_base_dir="gs://cat-logs",
+    ),
+    TrainConfig(
         name="pi05_steervla_cot",
         model=pi0_config.Pi0CoTConfig(
             action_dim=32,
@@ -1482,8 +1534,8 @@ _CONFIGS = [
             decay_lr=1e-5,
         ),
         num_train_steps=200_000,
-        batch_size=256,
-        fsdp_devices=4,
+        batch_size=512,
+        fsdp_devices=8,
         log_interval=1,
         eval_interval=100,
         save_interval=5000,
@@ -1563,15 +1615,16 @@ _CONFIGS = [
         ema_decay=None,
     ),
     TrainConfig(
-        name="pi05_steervla_cot_ki_simplified_reasoning",
+        name="pi05_steervla_cot_simplified_reasoning",
         model=pi0_config.Pi0CoTConfig(
             action_dim=32,
             action_horizon=10,
-            max_token_len=112,
+            max_token_len=200,
             max_subtask_len=64,
             max_reasoning_len=64,
-            cot_loss_weight=1.0,
-            knowledge_insulation=True,
+            cot_loss_weight=0.1,
+            knowledge_insulation=False,
+            use_fast_tokens=True,
         ),
         data=RLDSSteerVLACoTDataConfig(
             repo_id="steervla_simlingo_cot",
@@ -1608,7 +1661,6 @@ _CONFIGS = [
             hl_dataset_format=steervla_rlds_dataset.DatasetFormat.SIMLINGO,
             hl_cot_reasoning_key="gemini_refined_label",
             hl_cot_subtask_key="prompt",
-            
             max_subtask_len=64,
             max_reasoning_len=64,
         ),
@@ -1620,8 +1672,8 @@ _CONFIGS = [
             decay_lr=1e-5,
         ),
         num_train_steps=200_000,
-        batch_size=256,
-        fsdp_devices=4,
+        batch_size=512,
+        fsdp_devices=8,
         log_interval=1,
         eval_interval=100,
         save_interval=2000,

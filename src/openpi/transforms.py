@@ -271,6 +271,8 @@ class TokenizeCoTPrompt(DataTransformFn):
     """Tokenizes prompt, reasoning, and subtask for the Pi0-CoT model (prefix order: reasoning then subtask)."""
 
     tokenizer: _tokenizer.CoTPaligemmaTokenizer
+    # Proprio dimensions to embed in the prompt (exclude zero-padded tail of ``state``).
+    prompt_state_dim: int | None = None
 
     def __call__(self, data: DataDict) -> DataDict:
         prompt = data.pop("prompt", None)
@@ -295,11 +297,13 @@ class TokenizeCoTPrompt(DataTransformFn):
         if state is None:
             raise ValueError("State is required for CoT tokenization")
 
-        prompt_tok, prompt_mask = self.tokenizer.tokenize_prompt(prompt, state)
+        prompt_tok, prompt_mask = self.tokenizer.tokenize_prompt(
+            prompt, state, state_dim=self.prompt_state_dim
+        )
         reasoning_tok, reasoning_mask = self.tokenizer.tokenize_reasoning(reasoning)
         subtask_tok, subtask_mask = self.tokenizer.tokenize_subtask(subtask)
 
-        return {
+        out = {
             **data,
             "tokenized_prompt": prompt_tok,
             "tokenized_prompt_mask": prompt_mask,
@@ -308,6 +312,18 @@ class TokenizeCoTPrompt(DataTransformFn):
             "tokenized_reasoning": reasoning_tok,
             "tokenized_reasoning_mask": reasoning_mask,
         }
+
+        if self.tokenizer.use_fast_tokens:
+            actions = data.get("actions")
+            if actions is not None:
+                fast_tok, fast_mask = self.tokenizer.tokenize_fast_actions(np.asarray(actions))
+            else:
+                fast_tok = np.zeros(self.tokenizer.max_fast_len, dtype=np.int32)
+                fast_mask = np.zeros(self.tokenizer.max_fast_len, dtype=bool)
+            out["tokenized_fast"] = fast_tok
+            out["tokenized_fast_mask"] = fast_mask
+
+        return out
 
 
 @dataclasses.dataclass(frozen=True)

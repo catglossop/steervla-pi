@@ -114,6 +114,9 @@ class Observation(Generic[ArrayT]):
     # Ground-truth reasoning/commentary tokens and mask.
     tokenized_reasoning: at.Int[ArrayT, "*b lr"] | None = None
     tokenized_reasoning_mask: at.Bool[ArrayT, "*b lr"] | None = None
+    # FAST-discretized action tokens (VLM prefix; supervised with CE when enabled).
+    tokenized_fast: at.Int[ArrayT, "*b lf"] | None = None
+    tokenized_fast_mask: at.Bool[ArrayT, "*b lf"] | None = None
     # Optional per-timestep action loss mask (e.g., disable action supervision on HL-only samples).
     action_loss_mask: at.Bool[ArrayT, "*b ah"] | None = None
 
@@ -141,6 +144,8 @@ class Observation(Generic[ArrayT]):
             tokenized_subtask_mask=data.get("tokenized_subtask_mask"),
             tokenized_reasoning=data.get("tokenized_reasoning"),
             tokenized_reasoning_mask=data.get("tokenized_reasoning_mask"),
+            tokenized_fast=data.get("tokenized_fast"),
+            tokenized_fast_mask=data.get("tokenized_fast_mask"),
             action_loss_mask=data.get("action_loss_mask"),
         )
 
@@ -225,6 +230,8 @@ def preprocess_observation(
         tokenized_subtask_mask=observation.tokenized_subtask_mask,
         tokenized_reasoning=observation.tokenized_reasoning,
         tokenized_reasoning_mask=observation.tokenized_reasoning_mask,
+        tokenized_fast=observation.tokenized_fast,
+        tokenized_fast_mask=observation.tokenized_fast_mask,
         action_loss_mask=observation.action_loss_mask,
     )
 

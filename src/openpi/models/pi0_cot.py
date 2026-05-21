@@ -5,11 +5,12 @@ Prefix layout (language, after image tokens; see ``CoTPaligemmaTokenizer``):
     [Prompt:...;State:...;]                                           <-- bidirectional
     [<start_of_reasoning> reasoning_body <end_of_reasoning>]          <-- causal
     [<start_of_subtask>   subtask_body   <end_of_subtask> <eos>]      <-- causal
+    [Action: FAST tokens |]  (optional)                               <-- causal
 
 Each segment owns its start/end delimiters: ``tokenize_reasoning`` and
 ``tokenize_subtask`` in ``CoTPaligemmaTokenizer`` prepend ``<start_of_*>`` and
 append ``<end_of_*>`` themselves. The bidirectional prompt segment has no CoT
-delimiters of its own.
+delimiters of its own. FAST action tokens use ``CoTPaligemmaTokenizer.tokenize_fast_actions``.
 
 Supervision (see ``_compute_loss_and_metrics``):
     - ``first_reasoning_ce`` predicts ``<start_of_reasoning>`` from the last
@@ -20,11 +21,12 @@ Supervision (see ``_compute_loss_and_metrics``):
       ``<end_of_reasoning>``.
     - ``subtask_ce`` (shifted CE) predicts subtask body, ``<end_of_subtask>``
       and the trailing EOS.
+    - ``fast_ce`` / ``first_fast_ce`` (optional) supervise FAST action tokens.
 
 Suffix (Action expert, adaRMS):
-    [action tokens] — attend to images + prompt + subtask (not reasoning).
+    [action tokens] — attend to images + prompt + subtask + FAST (not reasoning).
 
-Losses: CE on reasoning + subtask (VLM), flow-matching on actions.
+Losses: CE on reasoning + subtask (+ FAST when enabled), flow-matching on actions.
 """
 
 import logging
@@ -42,18 +44,17 @@ from openpi.models import pi0
 from openpi.models import pi0_config
 import openpi.models.gemma as _gemma
 import openpi.models.siglip as _siglip
+from openpi.models.tokenizer import COT_DELIMITER_TOKEN_SLOTS, PALIGEMMA_VOCAB_SKIP_TOKENS
 from openpi.shared import array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
 
 logger = logging.getLogger("openpi")
 
-# Must match ``CoTPaligemmaTokenizer._cot_skip_tokens`` and special-token layout.
-_COT_SKIP_LAST = 128
-
-START_OF_SUBTASK_ID = _gemma.PALIGEMMA_VOCAB_SIZE - 1 - _COT_SKIP_LAST - 1
-END_OF_SUBTASK_ID = _gemma.PALIGEMMA_VOCAB_SIZE - 1 - _COT_SKIP_LAST - 2
-START_OF_REASONING_ID = _gemma.PALIGEMMA_VOCAB_SIZE - 1 - _COT_SKIP_LAST - 3
-END_OF_REASONING_ID = _gemma.PALIGEMMA_VOCAB_SIZE - 1 - _COT_SKIP_LAST - 4
+# Must match ``CoTPaligemmaTokenizer`` reserved-token layout.
+START_OF_SUBTASK_ID = _gemma.PALIGEMMA_VOCAB_SIZE - 1 - PALIGEMMA_VOCAB_SKIP_TOKENS - 1
+END_OF_SUBTASK_ID = _gemma.PALIGEMMA_VOCAB_SIZE - 1 - PALIGEMMA_VOCAB_SKIP_TOKENS - 2
+START_OF_REASONING_ID = _gemma.PALIGEMMA_VOCAB_SIZE - 1 - PALIGEMMA_VOCAB_SKIP_TOKENS - 3
+END_OF_REASONING_ID = _gemma.PALIGEMMA_VOCAB_SIZE - 1 - PALIGEMMA_VOCAB_SKIP_TOKENS - 4
 
 _COT_MODULE_JIT_CACHE: dict[int, dict[str, object]] = {}
 
@@ -96,6 +97,8 @@ class Pi0CoT(_model.BaseModel):
 
         self.max_subtask_len = config.max_subtask_len
         self.max_reasoning_len = config.max_reasoning_len
+        self.max_fast_len = config.max_fast_len
+        self._use_fast_tokens = config.use_fast_tokens
         self._preprocess_image_keys: tuple[str, ...] = (
             tuple(config.inference_image_keys)
             if config.inference_image_keys is not None
@@ -161,6 +164,7 @@ class Pi0CoT(_model.BaseModel):
         n_prompt: int,
         n_subtask: int,
         n_reasoning: int,
+        n_fast: int,
         n_action: int,
     ) -> jnp.ndarray:
         """Build a (b, total, total) attention mask implementing:
@@ -168,10 +172,10 @@ class Pi0CoT(_model.BaseModel):
         - Images + prompt: bidirectional among themselves
         - Reasoning: causal, attending to images + prompt + earlier reasoning
         - Subtask: causal, attending to images + prompt + reasoning + earlier subtask
-        - Actions: causal among themselves, attend to images + prompt + subtask (NOT reasoning)
+        - FAST tokens: causal among themselves, attending to images + prompt + subtask
+        - Actions: causal among themselves, attend to images + prompt + subtask + FAST (NOT reasoning)
         """
         total = prefix_mask.shape[1] + suffix_mask.shape[1]
-        batch = prefix_mask.shape[0]
 
         combined_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
         combined_ar = jnp.concatenate([prefix_ar, suffix_ar], axis=0)
@@ -182,17 +186,17 @@ class Pi0CoT(_model.BaseModel):
         valid = combined_mask[:, None, :] * combined_mask[:, :, None]
         base_mask = jnp.logical_and(attn, valid)
 
-        # Now zero out action-tokens → reasoning-tokens attention.
-        # Prefix order: images, prompt, reasoning, subtask (reasoning before subtask).
+        # Prefix order: images, prompt, reasoning, subtask, [fast]. Suffix: action expert.
         reasoning_start = n_img + n_prompt
         reasoning_end = reasoning_start + n_reasoning
-        action_start = reasoning_end + n_subtask  # suffix starts after full prefix
+        fast_start = reasoning_end + n_subtask
+        action_start = prefix_mask.shape[1]  # suffix
 
-        # Mask: for rows [action_start : action_start + n_action],
-        #        zero out columns [reasoning_start : reasoning_end]
-        row_is_action = (jnp.arange(total) >= action_start) & (jnp.arange(total) < action_start + n_action)
         col_is_reasoning = (jnp.arange(total) >= reasoning_start) & (jnp.arange(total) < reasoning_end)
-        block_mask = ~(row_is_action[:, None] & col_is_reasoning[None, :])
+        row_is_action = (jnp.arange(total) >= action_start) & (jnp.arange(total) < action_start + n_action)
+        row_is_fast = (jnp.arange(total) >= fast_start) & (jnp.arange(total) < fast_start + n_fast)
+        row_blocks_reasoning = row_is_action | row_is_fast
+        block_mask = ~(row_blocks_reasoning[:, None] & col_is_reasoning[None, :])
 
         return base_mask & block_mask[None, :, :]
 
@@ -229,15 +233,23 @@ class Pi0CoT(_model.BaseModel):
         subtask_mask = observation.tokenized_subtask_mask
         n_subtask = subtask_emb.shape[1]
 
-        prefix_tokens = jnp.concatenate(img_tokens + [prompt_emb, reasoning_emb, subtask_emb], axis=1)
-        prefix_mask = jnp.concatenate(img_masks + [prompt_mask, reasoning_mask, subtask_mask], axis=1)
-        # AR mask: bidirectional for images+prompt, causal for reasoning then subtask
-        prefix_ar = jnp.array(
-            img_ar
-            + [False] * n_prompt
-            + [True] * n_reasoning
-            + [True] * n_subtask
+        prefix_parts = img_tokens + [prompt_emb, reasoning_emb, subtask_emb]
+        prefix_mask_parts = img_masks + [prompt_mask, reasoning_mask, subtask_mask]
+        prefix_ar_list = (
+            img_ar + [False] * n_prompt + [True] * n_reasoning + [True] * n_subtask
         )
+        n_fast = 0
+        if self._use_fast_tokens and observation.tokenized_fast is not None:
+            fast_emb = self._embed_text_tokens(observation.tokenized_fast)
+            fast_mask = observation.tokenized_fast_mask
+            n_fast = fast_emb.shape[1]
+            prefix_parts.append(fast_emb)
+            prefix_mask_parts.append(fast_mask)
+            prefix_ar_list += [True] * n_fast
+
+        prefix_tokens = jnp.concatenate(prefix_parts, axis=1)
+        prefix_mask = jnp.concatenate(prefix_mask_parts, axis=1)
+        prefix_ar = jnp.array(prefix_ar_list)
 
         # --- Build suffix tokens (action expert) ---
         suffix_tokens, suffix_mask, suffix_ar_list, adarms_cond = self._embed_action_suffix(observation, x_t, time)
@@ -247,7 +259,7 @@ class Pi0CoT(_model.BaseModel):
         # --- Custom attention mask ---
         attn_mask = self._build_attention_mask(
             prefix_mask, prefix_ar, suffix_mask, suffix_ar,
-            n_img, n_prompt, n_subtask, n_reasoning, n_action,
+            n_img, n_prompt, n_subtask, n_reasoning, n_fast, n_action,
         )
 
         # --- Forward pass ---
@@ -275,6 +287,8 @@ class Pi0CoT(_model.BaseModel):
         reasoning_out = prefix_out[:, reasoning_start:reasoning_start + n_reasoning]
         subtask_start = reasoning_start + n_reasoning
         subtask_out = prefix_out[:, subtask_start:subtask_start + n_subtask]
+        fast_start = subtask_start + n_subtask
+        fast_out = prefix_out[:, fast_start:fast_start + n_fast] if n_fast > 0 else None
         # Logits via embedder (shared embedding weights)
         reasoning_logits = self.PaliGemma.llm(reasoning_out, method="decode_logits")
         subtask_logits = self.PaliGemma.llm(subtask_out, method="decode_logits")
@@ -316,7 +330,29 @@ class Pi0CoT(_model.BaseModel):
                 first_subtask_logits, subtask_targets[:, :1], bridge_ok
             )
 
-        cot_loss = reasoning_ce + subtask_ce + first_reasoning_ce + first_subtask_ce
+        fast_ce = jnp.zeros_like(reasoning_ce)
+        first_fast_ce = jnp.zeros_like(reasoning_ce)
+        if n_fast > 0 and fast_out is not None:
+            fast_mask = observation.tokenized_fast_mask
+            fast_targets = observation.tokenized_fast
+            fast_logits = self.PaliGemma.llm(fast_out, method="decode_logits")
+            fast_ce = self._token_cross_entropy(
+                fast_logits[:, :-1], fast_targets[:, 1:], fast_mask[:, 1:]
+            )
+            n_subtask_cols = subtask_out.shape[1]
+            if n_subtask_cols == 0:
+                first_fast_ce = jnp.zeros_like(fast_ce)
+            else:
+                last_sub_idx = jnp.sum(subtask_mask, axis=1, keepdims=True).astype(jnp.int32) - 1
+                last_sub_idx = jnp.clip(last_sub_idx, 0, n_subtask_cols - 1)
+                bridge_h_fast = jnp.take_along_axis(subtask_out, last_sub_idx[:, :, None], axis=1)
+                first_fast_logits = self.PaliGemma.llm(bridge_h_fast, method="decode_logits")
+                bridge_fast_ok = subtask_mask.any(axis=1, keepdims=True) & fast_mask[:, :1]
+                first_fast_ce = self._token_cross_entropy(
+                    first_fast_logits, fast_targets[:, :1], bridge_fast_ok
+                )
+
+        cot_loss = reasoning_ce + subtask_ce + first_reasoning_ce + first_subtask_ce + fast_ce + first_fast_ce
 
         # Combine: flow loss is per-timestep (batch, horizon), cot_loss is scalar per batch
         # Broadcast cot_loss to match flow_loss shape for the return
@@ -328,6 +364,8 @@ class Pi0CoT(_model.BaseModel):
             "cot_subtask_ce": subtask_ce,
             "cot_first_reasoning_ce": first_reasoning_ce,
             "cot_first_subtask_ce": first_subtask_ce,
+            "cot_fast_ce": fast_ce,
+            "cot_first_fast_ce": first_fast_ce,
         }
         return combined, metrics
 
@@ -845,14 +883,38 @@ class Pi0CoT(_model.BaseModel):
         subtask_mask = observation.tokenized_subtask_mask
         n_subtask = subtask_emb.shape[1]
 
-        prefix_tokens = jnp.concatenate(img_tokens + [prompt_emb, reasoning_emb, subtask_emb], axis=1)
-        prefix_mask = jnp.concatenate(img_masks + [prompt_mask, reasoning_mask, subtask_mask], axis=1)
-        prefix_ar = jnp.array(
-            img_ar + [False] * n_prompt + [True] * n_reasoning + [True] * n_subtask
-        )
+        prefix_parts = img_tokens + [prompt_emb, reasoning_emb, subtask_emb]
+        prefix_mask_parts = img_masks + [prompt_mask, reasoning_mask, subtask_mask]
+        prefix_ar_list = img_ar + [False] * n_prompt + [True] * n_reasoning + [True] * n_subtask
+        if self._use_fast_tokens and observation.tokenized_fast is not None:
+            fast_emb = self._embed_text_tokens(observation.tokenized_fast)
+            fast_mask = observation.tokenized_fast_mask
+            prefix_parts.append(fast_emb)
+            prefix_mask_parts.append(fast_mask)
+            prefix_ar_list += [True] * fast_emb.shape[1]
 
-        # Fill KV cache with prefix
-        prefix_attn_mask = pi0.make_attn_mask(prefix_mask, prefix_ar)
+        prefix_tokens = jnp.concatenate(prefix_parts, axis=1)
+        prefix_mask = jnp.concatenate(prefix_mask_parts, axis=1)
+        prefix_ar = jnp.array(prefix_ar_list)
+
+        # Prefix attention (blocks FAST/action from reasoning when fast tokens are present).
+        n_fast = 0
+        if self._use_fast_tokens and observation.tokenized_fast is not None:
+            n_fast = observation.tokenized_fast.shape[1]
+        empty_suffix_mask = jnp.zeros((batch_size, 0), dtype=jnp.bool_)
+        empty_suffix_ar = jnp.array([], dtype=jnp.bool_)
+        prefix_attn_mask = self._build_attention_mask(
+            prefix_mask,
+            prefix_ar,
+            empty_suffix_mask,
+            empty_suffix_ar,
+            n_img,
+            n_prompt,
+            n_subtask,
+            n_reasoning,
+            n_fast,
+            0,
+        )
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 

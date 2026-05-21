@@ -133,9 +133,12 @@ class Pi0CoTConfig(_model.BaseModelConfig):
     max_token_len: int = 96
     max_subtask_len: int = 48
     max_reasoning_len: int = 96
+    max_fast_len: int = 64
 
     cot_loss_weight: float = 1.0
     knowledge_insulation: bool = True
+    # Supervise FAST-discretized actions in the VLM prefix (after subtask).
+    use_fast_tokens: bool = False
 
     # If set, :meth:`Pi0CoT.sample_cot` / :meth:`Pi0CoT.sample_actions` pass this to
     # ``preprocess_observation(..., image_keys=...)`` when the call does not pass
@@ -170,6 +173,13 @@ class Pi0CoTConfig(_model.BaseModelConfig):
         image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
         image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
 
+        fast_spec = {}
+        if self.use_fast_tokens:
+            fast_spec = {
+                "tokenized_fast": jax.ShapeDtypeStruct([batch_size, self.max_fast_len], jnp.int32),
+                "tokenized_fast_mask": jax.ShapeDtypeStruct([batch_size, self.max_fast_len], bool),
+            }
+
         with at.disable_typechecking():
             observation_spec = _model.Observation(
                 images={
@@ -190,6 +200,7 @@ class Pi0CoTConfig(_model.BaseModelConfig):
                 tokenized_reasoning=jax.ShapeDtypeStruct([batch_size, self.max_reasoning_len], jnp.int32),
                 tokenized_reasoning_mask=jax.ShapeDtypeStruct([batch_size, self.max_reasoning_len], bool),
                 action_loss_mask=jax.ShapeDtypeStruct([batch_size, self.action_horizon], jnp.bool_),
+                **fast_spec,
             )
         action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
 

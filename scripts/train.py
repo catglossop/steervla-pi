@@ -462,6 +462,11 @@ def main(config: _config.TrainConfig):
                     rng=cot_rng,
                     batch=eval_batch,
                     step=step,
+                    use_fast_tokens=getattr(config.model, "use_fast_tokens", False),
+                    action_horizon=config.model.action_horizon,
+                    action_dim=eval_action_dim,
+                    model_action_dim=config.model.action_dim,
+                    output_action_format=eval_output_format,
                 )
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
