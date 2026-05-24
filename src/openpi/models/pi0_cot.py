@@ -29,6 +29,7 @@ Suffix (Action expert, adaRMS):
 Losses: CE on reasoning + subtask (+ FAST when enabled), flow-matching on actions.
 """
 
+import functools
 import logging
 from collections.abc import Sequence
 
@@ -57,6 +58,19 @@ START_OF_REASONING_ID = _gemma.PALIGEMMA_VOCAB_SIZE - 1 - PALIGEMMA_VOCAB_SKIP_T
 END_OF_REASONING_ID = _gemma.PALIGEMMA_VOCAB_SIZE - 1 - PALIGEMMA_VOCAB_SKIP_TOKENS - 4
 
 _COT_MODULE_JIT_CACHE: dict[int, dict[str, object]] = {}
+
+
+@functools.lru_cache(maxsize=1)
+def _fast_segment_layout_token_ids() -> tuple[tuple[int, ...], int, int]:
+    """``Action:`` prefix, ``|`` delimiter, and EOS ids for FAST segment generation."""
+    import sentencepiece
+
+    from openpi.shared import download
+
+    path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
+    with path.open("rb") as f:
+        sp = sentencepiece.SentencePieceProcessor(model_proto=f.read())
+    return tuple(int(x) for x in sp.encode("Action: ")), int(sp.encode("|")[0]), int(sp.eos_id())
 
 
 class Pi0CoT(_model.BaseModel):
@@ -530,11 +544,12 @@ class Pi0CoT(_model.BaseModel):
         prefix_ar: jnp.ndarray,
         mr: int,
         ms: int,
+        mf: int,
         temperature: float,
     ):
         batch_size = prefix_tokens.shape[0]
         prefix_len = prefix_tokens.shape[1]
-        max_total_len = prefix_len + mr + ms + 1
+        max_total_len = prefix_len + mr + ms + mf + 1
 
         prefix_attn_mask = pi0.make_attn_mask(prefix_mask, prefix_ar)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
@@ -741,7 +756,73 @@ class Pi0CoT(_model.BaseModel):
         total_len_s = jnp.where(has_end_s, first_end_s + 1, jnp.sum(sub_m, axis=-1))
         sub_m = pos_s < total_len_s[:, None]
         sub_buf = jnp.where(sub_m, sub_buf, 0)
-        return rea_buf, rea_m, sub_buf, sub_m
+
+        fast_buf = jnp.zeros((batch_size, mf), dtype=jnp.int32)
+        fast_m = jnp.zeros((batch_size, mf), dtype=jnp.bool_)
+        if mf > 0:
+            action_prefix_ids, pipe_token_id, eos_token_id = _fast_segment_layout_token_ids()
+            idx = 0
+            for tok_id in action_prefix_ids:
+                if idx >= mf:
+                    break
+                tok = jnp.full((batch_size,), tok_id, dtype=jnp.int32)
+                fast_buf = fast_buf.at[:, idx].set(tok)
+                fast_m = fast_m.at[:, idx].set(True)
+                h, kv_cache, abs_pos, key_mask, cur_pos = self._cot_forward_fixed(
+                    tok,
+                    h,
+                    kv_cache,
+                    abs_pos,
+                    key_mask,
+                    cur_pos,
+                    jnp.ones((batch_size,), dtype=jnp.bool_),
+                )
+                idx += 1
+
+            done_f = jnp.zeros((batch_size,), dtype=jnp.bool_)
+
+            def fast_cond(carry):
+                step_idx, *_rest, done = carry
+                return (step_idx < mf) & (~jnp.all(done))
+
+            def fast_body(carry):
+                step_idx, rng, h, kv_cache, abs_pos, key_mask, cur_pos, fast_buf, fast_m, done = carry
+                active = ~done
+                rng, tok = self._cot_decode_token(h, rng, temperature)
+                tok = jnp.where(active, tok, jnp.int32(0))
+                stop = active & ((tok == pipe_token_id) | (tok == eos_token_id))
+                fast_buf = fast_buf.at[:, step_idx].set(tok)
+                fast_m = fast_m.at[:, step_idx].set(active)
+                done = done | stop
+                should_forward = (step_idx < (mf - 1)) & jnp.any(~done)
+
+                def do_forward(args):
+                    h, kv_cache, abs_pos, key_mask, cur_pos = args
+                    return self._cot_forward_fixed(tok, h, kv_cache, abs_pos, key_mask, cur_pos, active)
+
+                h, kv_cache, abs_pos, key_mask, cur_pos = jax.lax.cond(
+                    should_forward,
+                    do_forward,
+                    lambda args: args,
+                    (h, kv_cache, abs_pos, key_mask, cur_pos),
+                )
+                return step_idx + 1, rng, h, kv_cache, abs_pos, key_mask, cur_pos, fast_buf, fast_m, done
+
+            fast_start = jnp.asarray(idx, dtype=jnp.int32)
+            _, _, _, _, _, _, _, fast_buf, fast_m, _ = jax.lax.while_loop(
+                fast_cond,
+                fast_body,
+                (fast_start, rng, h, kv_cache, abs_pos, key_mask, cur_pos, fast_buf, fast_m, done_f),
+            )
+            pos_f = jnp.arange(mf, dtype=jnp.int32)[None, :]
+            matches_pipe = (fast_buf == pipe_token_id) & fast_m
+            has_pipe = jnp.any(matches_pipe, axis=-1)
+            first_pipe = jnp.min(jnp.where(matches_pipe, pos_f, mf), axis=-1)
+            total_len_f = jnp.where(has_pipe, first_pipe + 1, jnp.sum(fast_m, axis=-1, dtype=jnp.int32))
+            fast_m = pos_f < total_len_f[:, None]
+            fast_buf = jnp.where(fast_m, fast_buf, 0)
+
+        return rea_buf, rea_m, sub_buf, sub_m, fast_buf, fast_m
 
     def _sample_cot_core(
         self,
@@ -757,8 +838,8 @@ class Pi0CoT(_model.BaseModel):
         return self._cot_module_jit(
             "sample_cot_core",
             self._sample_cot_core_impl,
-            static_argnums=(5, 6, 7),
-        )(rng, prefix_tokens, prefix_mask, prefix_ar, mr, ms, temperature)
+            static_argnums=(5, 6, 7, 8),
+        )(rng, prefix_tokens, prefix_mask, prefix_ar, mr, ms, mf, temperature)
 
     # ------------------------------------------------------------------
     # Inference: sample_cot (autoregressive CoT, prompt-only conditioning)
@@ -774,7 +855,7 @@ class Pi0CoT(_model.BaseModel):
         max_reasoning_len: int | None = None,
         image_keys: Sequence[str] | None = None,
     ) -> dict[str, jnp.ndarray]:
-        """Autoregressively sample reasoning then subtask from images + prompt prefix only."""
+        """Autoregressively sample reasoning, subtask, and optional FAST tokens from images + prompt."""
         keys = tuple(image_keys) if image_keys is not None else self._preprocess_image_keys
         observation = _model.preprocess_observation(None, observation, train=False, image_keys=keys)
         if observation.tokenized_prompt is None or observation.tokenized_prompt_mask is None:
@@ -782,6 +863,7 @@ class Pi0CoT(_model.BaseModel):
 
         ms = max_subtask_len if max_subtask_len is not None else self.max_subtask_len
         mr = max_reasoning_len if max_reasoning_len is not None else self.max_reasoning_len
+        mf = int(self.max_fast_len) if self._use_fast_tokens else 0
         img_tokens, img_masks, img_ar = self._embed_images(observation)
 
         prompt_emb = self._embed_text_tokens(observation.tokenized_prompt)
@@ -790,22 +872,27 @@ class Pi0CoT(_model.BaseModel):
         prefix_tokens = jnp.concatenate(img_tokens + [prompt_emb], axis=1)
         prefix_mask = jnp.concatenate(img_masks + [prompt_mask], axis=1)
         prefix_ar = jnp.array(img_ar + [False] * prompt_emb.shape[1])
-        rea_buf, rea_m, sub_buf, sub_m = self._sample_cot_core(
+        rea_buf, rea_m, sub_buf, sub_m, fast_buf, fast_m = self._sample_cot_core(
             rng,
             prefix_tokens,
             prefix_mask,
             prefix_ar,
             mr=int(mr),
             ms=int(ms),
+            mf=int(mf),
             temperature=float(temperature),
         )
 
-        return {
+        out = {
             "tokenized_subtask": sub_buf,
             "tokenized_subtask_mask": sub_m,
             "tokenized_reasoning": rea_buf,
             "tokenized_reasoning_mask": rea_m,
         }
+        if self._use_fast_tokens:
+            out["tokenized_fast"] = fast_buf
+            out["tokenized_fast_mask"] = fast_m
+        return out
 
     @nnx.jit
     def _denoise_flow_step(

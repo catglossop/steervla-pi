@@ -21,6 +21,24 @@ class RemoveStrings(transforms.DataTransformFn):
         return {k: v for k, v in x.items() if not np.issubdtype(np.asarray(v).dtype, np.str_)}
 
 
+def _actions_for_norm_stats(batch: dict) -> np.ndarray | None:
+    """Keep only action-supervised samples (exclude HL / CoT-only rows)."""
+    actions = np.asarray(batch["actions"])
+    mask = batch.get("action_loss_mask")
+    if mask is None:
+        return actions
+
+    mask = np.asarray(mask, dtype=bool)
+    if mask.ndim == 1:
+        keep = mask
+    else:
+        keep = np.any(mask.reshape(mask.shape[0], -1), axis=1)
+
+    if not np.any(keep):
+        return None
+    return actions[keep]
+
+
 def create_torch_dataloader(
     data_config: _config.DataConfig,
     action_horizon: int,
@@ -99,12 +117,27 @@ def main(config_name: str, max_frames: int | None = None):
             data_config, config.model.action_horizon, config.batch_size, config.model, config.num_workers, max_frames
         )
 
-    keys = ["state", "actions"]
-    stats = {key: normalize.RunningStats() for key in keys}
+    stats = {key: normalize.RunningStats() for key in ("state", "actions")}
+    skipped_hl_action_rows = 0
+    total_action_rows = 0
 
     for batch in tqdm.tqdm(data_loader, total=num_batches, desc="Computing stats"):
-        for key in keys:
-            stats[key].update(np.asarray(batch[key]))
+        stats["state"].update(np.asarray(batch["state"]))
+
+        actions = _actions_for_norm_stats(batch)
+        batch_rows = int(np.asarray(batch["actions"]).shape[0])
+        total_action_rows += batch_rows
+        if actions is None:
+            skipped_hl_action_rows += batch_rows
+            continue
+        skipped_hl_action_rows += batch_rows - int(actions.shape[0])
+        stats["actions"].update(actions)
+
+    if skipped_hl_action_rows:
+        print(
+            f"Excluded {skipped_hl_action_rows}/{total_action_rows} batch rows from action norm stats "
+            "(HL / action_loss_mask=False)."
+        )
 
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
 
