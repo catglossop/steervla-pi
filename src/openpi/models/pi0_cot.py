@@ -833,6 +833,7 @@ class Pi0CoT(_model.BaseModel):
         *,
         mr: int,
         ms: int,
+        mf: int,
         temperature: float,
     ):
         return self._cot_module_jit(
