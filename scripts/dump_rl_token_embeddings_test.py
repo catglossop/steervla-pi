@@ -83,7 +83,10 @@ def test_data_loader_yields_cot_batch():
     import openpi.training.data_loader as _data_loader  # noqa: E402
     import openpi.training.sharding as sharding  # noqa: E402
 
-    config = dataclasses.replace(_config.get_config(CONFIG_NAME), batch_size=2, fsdp_devices=1)
+    # Match batch_size to the visible JAX device count so the data loader's
+    # NamedSharding(...).check_compatible_aval doesn't reject a non-divisible batch.
+    bsz = jax.device_count()
+    config = dataclasses.replace(_config.get_config(CONFIG_NAME), batch_size=bsz, fsdp_devices=1)
     mesh = sharding.make_mesh(1)
     sh = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(sharding.DATA_AXIS))
     loader = _data_loader.create_data_loader(
@@ -92,22 +95,22 @@ def test_data_loader_yields_cot_batch():
     obs, actions = next(iter(loader))
 
     # Action shape.
-    assert tuple(actions.shape) == (2, 10, 32)
+    assert tuple(actions.shape) == (bsz, 10, 32)
 
     # Vision.
     for k in ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"):
         assert k in obs.images, f"missing image {k}"
-        assert tuple(obs.images[k].shape) == (2, *_model.IMAGE_RESOLUTION, 3)
-        assert tuple(obs.image_masks[k].shape) == (2,)
+        assert tuple(obs.images[k].shape) == (bsz, *_model.IMAGE_RESOLUTION, 3)
+        assert tuple(obs.image_masks[k].shape) == (bsz,)
     assert bool(np.asarray(obs.image_masks["base_0_rgb"][0])) is True
     assert bool(np.asarray(obs.image_masks["left_wrist_0_rgb"][0])) is False
     assert bool(np.asarray(obs.image_masks["right_wrist_0_rgb"][0])) is False
 
     # Prompt / CoT / FAST.
-    assert tuple(obs.tokenized_prompt.shape) == (2, 200)
-    assert tuple(obs.tokenized_subtask.shape) == (2, 64)
-    assert tuple(obs.tokenized_reasoning.shape) == (2, 64)
-    assert tuple(obs.tokenized_fast.shape) == (2, 64)
+    assert tuple(obs.tokenized_prompt.shape) == (bsz, 200)
+    assert tuple(obs.tokenized_subtask.shape) == (bsz, 64)
+    assert tuple(obs.tokenized_reasoning.shape) == (bsz, 64)
+    assert tuple(obs.tokenized_fast.shape) == (bsz, 64)
     for mname in ("tokenized_prompt_mask", "tokenized_subtask_mask", "tokenized_reasoning_mask", "tokenized_fast_mask"):
         m = getattr(obs, mname)
         assert m is not None, mname
