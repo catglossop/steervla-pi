@@ -24,7 +24,8 @@ class Args:
     lr: float = 1e-4
     num_steps: int = 5000
     log_interval: int = 50
-    eval_interval: int = 500
+    eval_interval: int = 500       # set to 0 to disable val eval
+    max_train_samples: int | None = None  # truncate train set (useful: set == batch_size for single-batch overfit)
     seed: int = 0
     d_model: int = 512
     encoder_layers: int = 4
@@ -66,6 +67,9 @@ def main(args: Args):
                name=args.wandb_name or output_dir.name, config=dataclasses.asdict(args), dir=str(output_dir))
 
     train_z, train_m = _load_shards(args.train_dir)
+    if args.max_train_samples is not None:
+        train_z = train_z[: args.max_train_samples]
+        train_m = train_m[: args.max_train_samples]
     logging.info("train: %s density=%.3f", tuple(train_z.shape), float(train_m.float().mean()))
     train_loader = _loader(train_z, train_m, args.batch_size, shuffle=True)
     val_loader = None
@@ -106,7 +110,7 @@ def main(args: Args):
                 log({"step": step, "train_loss": float(out["loss"]), "shuffle_baseline": shuf, "lr": args.lr}, step)
                 pbar.set_postfix(loss=f"{out['loss']:.4f}", shuf=f"{shuf:.4f}")
 
-            if val_loader is not None and step > 0 and step % args.eval_interval == 0:
+            if val_loader is not None and args.eval_interval > 0 and step > 0 and step % args.eval_interval == 0:
                 model.eval()
                 with torch.no_grad():
                     vl = float(np.mean([float(model(vz.to(device).float(), vm.to(device))["loss"])
