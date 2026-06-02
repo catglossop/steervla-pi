@@ -32,6 +32,7 @@ class Args:
     output_dir: str = "./rl_token_embeddings/traffic_light_v0"
     num_batches: int = 500
     split: str = "train"
+    shuffle: bool = False
 
 
 def _prefix_forward(model: Pi0CoT, observation: _model.Observation):
@@ -83,7 +84,7 @@ def main(args: Args):
 
     mesh = sharding.make_mesh(config.fsdp_devices)
     data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(sharding.DATA_AXIS))
-    data_loader = _data_loader.create_data_loader(config, sharding=data_sharding, shuffle=False, skip_norm_stats=True, split=args.split)
+    data_loader = _data_loader.create_data_loader(config, sharding=data_sharding, shuffle=args.shuffle, skip_norm_stats=True, split=args.split)
     data_iter = iter(data_loader)
 
     logging.info("Loading checkpoint %s", args.checkpoint_dir)
