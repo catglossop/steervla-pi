@@ -106,6 +106,11 @@ def main(args: Args):
     if args.resume_from is not None:
         ckpt = torch.load(args.resume_from, map_location=device)
         model.load_state_dict(ckpt["model"])
+        if "optimizer" in ckpt:
+            opt.load_state_dict(ckpt["optimizer"])
+            logging.info("Restored optimizer state (Adam moments + step)")
+        else:
+            logging.warning("No optimizer state in %s; Adam moments start from scratch", args.resume_from)
         logging.info("Resumed weights from %s; training %d further steps", args.resume_from, args.num_steps)
 
     log_f = (output_dir / "metrics.jsonl").open("w")
@@ -145,7 +150,8 @@ def main(args: Args):
             step += 1; pbar.update(1)
 
     pbar.close(); log_f.close()
-    torch.save({"model": model.state_dict(), "cfg": dataclasses.asdict(cfg), "args": dataclasses.asdict(args)},
+    torch.save({"model": model.state_dict(), "optimizer": opt.state_dict(),
+                "cfg": dataclasses.asdict(cfg), "args": dataclasses.asdict(args)},
                output_dir / "ae_ckpt.pt")
     logging.info("Done. Checkpoint at %s/ae_ckpt.pt", output_dir)
     wandb.finish()
