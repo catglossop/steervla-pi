@@ -27,7 +27,7 @@ class Args:
     eval_interval: int = 500       # set to 0 to disable val eval
     max_train_samples: int | None = None  # truncate train set (useful: set == batch_size for single-batch overfit)
     seed: int = 0
-    d_model: int = 512
+    d_model: int = 2048
     encoder_layers: int = 4
     decoder_layers: int = 4
     num_heads: int = 8
