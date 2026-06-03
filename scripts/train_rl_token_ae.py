@@ -21,7 +21,6 @@ class Args:
     val_dir: str | None = "./rl_token_embeddings/traffic_light_v0/val"
     output_dir: str = "./rl_token_ae/traffic_light_v0"
     batch_size: int = 32
-    grad_accum_steps: int = 1
     lr: float = 1e-4
     num_steps: int = 5000
     log_interval: int = 50
@@ -94,41 +93,34 @@ def main(args: Args):
         log_f.write(json.dumps(rec) + "\n"); log_f.flush()
         wandb.log(rec, step=step)
 
-    def _cycle(loader):
-        while True: yield from loader
-
     model.train()
-    data_iter = _cycle(train_loader)
-    pbar = tqdm.tqdm(range(args.num_steps), desc="train")
-    for step in pbar:
-        opt.zero_grad(set_to_none=True)
-        losses = []
-        for _ in range(args.grad_accum_steps):
-            z, m = next(data_iter)
+    pbar = tqdm.tqdm(total=args.num_steps, desc="train")
+    step = 0
+    while step < args.num_steps:
+        for z, m in train_loader:
+            if step >= args.num_steps: break
             z, m = z.to(device, non_blocking=True).float(), m.to(device, non_blocking=True)
             out = model(z, m)
-            (out["loss"] / args.grad_accum_steps).backward()
-            losses.append(float(out["loss"]))
-        opt.step()
-        train_loss = float(np.mean(losses))
+            opt.zero_grad(set_to_none=True); out["loss"].backward(); opt.step()
 
-        if step % args.log_interval == 0:
-            with torch.no_grad():
-                shuf = float(_masked_l2(out["z_hat"], z[torch.randperm(z.shape[0], device=device)], m))
-            log({"step": step, "train_loss": train_loss, "shuffle_baseline": shuf, "lr": args.lr,
-                 "effective_batch_size": args.batch_size * args.grad_accum_steps}, step)
-            pbar.set_postfix(loss=f"{train_loss:.4f}", shuf=f"{shuf:.4f}")
+            if step % args.log_interval == 0:
+                with torch.no_grad():
+                    shuf = float(_masked_l2(out["z_hat"], z[torch.randperm(z.shape[0], device=device)], m))
+                log({"step": step, "train_loss": float(out["loss"]), "shuffle_baseline": shuf, "lr": args.lr}, step)
+                pbar.set_postfix(loss=f"{out['loss']:.4f}", shuf=f"{shuf:.4f}")
 
-        if val_loader is not None and args.eval_interval > 0 and step > 0 and step % args.eval_interval == 0:
-            model.eval()
-            with torch.no_grad():
-                vl = float(np.mean([float(model(vz.to(device).float(), vm.to(device))["loss"])
-                                    for vz, vm in val_loader]))
-            model.train()
-            log({"step": step, "val_loss": vl}, step)
-            logging.info("step %d val_loss=%.4f", step, vl)
+            if val_loader is not None and args.eval_interval > 0 and step > 0 and step % args.eval_interval == 0:
+                model.eval()
+                with torch.no_grad():
+                    vl = float(np.mean([float(model(vz.to(device).float(), vm.to(device))["loss"])
+                                        for vz, vm in val_loader]))
+                model.train()
+                log({"step": step, "val_loss": vl}, step)
+                logging.info("step %d val_loss=%.4f", step, vl)
 
-    log_f.close()
+            step += 1; pbar.update(1)
+
+    pbar.close(); log_f.close()
     torch.save({"model": model.state_dict(), "cfg": dataclasses.asdict(cfg), "args": dataclasses.asdict(args)},
                output_dir / "ae_ckpt.pt")
     logging.info("Done. Checkpoint at %s/ae_ckpt.pt", output_dir)
