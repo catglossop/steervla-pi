@@ -29,6 +29,8 @@ class Args:
     num_steps: int = 5000
     log_interval: int = 50
     eval_interval: int = 500
+    resume_from: str | None = None
+    start_step: int = 0
     max_train_samples: int | None = None
     seed: int = 0
     d_model: int = 2048
@@ -39,6 +41,7 @@ class Args:
     wandb_enabled: bool = True
     wandb_project: str = "openpi-rlt"
     wandb_name: str | None = None
+    wandb_id: str | None = None
 
 
 def _load_shards(shard_dir: str):
@@ -75,7 +78,8 @@ def main(args: Args):
     output_dir = pathlib.Path(args.output_dir); output_dir.mkdir(parents=True, exist_ok=True)
 
     wandb.init(mode="online" if args.wandb_enabled else "disabled", project=args.wandb_project,
-               name=args.wandb_name or output_dir.name, config=dataclasses.asdict(args), dir=str(output_dir))
+               name=args.wandb_name or output_dir.name, config=dataclasses.asdict(args), dir=str(output_dir),
+               id=args.wandb_id, resume="allow" if args.wandb_id else None)
 
     train_z, train_m = _load_shards(args.train_dir)
     if args.max_train_samples is not None:
@@ -98,6 +102,12 @@ def main(args: Args):
     wandb.config.update({"ae_cfg": dataclasses.asdict(cfg), "ae_params": n_params})
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    if args.resume_from is not None:
+        ckpt = torch.load(args.resume_from, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        logging.info("Resumed weights from %s; training %d further steps", args.resume_from, args.num_steps)
+
     log_f = (output_dir / "metrics.jsonl").open("w")
 
     def log(rec, step):
@@ -110,6 +120,7 @@ def main(args: Args):
     while step < args.num_steps:
         for z, m in train_loader:
             if step >= args.num_steps: break
+            gstep = step + args.start_step
             z, m = z.to(device, non_blocking=True).float(), m.to(device, non_blocking=True)
             lr_now = _lr_at(step, args.warmup_steps, args.num_steps, args.lr, args.min_lr) if args.cosine_lr else args.lr
             for g in opt.param_groups: g["lr"] = lr_now
@@ -119,7 +130,7 @@ def main(args: Args):
             if step % args.log_interval == 0:
                 with torch.no_grad():
                     shuf = float(_masked_l2(out["z_hat"], z[torch.randperm(z.shape[0], device=device)], m))
-                log({"step": step, "train_loss": float(out["loss"]), "shuffle_baseline": shuf, "lr": lr_now}, step)
+                log({"step": gstep, "train_loss": float(out["loss"]), "shuffle_baseline": shuf, "lr": lr_now}, gstep)
                 pbar.set_postfix(loss=f"{out['loss']:.4f}", shuf=f"{shuf:.4f}")
 
             if val_loader is not None and args.eval_interval > 0 and step > 0 and step % args.eval_interval == 0:
@@ -128,8 +139,8 @@ def main(args: Args):
                     vl = float(np.mean([float(model(vz.to(device).float(), vm.to(device))["loss"])
                                         for vz, vm in val_loader]))
                 model.train()
-                log({"step": step, "val_loss": vl}, step)
-                logging.info("step %d val_loss=%.4f", step, vl)
+                log({"step": gstep, "val_loss": vl}, gstep)
+                logging.info("step %d val_loss=%.4f", gstep, vl)
 
             step += 1; pbar.update(1)
 
