@@ -3,6 +3,7 @@ import dataclasses
 import glob
 import json
 import logging
+import math
 import pathlib
 
 import numpy as np
@@ -22,6 +23,9 @@ class Args:
     output_dir: str = "./rl_token_ae/traffic_light_v0"
     batch_size: int = 32
     lr: float = 1e-4
+    cosine_lr: bool = False
+    warmup_steps: int = 500
+    min_lr: float = 1e-5
     num_steps: int = 5000
     log_interval: int = 50
     eval_interval: int = 500
@@ -55,6 +59,13 @@ def _loader(z, m, batch_size, shuffle):
 def _masked_l2(pred, target, mask):
     sq = (pred - target).pow(2).sum(-1) * mask.to(pred.dtype)
     return sq.sum() / mask.to(pred.dtype).sum()
+
+
+def _lr_at(step, warmup, total, peak, min_lr):
+    if step < warmup:
+        return peak * (step + 1) / max(warmup, 1)
+    progress = (step - warmup) / max(1, total - warmup)
+    return min_lr + 0.5 * (peak - min_lr) * (1 + math.cos(math.pi * progress))
 
 
 def main(args: Args):
@@ -100,13 +111,15 @@ def main(args: Args):
         for z, m in train_loader:
             if step >= args.num_steps: break
             z, m = z.to(device, non_blocking=True).float(), m.to(device, non_blocking=True)
+            lr_now = _lr_at(step, args.warmup_steps, args.num_steps, args.lr, args.min_lr) if args.cosine_lr else args.lr
+            for g in opt.param_groups: g["lr"] = lr_now
             out = model(z, m)
             opt.zero_grad(set_to_none=True); out["loss"].backward(); opt.step()
 
             if step % args.log_interval == 0:
                 with torch.no_grad():
                     shuf = float(_masked_l2(out["z_hat"], z[torch.randperm(z.shape[0], device=device)], m))
-                log({"step": step, "train_loss": float(out["loss"]), "shuffle_baseline": shuf, "lr": args.lr}, step)
+                log({"step": step, "train_loss": float(out["loss"]), "shuffle_baseline": shuf, "lr": lr_now}, step)
                 pbar.set_postfix(loss=f"{out['loss']:.4f}", shuf=f"{shuf:.4f}")
 
             if val_loader is not None and args.eval_interval > 0 and step > 0 and step % args.eval_interval == 0:
