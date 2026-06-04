@@ -33,6 +33,8 @@ class Args:
     num_batches: int = 500
     split: str = "train"
     shuffle: bool = False
+    save_metadata: bool = True
+    save_images: bool = True
 
 
 def _prefix_forward(model: Pi0CoT, observation: _model.Observation):
@@ -71,6 +73,28 @@ def _prefix_forward(model: Pi0CoT, observation: _model.Observation):
     (prefix_out, _), _ = model.PaliGemma.llm([tokens, None], mask=attn_mask, positions=positions)
     sizes = jnp.array([n_img, n_prompt, n_reasoning, n_subtask, n_fast], jnp.int32)
     return prefix_out, prefix_mask, sizes
+
+
+def _extract_metadata(obs: _model.Observation, *, save_images: bool) -> dict:
+    """Per-row raw inputs aligned to the embeddings: tokenized text ids (+masks) and base image."""
+    def g(x):
+        return None if x is None else np.asarray(jax.device_get(x))
+
+    meta = {
+        "tokenized_prompt": g(obs.tokenized_prompt),
+        "tokenized_prompt_mask": g(obs.tokenized_prompt_mask),
+        "tokenized_reasoning": g(obs.tokenized_reasoning),
+        "tokenized_reasoning_mask": g(obs.tokenized_reasoning_mask),
+        "tokenized_subtask": g(obs.tokenized_subtask),
+        "tokenized_subtask_mask": g(obs.tokenized_subtask_mask),
+        "tokenized_fast": g(obs.tokenized_fast),
+        "tokenized_fast_mask": g(obs.tokenized_fast_mask),
+    }
+    if save_images and "base_0_rgb" in obs.images:
+        # Loader images are float in [-1, 1]; store as uint8 for compact, directly viewable frames.
+        img = np.asarray(jax.device_get(obs.images["base_0_rgb"])).astype(np.float32)
+        meta["base_image"] = np.clip((img + 1.0) * 127.5, 0, 255).astype(np.uint8)
+    return {k: v for k, v in meta.items() if v is not None}
 
 
 def main(args: Args):
@@ -123,8 +147,7 @@ def main(args: Args):
         per_cam = n_img // 3
         keep = np.r_[np.arange(per_cam), np.arange(3 * per_cam, out.shape[1])]
 
-        np.savez(
-            output_dir / f"shard_{i:06d}.npz",
+        payload = dict(
             prefix_out=out[:, keep, :],
             prefix_mask=mask[:, keep],
             actions=acts,
@@ -134,6 +157,9 @@ def main(args: Args):
             n_subtask=np.int32(sizes[3]),
             n_fast=np.int32(sizes[4]),
         )
+        if args.save_metadata:
+            payload.update(_extract_metadata(obs, save_images=args.save_images))
+        np.savez(output_dir / f"shard_{i:06d}.npz", **payload)
         if i < 3:
             logging.info("batch %d shape=%s density=%.3f", i, out[:, keep, :].shape, float(mask[:, keep].mean()))
 
