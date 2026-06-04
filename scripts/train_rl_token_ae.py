@@ -8,7 +8,6 @@ import pathlib
 
 import numpy as np
 import torch
-import torch.utils.data
 import tqdm
 import tyro
 import wandb
@@ -44,19 +43,53 @@ class Args:
     wandb_id: str | None = None
 
 
-def _load_shards(shard_dir: str):
-    paths = sorted(glob.glob(f"{shard_dir}/shard_*.npz"))
-    assert paths, f"no shards found at {shard_dir}"
-    arrs = [np.load(p) for p in tqdm.tqdm(paths, desc=f"loading {shard_dir}")]
-    z = np.concatenate([a["prefix_out"] for a in arrs])
-    m = np.concatenate([a["prefix_mask"] for a in arrs])
-    return torch.from_numpy(z), torch.from_numpy(m)
+class ShardStream:
+    """Streams (z, m) batches from .npz shards with bounded RAM (shard-order + buffer shuffle)."""
 
+    def __init__(self, shard_dir, batch_size, *, shuffle, seed=0, buffer_frames=2048, max_frames=None):
+        self.paths = sorted(glob.glob(f"{shard_dir}/shard_*.npz"))
+        assert self.paths, f"no shards found at {shard_dir}"
+        self.batch_size, self.shuffle = batch_size, shuffle
+        self.buffer_frames, self.seed, self.max_frames = buffer_frames, seed, max_frames
+        self._epoch = 0
+        head = np.load(self.paths[0])["prefix_out"]
+        self.seq_len, self.embed_dim = int(head.shape[1]), int(head.shape[2])
 
-def _loader(z, m, batch_size, shuffle):
-    ds = torch.utils.data.TensorDataset(z, m)
-    return torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
-                                        num_workers=2, pin_memory=True, drop_last=shuffle)
+    def _frames(self, rng):
+        order = list(self.paths)
+        if self.shuffle:
+            rng.shuffle(order)
+        buf_z, buf_m, n = [], [], 0
+        for p in order:
+            a = np.load(p)
+            z, m = a["prefix_out"], a["prefix_mask"]
+            for i in range(z.shape[0]):
+                if self.shuffle:
+                    buf_z.append(z[i]); buf_m.append(m[i])
+                    if len(buf_z) >= self.buffer_frames:
+                        j = int(rng.integers(len(buf_z)))
+                        yield buf_z[j], buf_m[j]; n += 1
+                        buf_z[j], buf_m[j] = buf_z[-1], buf_m[-1]
+                        buf_z.pop(); buf_m.pop()
+                else:
+                    yield z[i], m[i]; n += 1
+                if self.max_frames and n >= self.max_frames:
+                    return
+        if self.shuffle:
+            for j in rng.permutation(len(buf_z)):
+                if self.max_frames and n >= self.max_frames:
+                    return
+                yield buf_z[j], buf_m[j]; n += 1
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self._epoch); self._epoch += 1
+        bz, bm = [], []
+        for z, m in self._frames(rng):
+            bz.append(z); bm.append(m)
+            if len(bz) == self.batch_size:
+                yield torch.from_numpy(np.stack(bz)), torch.from_numpy(np.stack(bm)); bz, bm = [], []
+        if bz and not self.shuffle:
+            yield torch.from_numpy(np.stack(bz)), torch.from_numpy(np.stack(bm))
 
 
 def _masked_l2(pred, target, mask):
@@ -81,21 +114,19 @@ def main(args: Args):
                name=args.wandb_name or output_dir.name, config=dataclasses.asdict(args), dir=str(output_dir),
                id=args.wandb_id, resume="allow" if args.wandb_id else None)
 
-    train_z, train_m = _load_shards(args.train_dir)
-    if args.max_train_samples is not None:
-        train_z = train_z[: args.max_train_samples]
-        train_m = train_m[: args.max_train_samples]
-    logging.info("train: %s density=%.3f", tuple(train_z.shape), float(train_m.float().mean()))
-    train_loader = _loader(train_z, train_m, args.batch_size, shuffle=True)
+    train_loader = ShardStream(args.train_dir, args.batch_size, shuffle=True, seed=args.seed,
+                               max_frames=args.max_train_samples)
+    logging.info("train: %d shards, seq_len=%d, embed_dim=%d",
+                 len(train_loader.paths), train_loader.seq_len, train_loader.embed_dim)
     val_loader = None
     if args.val_dir:
-        val_z, val_m = _load_shards(args.val_dir)
-        logging.info("val: %s density=%.3f", tuple(val_z.shape), float(val_m.float().mean()))
-        val_loader = _loader(val_z, val_m, args.batch_size, shuffle=False)
+        val_loader = ShardStream(args.val_dir, args.batch_size, shuffle=False, seed=args.seed)
+        assert val_loader.seq_len == train_loader.seq_len, "train/val seq_len mismatch"
+        logging.info("val: %d shards", len(val_loader.paths))
 
-    cfg = RLTokenAEConfig(vla_embed_dim=train_z.shape[-1], d_model=args.d_model,
+    cfg = RLTokenAEConfig(vla_embed_dim=train_loader.embed_dim, d_model=args.d_model,
                           encoder_layers=args.encoder_layers, decoder_layers=args.decoder_layers,
-                          num_heads=args.num_heads, max_seq_len=train_z.shape[1])
+                          num_heads=args.num_heads, max_seq_len=train_loader.seq_len)
     model = RLTokenAutoencoder(cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     logging.info("AE params: %.2fM", n_params / 1e6)
