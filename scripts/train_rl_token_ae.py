@@ -28,6 +28,7 @@ class Args:
     num_steps: int = 5000
     log_interval: int = 50
     eval_interval: int = 500
+    ckpt_interval: int = 5000
     resume_from: str | None = None
     start_step: int = 0
     max_train_samples: int | None = None
@@ -150,6 +151,13 @@ def main(args: Args):
         log_f.write(json.dumps(rec) + "\n"); log_f.flush()
         wandb.log(rec, step=step)
 
+    def save_ckpt(path, gstep):
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        torch.save({"model": model.state_dict(), "optimizer": opt.state_dict(), "step": gstep,
+                    "cfg": dataclasses.asdict(cfg), "args": dataclasses.asdict(args)}, tmp)
+        tmp.replace(path)
+        logging.info("Saved checkpoint %s (step %d)", path, gstep)
+
     model.train()
     pbar = tqdm.tqdm(total=args.num_steps, desc="train")
     step = 0
@@ -179,12 +187,12 @@ def main(args: Args):
                 logging.info("step %d val_loss=%.4f", gstep, vl)
 
             step += 1; pbar.update(1)
+            if args.ckpt_interval > 0 and step % args.ckpt_interval == 0:
+                save_ckpt(output_dir / f"ae_step{step + args.start_step}.pt", step + args.start_step)
 
     pbar.close(); log_f.close()
-    torch.save({"model": model.state_dict(), "optimizer": opt.state_dict(),
-                "cfg": dataclasses.asdict(cfg), "args": dataclasses.asdict(args)},
-               output_dir / "ae_ckpt.pt")
-    logging.info("Done. Checkpoint at %s/ae_ckpt.pt", output_dir)
+    save_ckpt(output_dir / "ae_ckpt.pt", step + args.start_step)
+    logging.info("Done.")
     wandb.finish()
 
 
