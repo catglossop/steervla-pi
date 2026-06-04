@@ -35,6 +35,8 @@ class Args:
     shuffle: bool = False
     save_metadata: bool = True
     save_images: bool = True
+    jpeg_images: bool = True
+    jpeg_quality: int = 95
 
 
 def _prefix_forward(model: Pi0CoT, observation: _model.Observation):
@@ -75,8 +77,22 @@ def _prefix_forward(model: Pi0CoT, observation: _model.Observation):
     return prefix_out, prefix_mask, sizes
 
 
-def _extract_metadata(obs: _model.Observation, *, save_images: bool) -> dict:
-    """Per-row raw inputs aligned to the embeddings: tokenized text ids (+masks) and base image."""
+def _encode_jpeg(frame: np.ndarray, quality: int) -> bytes:
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.fromarray(frame).save(buf, format="JPEG", quality=quality)
+    return buf.getvalue()
+
+
+def _extract_metadata(obs: _model.Observation, *, save_images: bool, jpeg_images: bool, jpeg_quality: int) -> dict:
+    """Per-row raw inputs aligned to the embeddings: tokenized text ids (+masks) and base image.
+
+    Images are analysis-only (the AE trains on embeddings, not images). With ``jpeg_images`` we store
+    each frame as a JPEG blob in a flat uint8 buffer + per-row lengths (no pickle, much smaller on disk).
+    """
     def g(x):
         return None if x is None else np.asarray(jax.device_get(x))
 
@@ -91,9 +107,15 @@ def _extract_metadata(obs: _model.Observation, *, save_images: bool) -> dict:
         "tokenized_fast_mask": g(obs.tokenized_fast_mask),
     }
     if save_images and "base_0_rgb" in obs.images:
-        # Loader images are float in [-1, 1]; store as uint8 for compact, directly viewable frames.
+        # Loader images are float in [-1, 1]; convert to uint8 for viewable frames.
         img = np.asarray(jax.device_get(obs.images["base_0_rgb"])).astype(np.float32)
-        meta["base_image"] = np.clip((img + 1.0) * 127.5, 0, 255).astype(np.uint8)
+        img = np.clip((img + 1.0) * 127.5, 0, 255).astype(np.uint8)  # (B, H, W, 3)
+        if jpeg_images:
+            blobs = [_encode_jpeg(frame, jpeg_quality) for frame in img]
+            meta["base_image_jpeg"] = np.frombuffer(b"".join(blobs), dtype=np.uint8).copy()
+            meta["base_image_jpeg_lengths"] = np.asarray([len(b) for b in blobs], dtype=np.int64)
+        else:
+            meta["base_image"] = img
     return {k: v for k, v in meta.items() if v is not None}
 
 
@@ -158,7 +180,9 @@ def main(args: Args):
             n_fast=np.int32(sizes[4]),
         )
         if args.save_metadata:
-            payload.update(_extract_metadata(obs, save_images=args.save_images))
+            payload.update(_extract_metadata(
+                obs, save_images=args.save_images, jpeg_images=args.jpeg_images, jpeg_quality=args.jpeg_quality
+            ))
         np.savez(output_dir / f"shard_{i:06d}.npz", **payload)
         if i < 3:
             logging.info("batch %d shape=%s density=%.3f", i, out[:, keep, :].shape, float(mask[:, keep].mean()))
