@@ -65,11 +65,13 @@ class RLTokenAutoencoder(nn.Module):
         out = self.decoder(seq, mask=causal, src_key_padding_mask=kp)
         return self.out_proj(out)
 
-    def forward(self, z: torch.Tensor, mask: torch.Tensor):
+    def forward(self, z: torch.Tensor, mask: torch.Tensor, loss_mask: torch.Tensor | None = None):
+        # encoder/decoder always see the full prefix via `mask`; `loss_mask` (defaults to `mask`)
+        # selects which tokens count toward reconstruction -- e.g. exclude trailing FAST action tokens.
         z_targets = z.detach()  # stop-grad on reconstruction targets (paper: z̄_i = sg(z_i))
         z_rl = self.encode(z, mask)
         z_hat = self.decode(z_rl, z_targets, mask)
         per_token = (z_hat - z_targets).pow(2).sum(dim=-1)
-        mf = mask.to(per_token.dtype)
-        loss = (per_token * mf).sum() / mf.sum()
+        lm = (mask if loss_mask is None else loss_mask).to(per_token.dtype)
+        loss = (per_token * lm).sum() / lm.sum().clamp(min=1)
         return {"loss": loss, "z_rl": z_rl, "z_hat": z_hat, "per_token_l2": per_token.detach()}

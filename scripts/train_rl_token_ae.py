@@ -17,9 +17,9 @@ from openpi.models.rl_token import RLTokenAEConfig, RLTokenAutoencoder
 
 @dataclasses.dataclass
 class Args:
-    train_dir: str = "./rl_token_embeddings/traffic_light_v0/train"
-    val_dir: str | None = "./rl_token_embeddings/traffic_light_v0/val"
-    output_dir: str = "./rl_token_ae/traffic_light_v0"
+    train_dir: str = "./rl_token_embeddings/traffic_light_v1/train"
+    val_dir: str | None = "./rl_token_embeddings/traffic_light_v1/val"
+    output_dir: str = "./rl_token_ae/traffic_light_v1"
     batch_size: int = 32
     lr: float = 1e-4
     cosine_lr: bool = False
@@ -53,8 +53,9 @@ class ShardStream:
         self.batch_size, self.shuffle = batch_size, shuffle
         self.buffer_frames, self.seed, self.max_frames = buffer_frames, seed, max_frames
         self._epoch = 0
-        head = np.load(self.paths[0])["prefix_out"]
-        self.seq_len, self.embed_dim = int(head.shape[1]), int(head.shape[2])
+        head = np.load(self.paths[0])
+        self.seq_len, self.embed_dim = int(head["prefix_out"].shape[1]), int(head["prefix_out"].shape[2])
+        self.n_fast = int(head["n_fast"]) if "n_fast" in head.files else 0  # trailing FAST action tokens
 
     def _frames(self, rng):
         order = list(self.paths)
@@ -123,7 +124,24 @@ def main(args: Args):
     if args.val_dir:
         val_loader = ShardStream(args.val_dir, args.batch_size, shuffle=False, seed=args.seed)
         assert val_loader.seq_len == train_loader.seq_len, "train/val seq_len mismatch"
+        assert val_loader.n_fast == train_loader.n_fast, "train/val n_fast mismatch"
         logging.info("val: %d shards", len(val_loader.paths))
+
+    # FAST action tokens are the trailing block of the prefix; exclude them from the reconstruction
+    # loss (encoder/decoder still see them) so z_rl isn't graded on copying the action it conditions on.
+    n_fast = train_loader.n_fast
+    logging.info("n_fast=%d (excluded from reconstruction loss)", n_fast)
+
+    def loss_mask_of(m):
+        if n_fast <= 0:
+            return m
+        lm = m.clone()
+        lm[:, -n_fast:] = False
+        return lm
+
+    def eval_loss(vz, vm):
+        vz, vm = vz.to(device).float(), vm.to(device)
+        return float(model(vz, vm, loss_mask=loss_mask_of(vm))["loss"])
 
     cfg = RLTokenAEConfig(vla_embed_dim=train_loader.embed_dim, d_model=args.d_model,
                           encoder_layers=args.encoder_layers, decoder_layers=args.decoder_layers,
@@ -166,22 +184,22 @@ def main(args: Args):
             if step >= args.num_steps: break
             gstep = step + args.start_step
             z, m = z.to(device, non_blocking=True).float(), m.to(device, non_blocking=True)
+            lm = loss_mask_of(m)
             lr_now = _lr_at(step, args.warmup_steps, args.num_steps, args.lr, args.min_lr) if args.cosine_lr else args.lr
             for g in opt.param_groups: g["lr"] = lr_now
-            out = model(z, m)
+            out = model(z, m, loss_mask=lm)
             opt.zero_grad(set_to_none=True); out["loss"].backward(); opt.step()
 
             if step % args.log_interval == 0:
                 with torch.no_grad():
-                    shuf = float(_masked_l2(out["z_hat"], z[torch.randperm(z.shape[0], device=device)], m))
+                    shuf = float(_masked_l2(out["z_hat"], z[torch.randperm(z.shape[0], device=device)], lm))
                 log({"step": gstep, "train_loss": float(out["loss"]), "shuffle_baseline": shuf, "lr": lr_now}, gstep)
                 pbar.set_postfix(loss=f"{out['loss']:.4f}", shuf=f"{shuf:.4f}")
 
             if val_loader is not None and args.eval_interval > 0 and step > 0 and step % args.eval_interval == 0:
                 model.eval()
                 with torch.no_grad():
-                    vl = float(np.mean([float(model(vz.to(device).float(), vm.to(device))["loss"])
-                                        for vz, vm in val_loader]))
+                    vl = float(np.mean([eval_loss(vz, vm) for vz, vm in val_loader]))
                 model.train()
                 log({"step": gstep, "val_loss": vl}, gstep)
                 logging.info("step %d val_loss=%.4f", gstep, vl)
