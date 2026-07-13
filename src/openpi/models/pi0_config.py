@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 from typing_extensions import override
 
+from openpi.models import context_smoothing as _context_smoothing
 from openpi.models import model as _model
 import openpi.models.gemma as _gemma
 from openpi.shared import array_typing as at
@@ -156,6 +157,11 @@ class Pi0CoTConfig(_model.BaseModelConfig):
     # Replay generated reasoning from the prompt KV before subtask generation. This matches the
     # masked/padded training layout, but is expensive for batch-1 online inference.
     cot_replay_reasoning: bool = True
+
+    # Context-Smoothed Pre-training. When set, the image tokens in the VLM prefix are noised with a
+    # per-sample t_context ~ U(0, 1) and the action expert is conditioned on t_context alongside the
+    # flow-matching timestep. ``None`` disables it entirely (no new params, no behavior change).
+    context_smoothing: _context_smoothing.ContextSmoothingConfig | None = None
 
     pytorch_compile_mode: str | None = "max-autotune"
 

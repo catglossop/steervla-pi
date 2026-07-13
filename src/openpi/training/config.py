@@ -13,6 +13,7 @@ import flax.nnx as nnx
 from typing_extensions import override
 import tyro
 
+import openpi.models.context_smoothing as context_smoothing
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
@@ -1847,6 +1848,41 @@ _CONFIGS = [
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),
 ]
+
+# Context-Smoothed Pre-training variant of pi05_steervla_cot_ki. Derived from that config so the
+# dataset mixture and schedule stay in sync; only the model, weight loader and resume differ.
+_steervla_cot_ki = _CONFIGS[[c.name for c in _CONFIGS].index("pi05_steervla_cot_ki")]
+_CONFIGS.append(
+    dataclasses.replace(
+        _steervla_cot_ki,
+        name="pi05_steervla_cot_ki_csp",
+        exp_name="pi05_steervla_cot_ki_csp",
+        model=dataclasses.replace(
+            _steervla_cot_ki.model,
+            context_smoothing=context_smoothing.ContextSmoothingConfig(),
+        ),
+        # Norm stats live under `assets/<config.name>`, so the rename above would orphan them.
+        # Reuse the parent config's, since CSP changes nothing about the data distribution.
+        data=dataclasses.replace(
+            _steervla_cot_ki.data,
+            assets=AssetsConfig(
+                assets_dir=f"./assets/{_steervla_cot_ki.name}",
+                asset_id=_steervla_cot_ki.data.repo_id,
+            ),
+        ),
+        # ctx_time_mlp_* postdate pi05_base, so they must survive the checkpoint merge.
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params",
+            missing_regex=".*(lora|ctx_time_mlp).*",
+        ),
+        # The CSP params change the train-state structure, so orbax cannot resume from the non-CSP
+        # run. To warm-start from that run's weights instead of pi05_base, point the weight loader at
+        # "gs://cat-logs/pi05_steervla_cot_ki/pi05_steervla_cot_ki/99999/params".
+        resume=False,
+        resume_dir=None,
+        resume_step=None,
+    )
+)
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")
