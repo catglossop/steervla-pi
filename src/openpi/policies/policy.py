@@ -172,6 +172,11 @@ class Policy(BasePolicy):
             tokenized_subtask=cot_out["tokenized_subtask"],
             tokenized_subtask_mask=cot_out["tokenized_subtask_mask"],
         )
+        if "tokenized_fast" in cot_out and "tokenized_fast_mask" in cot_out:
+            observation = observation.replace(
+                tokenized_fast=cot_out["tokenized_fast"],
+                tokenized_fast_mask=cot_out["tokenized_fast_mask"],
+            )
 
         t_act = time.monotonic()
         actions = self._sample_actions(rng_act, observation, **sample_kwargs)
@@ -186,6 +191,9 @@ class Policy(BasePolicy):
         outputs["tokenized_reasoning_mask"] = _batch0(cot_out["tokenized_reasoning_mask"])
         outputs["tokenized_subtask"] = _batch0(cot_out["tokenized_subtask"])
         outputs["tokenized_subtask_mask"] = _batch0(cot_out["tokenized_subtask_mask"])
+        if "tokenized_fast" in cot_out:
+            outputs["tokenized_fast"] = _batch0(cot_out["tokenized_fast"])
+            outputs["tokenized_fast_mask"] = _batch0(cot_out["tokenized_fast_mask"])
         outputs["policy_timing"] = {
             "infer_cot_ms": cot_ms,
             "infer_actions_ms": act_ms,

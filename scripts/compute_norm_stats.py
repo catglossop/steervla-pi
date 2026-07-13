@@ -44,6 +44,24 @@ def _filter_for_norm_stats(batch: dict, key: str) -> np.ndarray | None:
 
 
 
+def _actions_for_norm_stats(batch: dict) -> np.ndarray | None:
+    """Keep only action-supervised samples (exclude HL / CoT-only rows)."""
+    actions = np.asarray(batch["actions"])
+    mask = batch.get("action_loss_mask")
+    if mask is None:
+        return actions
+
+    mask = np.asarray(mask, dtype=bool)
+    if mask.ndim == 1:
+        keep = mask
+    else:
+        keep = np.any(mask.reshape(mask.shape[0], -1), axis=1)
+
+    if not np.any(keep):
+        return None
+    return actions[keep]
+
+
 def create_torch_dataloader(
     data_config: _config.DataConfig,
     action_horizon: int,
