@@ -119,6 +119,8 @@ class Observation(Generic[ArrayT]):
     tokenized_fast_mask: at.Bool[ArrayT, "*b lf"] | None = None
     # Optional per-timestep action loss mask (e.g., disable action supervision on HL-only samples).
     action_loss_mask: at.Bool[ArrayT, "*b ah"] | None = None
+    # Optional dataset index for eval grouping (matches steervla RLDS source order).
+    dataset_id: at.Int[ArrayT, "*b"] | None = None
 
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
@@ -147,6 +149,7 @@ class Observation(Generic[ArrayT]):
             tokenized_fast=data.get("tokenized_fast"),
             tokenized_fast_mask=data.get("tokenized_fast_mask"),
             action_loss_mask=data.get("action_loss_mask"),
+            dataset_id=data.get("dataset_id"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:

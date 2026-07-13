@@ -297,6 +297,17 @@ class SteerVLARldsDataset:
 
             return restructure
 
+        def _tag_dataset_id(restructure_fn, dataset_id: int):
+            """Attach a constant ``dataset_id`` per frame for downstream eval grouping."""
+
+            def restructure(traj):
+                out = restructure_fn(traj)
+                traj_len = tf.shape(out["actions"])[0]
+                out["dataset_id"] = tf.fill([traj_len], tf.cast(dataset_id, tf.int32))
+                return out
+
+            return restructure
+
         def prepare_single_dataset(
             dataset_cfg: SteerVLARLDSDataset,
             source_dataset_format: DatasetFormat,
@@ -304,6 +315,7 @@ class SteerVLARldsDataset:
             action_supervision: bool,
             cot_reasoning_source_key: str,
             cot_subtask_source_key: str,
+            dataset_id: int,
             split: str = "train",
         ):
             builder_kwargs = {"data_dir": data_dir}
@@ -326,6 +338,7 @@ class SteerVLARldsDataset:
             else:
                 raise ValueError(f"Unknown dataset_format: {source_dataset_format}")
 
+            restructure_fn = _tag_dataset_id(restructure_fn, dataset_id)
             dataset = dataset.traj_map(restructure_fn, num_parallel_calls)
 
             if source_dataset_format == DatasetFormat.NUSCENES:
@@ -372,6 +385,8 @@ class SteerVLARldsDataset:
             )
         logging.info("-" * 50)
 
+        self.dataset_names = [ds.name for ds, _, _, _, _ in source_specs]
+
         all_datasets = [
             prepare_single_dataset(
                 ds,
@@ -379,9 +394,12 @@ class SteerVLARldsDataset:
                 action_supervision=action_supervision,
                 cot_reasoning_source_key=cot_reason_key,
                 cot_subtask_source_key=cot_subtask_key,
+                dataset_id=dataset_id,
                 split=split,
             )
-            for ds, ds_format, action_supervision, cot_reason_key, cot_subtask_key in source_specs
+            for dataset_id, (ds, ds_format, action_supervision, cot_reason_key, cot_subtask_key) in enumerate(
+                source_specs
+            )
         ]
 
         final_dataset = dl.DLataset.sample_from_datasets(all_datasets, weights=normalized_weights)

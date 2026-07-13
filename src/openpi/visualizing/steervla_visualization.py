@@ -8,6 +8,7 @@ the model's flow-matching sampler on a held-out batch during training.
 import logging
 import re
 import tempfile
+from collections.abc import Sequence
 
 import flax.nnx as nnx
 import jax
@@ -126,6 +127,154 @@ def compute_trajectory_metrics(
     return metrics
 
 
+def _short_dataset_name(name: str) -> str:
+    """Compact wandb key from a full RLDS dataset name."""
+    short = name.removeprefix("simlingo_dataset_")
+    short = re.sub(r"_img512_\d+$", "", short)
+    return short or name
+
+
+def _decode_subtask_from_tokens(
+    subtask_ids: np.ndarray,
+    subtask_mask: np.ndarray,
+    tokenizer: CoTPaligemmaTokenizer,
+) -> str:
+    text = _decode_cot_segment(
+        subtask_ids,
+        subtask_mask,
+        tokenizer._tokenizer,
+        start_id=tokenizer._start_of_subtask(),
+        end_id=tokenizer._end_of_subtask(),
+    )
+    return _strip_loc_spans(text)
+
+
+def _per_step_displacement_magnitude(
+    denorm_actions: np.ndarray,
+    output_action_format: str | None,
+) -> np.ndarray:
+    """Per-timestep scalar motion magnitude from denormalized actions."""
+    fmt = (output_action_format or "").upper()
+    if fmt in ("DELTA_XY_T_DELTA_XY_SPACE", "DELTA_XY_T_DELTA_COURSE_SPACE"):
+        return np.sqrt(denorm_actions[..., 0] ** 2 + denorm_actions[..., 1] ** 2)
+    return np.abs(denorm_actions[..., 0])
+
+
+def _infer_motion_label(
+    denorm_actions: np.ndarray,
+    output_action_format: str | None,
+    *,
+    rel_threshold: float = 0.05,
+) -> str:
+    """Classify predicted motion as accelerate / decelerate / constant."""
+    mag = _per_step_displacement_magnitude(denorm_actions, output_action_format)
+    if mag.ndim > 1:
+        mag = np.mean(mag, axis=-1)
+    n = mag.shape[-1]
+    k = max(1, n // 3)
+    early = float(np.mean(mag[:k]))
+    late = float(np.mean(mag[-k:]))
+    rel_change = (late - early) / (early + 1e-6)
+    if rel_change < -rel_threshold:
+        return "decelerate"
+    if rel_change > rel_threshold:
+        return "accelerate"
+    return "constant"
+
+
+def _expected_motion_from_dataset(dataset_name: str) -> str | None:
+    if "acceleration_negative" in dataset_name:
+        return "decelerate"
+    if "acceleration_positive" in dataset_name:
+        return "accelerate"
+    return None
+
+
+def _compute_per_dataset_loss_metrics(
+    per_sample_loss: np.ndarray,
+    dataset_ids: np.ndarray,
+    dataset_names: Sequence[str],
+) -> dict[str, float]:
+    """Mean eval loss and sample count per dataset source present in the batch."""
+    metrics: dict[str, float] = {}
+    for dataset_id in np.unique(dataset_ids):
+        idx = int(dataset_id)
+        if idx < 0 or idx >= len(dataset_names):
+            continue
+        mask = dataset_ids == idx
+        count = int(mask.sum())
+        if count == 0:
+            continue
+        short = _short_dataset_name(dataset_names[idx])
+        metrics[f"eval/dataset/{short}/loss"] = float(np.mean(per_sample_loss[mask]))
+        metrics[f"eval/dataset/{short}/count"] = float(count)
+    return metrics
+
+
+def _prepare_image_for_display(img: np.ndarray) -> np.ndarray:
+    if np.issubdtype(img.dtype, np.floating):
+        if img.max() <= 1.0:
+            return np.clip(img * 255, 0, 255).astype(np.uint8)
+        return np.clip(img, 0, 255).astype(np.uint8)
+    return img
+
+
+def _make_trajectory_figure(
+    gt_wp: np.ndarray,
+    pred_wp: np.ndarray,
+    image: np.ndarray,
+    *,
+    sample_i: int,
+    step: int,
+    group_label: str,
+    subtask_text: str = "",
+    extra_title: str = "",
+    caption_suffix: str = "",
+) -> wandb.Image:
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+    ax = axes[0]
+    ax.plot(gt_wp[:, 1], gt_wp[:, 0], "g.-", label="Ground Truth", linewidth=2)
+    ax.plot(pred_wp[:, 1], pred_wp[:, 0], "b.--", label="Predicted", linewidth=2)
+    ax.plot(0, 0, "ko", markersize=8)
+    ax.set_xlabel("Y (m)")
+    ax.set_ylabel("X (m)")
+    title = f"Trajectory — {group_label} sample {sample_i}"
+    if extra_title:
+        title = f"{title}\n{extra_title}"
+    ax.set_title(title)
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.axis("equal")
+
+    ax = axes[1]
+    ax.imshow(_prepare_image_for_display(image))
+    ax.set_title("Camera view")
+    ax.axis("off")
+
+    if subtask_text:
+        fig.text(
+            0.5,
+            -0.02,
+            f"Subtask:\n{subtask_text}",
+            ha="center",
+            va="top",
+            fontsize=8,
+            family="monospace",
+            wrap=True,
+            bbox=dict(boxstyle="round,pad=0.4", facecolor="lightyellow", alpha=0.9),
+        )
+
+    fig.tight_layout()
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        fig.savefig(tmp.name, format="png", bbox_inches="tight", dpi=100)
+        plt.close(fig)
+        caption = f"step {step} {group_label} sample {sample_i}"
+        if caption_suffix:
+            caption = f"{caption} — {caption_suffix}"
+        return wandb.Image(tmp.name, caption=caption)
+
+
 # ---------------------------------------------------------------------------
 # Eval step: run model sampling and collect predictions
 # ---------------------------------------------------------------------------
@@ -145,11 +294,14 @@ def eval_step(
 
     observation, gt_actions = batch
 
-    loss = jnp.mean(model.compute_loss(rng, observation, gt_actions, train=False))
+    per_timestep_loss = model.compute_loss(rng, observation, gt_actions, train=False)
+    per_sample_loss = jnp.mean(per_timestep_loss, axis=-1)
+    loss = jnp.mean(per_sample_loss)
     pred_actions = model.sample_actions(rng, observation)
 
     return jax.device_get({
         "loss": loss,
+        "per_sample_loss": per_sample_loss,
         "pred_actions": pred_actions,
         "gt_actions": gt_actions,
     })
@@ -169,6 +321,8 @@ def run_visualization_evaluation(
     output_action_format: str | None = None,
     dt: float = 0.5,
     vis_samples: int = 5,
+    dataset_names: Sequence[str] | None = None,
+    accel_decel_vis_samples: int = 3,
 ) -> dict[str, float]:
     """Run evaluation on process 0 only; other hosts barrier-wait (no duplicate GPU eval)."""
     if jax.process_index() != 0:
@@ -221,50 +375,46 @@ def run_visualization_evaluation(
 
         metrics["eval/loss"] = float(eval_info["loss"])
 
+        per_sample_loss = np.asarray(eval_info["per_sample_loss"])
+        if dataset_names and observation.dataset_id is not None:
+            dataset_ids = np.asarray(jax.device_get(observation.dataset_id))
+            metrics.update(_compute_per_dataset_loss_metrics(per_sample_loss, dataset_ids, dataset_names))
+
+        subtask_texts: list[str] = []
+        if (
+            observation.tokenized_subtask is not None
+            and observation.tokenized_subtask_mask is not None
+        ):
+            cot_tokenizer = CoTPaligemmaTokenizer(use_fast_tokens=False)
+            subtask_ids = np.asarray(jax.device_get(observation.tokenized_subtask))
+            subtask_masks = np.asarray(jax.device_get(observation.tokenized_subtask_mask))
+            subtask_texts = [
+                _decode_subtask_from_tokens(subtask_ids[i], subtask_masks[i], cot_tokenizer)
+                for i in range(subtask_ids.shape[0])
+            ]
+
         images_dict = jax.device_get(observation.images)
         base_key = next(iter(images_dict))
         base_images = np.asarray(images_dict[base_key])
+
+        def _subtask_for(i: int) -> str:
+            return subtask_texts[i] if subtask_texts else ""
 
         def _make_trajectory_figures(sample_indices: np.ndarray, group_label: str) -> list:
             figs = []
             for sample_i in sample_indices:
                 sample_i = int(sample_i)
-                fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-
-                ax = axes[0]
-                ax.plot(
-                    gt_wp[sample_i, :, 1], gt_wp[sample_i, :, 0],
-                    "g.-", label="Ground Truth", linewidth=2,
+                figs.append(
+                    _make_trajectory_figure(
+                        gt_wp[sample_i],
+                        pred_wp[sample_i],
+                        base_images[sample_i],
+                        sample_i=sample_i,
+                        step=step,
+                        group_label=group_label,
+                        subtask_text=_subtask_for(sample_i),
+                    )
                 )
-                ax.plot(
-                    pred_wp[sample_i, :, 1], pred_wp[sample_i, :, 0],
-                    "b.--", label="Predicted", linewidth=2,
-                )
-                ax.plot(0, 0, "ko", markersize=8)
-                ax.set_xlabel("Y (m)")
-                ax.set_ylabel("X (m)")
-                ax.set_title(f"Trajectory — {group_label} sample {sample_i}")
-                ax.legend()
-                ax.grid(True, alpha=0.3)
-                ax.axis("equal")
-
-                ax = axes[1]
-                img = base_images[sample_i]
-                if np.issubdtype(img.dtype, np.floating):
-                    img = np.clip(img * 255, 0, 255).astype(np.uint8) if img.max() <= 1.0 else np.clip(img, 0, 255).astype(np.uint8)
-                ax.imshow(img)
-                ax.set_title("Camera view")
-                ax.axis("off")
-
-                fig.tight_layout()
-
-                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-                    fig.savefig(tmp.name, format="png", bbox_inches="tight", dpi=100)
-                    plt.close(fig)
-                    figs.append(wandb.Image(
-                        tmp.name,
-                        caption=f"step {step} {group_label} sample {sample_i}",
-                    ))
             return figs
 
         non_hl_indices = np.flatnonzero(non_hl_mask)[:vis_samples]
@@ -276,6 +426,100 @@ def run_visualization_evaluation(
         if hl_indices.size > 0:
             log_dict["eval/trajectories_hl"] = _make_trajectory_figures(hl_indices, "HL")
 
+        if dataset_names and observation.dataset_id is not None:
+            dataset_ids = np.asarray(jax.device_get(observation.dataset_id))
+            accel_figs = []
+            accel_correct = 0
+            accel_total = 0
+            for sample_i in range(pred_actions.shape[0]):
+                if not non_hl_mask[sample_i]:
+                    continue
+                dataset_id = int(dataset_ids[sample_i])
+                if dataset_id < 0 or dataset_id >= len(dataset_names):
+                    continue
+                dataset_name = dataset_names[dataset_id]
+                expected_motion = _expected_motion_from_dataset(dataset_name)
+                if expected_motion is None:
+                    continue
+                pred_motion = _infer_motion_label(
+                    pred_denorm[sample_i],
+                    output_action_format,
+                )
+                matches = pred_motion == expected_motion
+                accel_total += 1
+                accel_correct += int(matches)
+
+            if accel_total > 0:
+                metrics["eval/accel_decel_policy_correct_rate"] = float(accel_correct / accel_total)
+                metrics["eval/accel_decel_policy_correct_count"] = float(accel_correct)
+                metrics["eval/accel_decel_policy_total"] = float(accel_total)
+
+            per_dataset_accel: dict[str, list[int]] = {}
+            for sample_i in range(pred_actions.shape[0]):
+                if not non_hl_mask[sample_i]:
+                    continue
+                dataset_id = int(dataset_ids[sample_i])
+                if dataset_id < 0 or dataset_id >= len(dataset_names):
+                    continue
+                dataset_name = dataset_names[dataset_id]
+                if _expected_motion_from_dataset(dataset_name) is None:
+                    continue
+                short = _short_dataset_name(dataset_name)
+                per_dataset_accel.setdefault(short, []).append(sample_i)
+
+            for short, indices in per_dataset_accel.items():
+                correct = 0
+                for sample_i in indices:
+                    expected_motion = _expected_motion_from_dataset(dataset_names[int(dataset_ids[sample_i])])
+                    pred_motion = _infer_motion_label(
+                        pred_denorm[sample_i],
+                        output_action_format,
+                    )
+                    correct += int(pred_motion == expected_motion)
+                metrics[f"eval/dataset/{short}/accel_decel_correct_rate"] = float(correct / len(indices))
+                metrics[f"eval/dataset/{short}/accel_decel_count"] = float(len(indices))
+
+            selected_accel: list[int] = []
+            for short, indices in sorted(per_dataset_accel.items()):
+                for sample_i in indices[:accel_decel_vis_samples]:
+                    if sample_i not in selected_accel:
+                        selected_accel.append(sample_i)
+
+            for sample_i in selected_accel:
+                dataset_id = int(dataset_ids[sample_i])
+                dataset_name = dataset_names[dataset_id]
+                expected_motion = _expected_motion_from_dataset(dataset_name)
+                assert expected_motion is not None
+                pred_motion = _infer_motion_label(
+                    pred_denorm[sample_i],
+                    output_action_format,
+                )
+                matches = pred_motion == expected_motion
+                short = _short_dataset_name(dataset_name)
+                extra_title = (
+                    f"Dataset: {short}\n"
+                    f"Expected: {expected_motion.upper()} | "
+                    f"Policy: {pred_motion.upper()} | "
+                    f"Correct: {'TRUE' if matches else 'FALSE'}"
+                )
+                accel_figs.append(
+                    _make_trajectory_figure(
+                        gt_wp[sample_i],
+                        pred_wp[sample_i],
+                        base_images[sample_i],
+                        sample_i=sample_i,
+                        step=step,
+                        group_label="accel/decel",
+                        subtask_text=_subtask_for(sample_i),
+                        extra_title=extra_title,
+                        caption_suffix=f"{expected_motion} correct={'TRUE' if matches else 'FALSE'}",
+                    )
+                )
+
+            if accel_figs:
+                log_dict["eval/trajectories_accel_decel"] = accel_figs
+
+        log_dict.update(metrics)
         wandb.log(log_dict, step=step)
         logging.info(
             f"Eval step {step}: "

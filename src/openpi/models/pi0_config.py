@@ -137,6 +137,8 @@ class Pi0CoTConfig(_model.BaseModelConfig):
 
     cot_loss_weight: float = 1.0
     knowledge_insulation: bool = True
+    # If False, action expert tokens attend to images + prompt only (not subtask).
+    action_attend_subtask: bool = True
     # Supervise FAST-discretized actions in the VLM prefix (after subtask).
     use_fast_tokens: bool = False
 

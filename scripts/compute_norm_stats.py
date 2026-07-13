@@ -20,6 +20,29 @@ class RemoveStrings(transforms.DataTransformFn):
     def __call__(self, x: dict) -> dict:
         return {k: v for k, v in x.items() if not np.issubdtype(np.asarray(v).dtype, np.str_)}
 
+def _action_supervised_keep_mask(batch: dict) -> np.ndarray | None:
+    """Per-batch-row mask for action-supervised samples (exclude HL / CoT-only rows)."""
+    mask = batch.get("action_loss_mask")
+    if mask is None:
+        return None
+
+    mask = np.asarray(mask, dtype=bool)
+    if mask.ndim == 1:
+        return mask
+    return np.any(mask.reshape(mask.shape[0], -1), axis=1)
+
+
+def _filter_for_norm_stats(batch: dict, key: str) -> np.ndarray | None:
+    """Keep only action-supervised samples for norm stats."""
+    values = np.asarray(batch[key])
+    keep = _action_supervised_keep_mask(batch)
+    if keep is None:
+        return values
+    if not np.any(keep):
+        return None
+    return values[keep]
+
+
 
 def create_torch_dataloader(
     data_config: _config.DataConfig,
@@ -99,12 +122,30 @@ def main(config_name: str, max_frames: int | None = None):
             data_config, config.model.action_horizon, config.batch_size, config.model, config.num_workers, max_frames
         )
 
-    keys = ["state", "actions"]
-    stats = {key: normalize.RunningStats() for key in keys}
+    stats = {key: normalize.RunningStats() for key in ("state", "actions")}
+    skipped_hl_rows = 0
+    total_rows = 0
 
     for batch in tqdm.tqdm(data_loader, total=num_batches, desc="Computing stats"):
-        for key in keys:
-            stats[key].update(np.asarray(batch[key]))
+        batch_rows = int(np.asarray(batch["state"]).shape[0])
+        total_rows += batch_rows
+
+        state = _filter_for_norm_stats(batch, "state")
+        actions = _filter_for_norm_stats(batch, "actions")
+        if state is None:
+            skipped_hl_rows += batch_rows
+            continue
+
+        skipped_hl_rows += batch_rows - int(state.shape[0])
+        stats["state"].update(state)
+        if actions is not None:
+            stats["actions"].update(actions)
+
+    if skipped_hl_rows:
+        print(
+            f"Excluded {skipped_hl_rows}/{total_rows} batch rows from state/action norm stats "
+            "(HL / action_loss_mask=False)."
+        )
 
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
 

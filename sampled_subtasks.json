@@ -1,0 +1,913 @@
+{
+  "config_name": "pi05_steervla_cot_simplified_reasoning",
+  "dataset_name": "simlingo_dataset_all_img512_1116",
+  "split": "train",
+  "subtask_key": "gemini_refined_label",
+  "reasoning_key": "commentary",
+  "num_samples": 100,
+  "steps_seen": 750000,
+  "max_steps": 750000,
+  "seed": 0,
+  "samples": [
+    {
+      "split": "train",
+      "episode_index": 1769,
+      "step_index": 476,
+      "subtask": "The vehicle cautiously follows the route, maintaining steady lane keeping behind the front car.",
+      "reasoning": "Follow the route. Maintain the reduced speed to stay behind the black car that is to the front.",
+      "prompt": "Current speed: 8.9 m/s. Command: follow the road. Q: What is the current speed limit?",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 2351,
+      "step_index": 193,
+      "subtask": "The vehicle smoothly adjusts course to the right while cautiously maintaining speed behind the police car.",
+      "reasoning": "Follow the route. Maintain the reduced speed to stay behind the black police car that is to the front.",
+      "prompt": "Current speed: 8.0 m/s. Command: follow the road then do a lane change to the right. Predict the waypoints.",
+      "routing_command": "Command: follow the road then do a lane change to the right."
+    },
+    {
+      "split": "train",
+      "episode_index": 441,
+      "step_index": 75,
+      "subtask": "The vehicle maintains a steady course, following the black car ahead at a normal pace.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 17.2 m/s. Command: follow the road then go straight at the next intersection. Predict the waypoints.",
+      "routing_command": "Command: follow the road then go straight at the next intersection."
+    },
+    {
+      "split": "train",
+      "episode_index": 993,
+      "step_index": 53,
+      "subtask": "The vehicle remains stopped normally at the red traffic light.",
+      "reasoning": "Follow the route. Remain stopped due to the red traffic light.",
+      "prompt": "Current speed: 0.0 m/s. Command: go straight at the next intersection in 25 meter then follow the road. What should the ego do next?",
+      "routing_command": "Command: go straight at the next intersection in 25 meter then follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 3771,
+      "step_index": 117,
+      "subtask": "The vehicle smoothly decelerates to a stop, cautiously adjusting course to the left due to a pedestrian.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 3.5 m/s. Command: follow the road. Predict the waypoints.",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 5177,
+      "step_index": 278,
+      "subtask": "The vehicle maintains a steady speed while following the route, staying behind the dark green SUV.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 8.1 m/s. Command: follow the road then go straight at the next intersection. Predict the waypoints.",
+      "routing_command": "Command: follow the road then go straight at the next intersection."
+    },
+    {
+      "split": "train",
+      "episode_index": 2274,
+      "step_index": 33,
+      "subtask": "The vehicle smoothly follows the route, cautiously reducing speed through the junction with steady lane keeping.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 17.8 m/s. Command: go straight at the next intersection in 124 meter then follow the road. What should the ego do next?",
+      "routing_command": "Command: go straight at the next intersection in 124 meter then follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 2969,
+      "step_index": 79,
+      "subtask": "The vehicle normally follows the route, maintaining reduced speed behind the front black car.",
+      "reasoning": "Follow the route. Maintain the reduced speed to stay behind the black car that is to the front.",
+      "prompt": "Current speed: 7.7 m/s. Command: follow the road. Q: How many lanes are there in the opposite direction to the ego car?",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 1452,
+      "step_index": 1877,
+      "subtask": "The vehicle accelerates steadily to follow the front black car, maintaining a straight course.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 0.5 m/s. Command: follow the road then go right at the next intersection. What should the ego do next?",
+      "routing_command": "Command: follow the road then go right at the next intersection."
+    },
+    {
+      "split": "train",
+      "episode_index": 77,
+      "step_index": 112,
+      "subtask": "The vehicle turns right aggressively while accelerating through the clear junction.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 5.3 m/s. Command: go right at the next intersection in 16 meter then follow the road. What should the ego do next?",
+      "routing_command": "Command: go right at the next intersection in 16 meter then follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 118,
+      "step_index": 51,
+      "subtask": "The vehicle accelerates normally and makes a sharp left adjustment following the route.",
+      "reasoning": "Follow the route. Accelerate to drive with the target speed.",
+      "prompt": "Current speed: 2.6 m/s. Command: go left at the next intersection in 23 meter then do a lane change to the right. Predict the waypoints.",
+      "routing_command": "Command: go left at the next intersection in 23 meter then do a lane change to the right."
+    },
+    {
+      "split": "train",
+      "episode_index": 5205,
+      "step_index": 777,
+      "subtask": "The vehicle cautiously waits for a gap before normally changing lanes.",
+      "reasoning": "Go around the construction site. Wait for a gap in the traffic before changing lanes.",
+      "prompt": "Current speed: 0.0 m/s. Command: follow the road. Q: Does the ego vehicle need to brake? Why?",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 5281,
+      "step_index": 40,
+      "subtask": "The vehicle turns right smoothly while accelerating to follow the maroon car.",
+      "reasoning": "Turn right. Accelerate to follow the maroon car that is to the front right in 22.0 meters.",
+      "prompt": "Current speed: 0.9 m/s. Command: go right at the next intersection in 15 meter then follow the road. Predict the waypoints.",
+      "routing_command": "Command: go right at the next intersection in 15 meter then follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 5284,
+      "step_index": 13,
+      "subtask": "The vehicle follows the route, accelerating normally and then making a sharp right adjustment.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 16.4 m/s. Command: follow the road. Follow the route. Predict the waypoints.",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 3137,
+      "step_index": 54,
+      "subtask": "The vehicle cautiously adjusts its course to follow the black car, braking if necessary for the walker.",
+      "reasoning": "Follow the route. Decelerate to stay behind the black car that is to the front in 16.9 meters. Pay attention to the walker and brake if necessary.",
+      "prompt": "Current speed: 13.1 m/s. Command: follow the road. What should the ego do next?",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 2279,
+      "step_index": 53,
+      "subtask": "The vehicle follows the route, maintaining reduced speed cautiously with slight adjustments to the left.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 8.9 m/s. Command: follow the road. Follow the route. Predict the waypoints.",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 2736,
+      "step_index": 22,
+      "subtask": "The vehicle steadily decelerates to a stop while maintaining a straight course.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 18.9 m/s. Command: follow the road. What should the ego do next?",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 4248,
+      "step_index": 0,
+      "subtask": "The vehicle cautiously decelerates and adjusts course to follow the yellow car ahead.",
+      "reasoning": "Follow the route. Decelerate to stay behind the yellow car that is to the front.",
+      "prompt": "Current speed: 5.3 m/s. Command: follow the road. Follow the route. Decelerate to stay behind the yellow car that is to the front. Predict the waypoints.",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 4147,
+      "step_index": 152,
+      "subtask": "The vehicle remains stopped, patiently waiting behind the stationary maroon car.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 0.0 m/s. Command: follow the road then go right at the next intersection. Predict the waypoints.",
+      "routing_command": "Command: follow the road then go right at the next intersection."
+    },
+    {
+      "split": "train",
+      "episode_index": 1147,
+      "step_index": 113,
+      "subtask": "The vehicle remained stopped behind the maroon car 2.8 meters ahead, maintaining a steady course.",
+      "reasoning": "Follow the route. Remain stopped to stay behind the maroon car that is to the front right in 2.8 meters.",
+      "prompt": "Current speed: 0.0 m/s. Command: follow the road. Q: In which direction is the ego car allowed to change lanes?",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 3433,
+      "step_index": 216,
+      "subtask": "The vehicle decelerates smoothly to stay behind the black car ahead, driving cautiously.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 5.4 m/s. Command: follow the road then go left at the next intersection. Predict the waypoints.",
+      "routing_command": "Command: follow the road then go left at the next intersection."
+    },
+    {
+      "split": "train",
+      "episode_index": 3357,
+      "step_index": 9,
+      "subtask": "The vehicle accelerates through a wide left turn, cautiously monitoring oncoming traffic.",
+      "reasoning": "Turn left. Accelerate because the traffic light is green but pay attention to the vehicle coming towards the junction.",
+      "prompt": "Current speed: 2.3 m/s. Command: go left at the next intersection in 18 meter then follow the road. Turn left. Accelerate because the traffic light is green but pay attention to the vehicle coming towards the junction. Predict the waypoints.",
+      "routing_command": "Command: go left at the next intersection in 18 meter then follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 4844,
+      "step_index": 261,
+      "subtask": "Cautiously adjusting course, the vehicle waits for a gap before changing lanes to the lane with oncoming traffic.",
+      "reasoning": "Avoid the vehicle that is opening its door. Wait for a gap in the traffic before changing lanes to the lane with oncoming traffic.",
+      "prompt": "Current speed: 0.0 m/s. Command: follow the road. Q: How many lanes are there in the opposite direction to the ego car?",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 1487,
+      "step_index": 65,
+      "subtask": "The vehicle remains stopped behind the black car at 8.8 meters, obeying the red traffic light.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 0.0 m/s. Command: follow the road. Predict the waypoints.",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 4463,
+      "step_index": 78,
+      "subtask": "The vehicle follows the route and maintains reduced speed with a steady course.",
+      "reasoning": "Follow the route. Maintain the reduced speed.",
+      "prompt": "Current speed: 18.6 m/s. Command: follow the road then go right at the next intersection. Q: Is there an obstacle on the current road?",
+      "routing_command": "Command: follow the road then go right at the next intersection."
+    },
+    {
+      "split": "train",
+      "episode_index": 135,
+      "step_index": 182,
+      "subtask": "The vehicle cautiously follows the route and remains stopped behind the black car to the front right.",
+      "reasoning": "Follow the route. Remain stopped to stay behind the black car that is to the front right.",
+      "prompt": "Current speed: 0.0 m/s. Command: follow the road. Q: What are the important objects in the scene?",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 707,
+      "step_index": 88,
+      "subtask": "The vehicle remains stopped behind the front black car due to a red traffic light, normally maintaining its position.",
+      "reasoning": "Follow the route. Remain stopped to stay behind the black car that is to the front that is stopped because of a red traffic light.",
+      "prompt": "Current speed: 0.0 m/s. Command: follow the road. What should the ego do next?",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 5046,
+      "step_index": 145,
+      "subtask": "The vehicle remained stopped, steadily maintaining its position behind the maroon SUV.",
+      "reasoning": "Follow the route. Remain stopped to stay behind the maroon SUV that is to the front.",
+      "prompt": "Current speed: 0.0 m/s. Command: follow the road then go left at the next intersection. Q: Is there an obstacle on the current road?",
+      "routing_command": "Command: follow the road then go left at the next intersection."
+    },
+    {
+      "split": "train",
+      "episode_index": 1844,
+      "step_index": 20,
+      "subtask": "The vehicle normally follows the route, accelerating and adjusting right.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 3.6 m/s. Command: follow the road. Follow the route. Predict the waypoints.",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 4552,
+      "step_index": 61,
+      "subtask": "The vehicle cautiously waits for a gap in traffic before changing lanes.",
+      "reasoning": "Steer clear of the parked vehicle. Wait for a gap in the traffic before changing lanes to the lane with oncoming traffic.",
+      "prompt": "Current speed: 0.0 m/s. Command: follow the road. Q: Is the ego vehicle at a junction?",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 3034,
+      "step_index": 86,
+      "subtask": "The vehicle remains stopped normally due to a red traffic light.",
+      "reasoning": "Follow the route. Remain stopped due to the red traffic light.",
+      "prompt": "Current speed: 0.0 m/s. Command: follow the road. Predict the waypoints.",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 12,
+      "step_index": 28,
+      "subtask": "The vehicle remained stopped normally due to the red traffic light.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 0.0 m/s. Command: go left at the next intersection in 20 meter then follow the road. What should the ego do next?",
+      "routing_command": "Command: go left at the next intersection in 20 meter then follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 773,
+      "step_index": 70,
+      "subtask": "The vehicle follows the route, maintaining reduced speed with a smooth rightward course adjustment.",
+      "reasoning": "Follow the route. Maintain the reduced speed.",
+      "prompt": "Current speed: 20.3 m/s. Command: follow the road then do a lane change to the right. What should the ego do next?",
+      "routing_command": "Command: follow the road then do a lane change to the right."
+    },
+    {
+      "split": "train",
+      "episode_index": 5102,
+      "step_index": 449,
+      "subtask": "The vehicle stayed stopped, waiting behind the navy car.",
+      "reasoning": "Turn left. Remain stopped to stay behind the navy car that is to the front in 5.0 meters.",
+      "prompt": "Current speed: 0.0 m/s. Command: go left at the next intersection in 13 meter then do a lane change to the right. Q: The ego vehicle continues turning left at the current intersection. Is the navy car that is nearby to the front of the ego vehicle potentially crossing the path of the ego vehicle?",
+      "routing_command": "Command: go left at the next intersection in 13 meter then do a lane change to the right."
+    },
+    {
+      "split": "train",
+      "episode_index": 1047,
+      "step_index": 193,
+      "subtask": "The vehicle follows the dark green car, accelerating and then sharply adjusting course to the left.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 5.1 m/s. Command: go left at the next intersection in 21 meter then follow the road. Predict the waypoints.",
+      "routing_command": "Command: go left at the next intersection in 21 meter then follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 3222,
+      "step_index": 147,
+      "subtask": "The vehicle stops steadily behind the dark green car.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 0.0 m/s. Command: follow the road. What should the ego do next?",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 5177,
+      "step_index": 371,
+      "subtask": "The vehicle accelerates to follow the dark green SUV at 17.4 meters, normally maintaining its lane.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 2.8 m/s. Command: follow the road then go straight at the next intersection. What should the ego do next?",
+      "routing_command": "Command: follow the road then go straight at the next intersection."
+    },
+    {
+      "split": "train",
+      "episode_index": 3612,
+      "step_index": 164,
+      "subtask": "The vehicle remains stopped normally due to a red traffic light.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 0.0 m/s. Command: go straight at the next intersection in 26 meter then follow the road. Predict the waypoints.",
+      "routing_command": "Command: go straight at the next intersection in 26 meter then follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 4790,
+      "step_index": 29,
+      "subtask": "The vehicle follows the route with a smooth rightward adjustment, then a gradual leftward adjustment, normally maintaining its speed before decelerating.",
+      "reasoning": "Follow the route. Maintain your current speed.",
+      "prompt": "Current speed: 10.4 m/s. Command: follow the road. Q: What are the important objects in the scene?",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 3470,
+      "step_index": 38,
+      "subtask": "The vehicle turns right normally, accelerating to follow the maroon car 14.6 meters ahead.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 6.7 m/s. Command: go right at the next intersection in 18 meter then follow the road. What should the ego do next?",
+      "routing_command": "Command: go right at the next intersection in 18 meter then follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 5219,
+      "step_index": 186,
+      "subtask": "The vehicle remains stopped to stay behind the black car that is to the front in 8.8 meters, driving normally.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 0.0 m/s. Command: follow the road. Predict the waypoints.",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 4716,
+      "step_index": 65,
+      "subtask": "The vehicle accelerates normally to follow the black car in 9.5 meters.",
+      "reasoning": "Follow the route. Accelerate to follow the black car that is to the front in 9.5 meters.",
+      "prompt": "Current speed: 0.1 m/s. Command: follow the road. Predict the waypoints.",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 1207,
+      "step_index": 40,
+      "subtask": "The vehicle follows the route with steady lane keeping and normal acceleration.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 17.7 m/s. Command: do a lane change to the left in 110 meter then follow the road. What should the ego do next?",
+      "routing_command": "Command: do a lane change to the left in 110 meter then follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 746,
+      "step_index": 291,
+      "subtask": "Following the route, the vehicle smoothly adjusts left while maintaining reduced speed behind the yellow car.",
+      "reasoning": "Follow the route. Maintain the reduced speed to stay behind the yellow car that is to the front left.",
+      "prompt": "Current speed: 5.8 m/s. Command: follow the road then go left at the next intersection. Q: Is the ego vehicle affected by a traffic light?",
+      "routing_command": "Command: follow the road then go left at the next intersection."
+    },
+    {
+      "split": "train",
+      "episode_index": 1823,
+      "step_index": 204,
+      "subtask": "The vehicle accelerates normally to follow the gray car ahead, maintaining a steady course.",
+      "reasoning": "Follow the route. Accelerate to follow the gray car that is to the front in 8.8 meters.",
+      "prompt": "Current speed: 0.0 m/s. Command: follow the road then go left at the next intersection. Q: On which lane is the ego vehicle (left most lane of the lanes going in the same direction is indicated with 0)?",
+      "routing_command": "Command: follow the road then go left at the next intersection."
+    },
+    {
+      "split": "train",
+      "episode_index": 399,
+      "step_index": 50,
+      "subtask": "The vehicle accelerates and makes a wide right adjustment through the junction.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 8.0 m/s. Command: go left at the next intersection in 20 meter then follow the road. What should the ego do next?",
+      "routing_command": "Command: go left at the next intersection in 20 meter then follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 3173,
+      "step_index": 13,
+      "subtask": "The vehicle smoothly follows the route, normally decelerating and accelerating to match target speed.",
+      "reasoning": "Follow the route. Decelerate to drive with the target speed.",
+      "prompt": "Current speed: 10.6 m/s. Command: follow the road. Q: The ego vehicle follows the road. Is the maroon car that is nearby to the front left of the ego vehicle potentially crossing the path of the ego vehicle?",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 1149,
+      "step_index": 13,
+      "subtask": "The vehicle accelerates normally, maintaining a steady course before making a slight adjustment to the left.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 14.7 m/s. Command: follow the road. Predict the waypoints.",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 2913,
+      "step_index": 24,
+      "subtask": "The vehicle accelerates and then adjusts its course smoothly while following the route.",
+      "reasoning": "Follow the route. Accelerate to drive with the target speed.",
+      "prompt": "Current speed: 8.7 m/s. Command: follow the road. Predict the waypoints.",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 541,
+      "step_index": 68,
+      "subtask": "The vehicle steadily follows the route, maintaining a reduced speed behind the front black car.",
+      "reasoning": "Follow the route. Maintain the reduced speed to stay behind the black car that is to the front.",
+      "prompt": "Current speed: 9.8 m/s. Command: do a lane change to the left in 98 meter then go left at the next intersection. Q: Is the ego vehicle at a junction?",
+      "routing_command": "Command: do a lane change to the left in 98 meter then go left at the next intersection."
+    },
+    {
+      "split": "train",
+      "episode_index": 4185,
+      "step_index": 45,
+      "subtask": "The vehicle decelerates steadily behind the maroon car, maintaining a straight course.",
+      "reasoning": "Follow the route. Decelerate to stay behind the maroon car that is to the front at 10.7 meters that is slowing down because of a red traffic light.",
+      "prompt": "Current speed: 7.2 m/s. Command: follow the road. What should the ego do next?",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 563,
+      "step_index": 168,
+      "subtask": "The vehicle remained stopped behind the front black car at 9.2 meters, normally.",
+      "reasoning": "Follow the route. Remain stopped to stay behind the black car that is to the front at 9.2 meters that is stopped because of a red traffic light.",
+      "prompt": "Current speed: 0.0 m/s. Command: follow the road then go straight at the next intersection. What should the ego do next?",
+      "routing_command": "Command: follow the road then go straight at the next intersection."
+    },
+    {
+      "split": "train",
+      "episode_index": 1071,
+      "step_index": 175,
+      "subtask": "The vehicle remains stopped, cautiously following the black car ahead.",
+      "reasoning": "Follow the route. Remain stopped to stay behind the black car that is to the front right in 8.6 meters.",
+      "prompt": "Current speed: 0.0 m/s. Command: follow the road. What should the ego do next?",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 4136,
+      "step_index": 66,
+      "subtask": "The vehicle remains stopped, then cautiously accelerates slightly forward to maintain position behind the maroon car.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 0.0 m/s. Command: follow the road then go left at the next intersection. Predict the waypoints.",
+      "routing_command": "Command: follow the road then go left at the next intersection."
+    },
+    {
+      "split": "train",
+      "episode_index": 850,
+      "step_index": 64,
+      "subtask": "The vehicle remained stopped behind the maroon car to the front right in 8.4 meters.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 0.0 m/s. Command: follow the road. Follow the route. Predict the waypoints.",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 223,
+      "step_index": 9,
+      "subtask": "The vehicle steadily accelerates normally and maintains course along the route.",
+      "reasoning": "Follow the route. Accelerate to drive with the target speed.",
+      "prompt": "Current speed: 12.7 m/s. Command: follow the road. What should the ego do next?",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 1694,
+      "step_index": 257,
+      "subtask": "The car is in a driving scenario.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 0.0 m/s. Command: go right at the next intersection in 120 meter then follow the road. Follow the route. Predict the waypoints.",
+      "routing_command": "Command: go right at the next intersection in 120 meter then follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 922,
+      "step_index": 103,
+      "subtask": "The vehicle cautiously accelerates to reach the speed limit with steady lane keeping.",
+      "reasoning": "Follow the route. Accelerate to reach the speed limit.",
+      "prompt": "Current speed: 0.0 m/s. Command: follow the road. What should the ego do next?",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 90,
+      "step_index": 33,
+      "subtask": "The vehicle cautiously decelerates and makes a slight rightward adjustment to follow the black car.",
+      "reasoning": "Follow the route. Decelerate to stay behind the black car that is to the front left.",
+      "prompt": "Current speed: 16.7 m/s. Command: go straight at the next intersection in 30 meter then do a lane change to the left. Q: How many lanes are there in the opposite direction to the ego car?",
+      "routing_command": "Command: go straight at the next intersection in 30 meter then do a lane change to the left."
+    },
+    {
+      "split": "train",
+      "episode_index": 4272,
+      "step_index": 100,
+      "subtask": "The vehicle remains stopped behind the maroon car, normally adhering to the red traffic light.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 0.0 m/s. Command: follow the road. What should the ego do next?",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 5240,
+      "step_index": 16,
+      "subtask": "The vehicle cautiously stopped, then smoothly accelerated forward, maintaining its course.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 0.0 m/s. Command: go left at the next intersection in 16 meter then follow the road. Predict the waypoints.",
+      "routing_command": "Command: go left at the next intersection in 16 meter then follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 4552,
+      "step_index": 85,
+      "subtask": "The vehicle cautiously waits for a gap before changing lanes.",
+      "reasoning": "Steer clear of the parked vehicle. Wait for a gap in the traffic before changing lanes to the lane with oncoming traffic.",
+      "prompt": "Current speed: 0.0 m/s. Command: follow the road. What should the ego do next?",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 5028,
+      "step_index": 82,
+      "subtask": "The car follows the route and maintains reduced speed, normally staying behind the orange car at 10.3 meters.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 5.3 m/s. Command: follow the road. Predict the waypoints.",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 1645,
+      "step_index": 127,
+      "subtask": "The vehicle returns to its route with steady lane keeping, normally.",
+      "reasoning": "Return to your original route after avoiding the obstacle. Maintain your current speed.",
+      "prompt": "Current speed: 9.8 m/s. Command: follow the road. What should the ego do next?",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 4500,
+      "step_index": 328,
+      "subtask": "The vehicle remains stopped, steadily maintaining its course behind the maroon car.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 0.0 m/s. Command: follow the road. Predict the waypoints.",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 3555,
+      "step_index": 794,
+      "subtask": "The vehicle decelerates smoothly to follow the front car, then cautiously accelerates normally.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 6.1 m/s. Command: follow the road. Predict the waypoints.",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 4563,
+      "step_index": 37,
+      "subtask": "The vehicle follows the route, accelerating normally and making a slight right course adjustment.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 12.6 m/s. Command: do a lane change to the right in 100 meter then go straight at the next intersection. What should the ego do next?",
+      "routing_command": "Command: do a lane change to the right in 100 meter then go straight at the next intersection."
+    },
+    {
+      "split": "train",
+      "episode_index": 458,
+      "step_index": 4,
+      "subtask": "The vehicle accelerates to follow the dark green SUV ahead, maintaining a steady lane keeping.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 7.4 m/s. Command: go straight at the next intersection in 77 meter then follow the road. What should the ego do next?",
+      "routing_command": "Command: go straight at the next intersection in 77 meter then follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 4431,
+      "step_index": 49,
+      "subtask": "The vehicle normally follows the route, steadily maintaining speed while making slight right adjustments.",
+      "reasoning": "Follow the route. Decelerate to drive with the target speed.",
+      "prompt": "Current speed: 20.5 m/s. Command: follow the road. What should the ego do next?",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 4876,
+      "step_index": 36,
+      "subtask": "The vehicle normally accelerates to follow the front car, then abruptly decelerates to a stop.",
+      "reasoning": "Follow the route. Accelerate to follow the black car that is to the front.",
+      "prompt": "Current speed: 6.9 m/s. Command: follow the road. What should the ego do next?",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 3452,
+      "step_index": 494,
+      "subtask": "The vehicle remains stopped, following the route cautiously behind the orange car in 3.1 meters.",
+      "reasoning": "Follow the route. Remain stopped to stay behind the orange car that is to the front left in 3.1 meters.",
+      "prompt": "Current speed: 0.0 m/s. Command: follow the road. What should the ego do next?",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 359,
+      "step_index": 78,
+      "subtask": "The vehicle smoothly decelerates and then accelerates to follow the navy car ahead.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 9.3 m/s. Command: follow the road. Predict the waypoints.",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 790,
+      "step_index": 202,
+      "subtask": "The vehicle follows the black car, accelerating and then braking cautiously for the pedestrian.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 10.0 m/s. Command: follow the road. What should the ego do next?",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 2247,
+      "step_index": 91,
+      "subtask": "The vehicle follows the route, maintaining reduced speed cautiously behind the black SUV at 11.7 meters.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 8.1 m/s. Command: follow the road then go right at the next intersection. Predict the waypoints.",
+      "routing_command": "Command: follow the road then go right at the next intersection."
+    },
+    {
+      "split": "train",
+      "episode_index": 2755,
+      "step_index": 65,
+      "subtask": "The vehicle smoothly decelerates to follow the dark green SUV ahead, then normally accelerates forward.",
+      "reasoning": "Follow the route. Decelerate to stay behind the dark green SUV that is to the front right in 9.1 meters.",
+      "prompt": "Current speed: 14.6 m/s. Command: follow the road. Follow the route. Decelerate to stay behind the dark green SUV that is to the front right in 9.1 meters. Predict the waypoints.",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 4668,
+      "step_index": 205,
+      "subtask": "The vehicle remained stopped, cautiously preparing to follow the maroon car ahead.",
+      "reasoning": "Follow the route. Remain stopped to stay behind the maroon car that is to the front.",
+      "prompt": "Current speed: 0.0 m/s. Command: follow the road then go right at the next intersection. Predict the waypoints.",
+      "routing_command": "Command: follow the road then go right at the next intersection."
+    },
+    {
+      "split": "train",
+      "episode_index": 986,
+      "step_index": 1,
+      "subtask": "The vehicle follows the route, steadily maintaining speed behind the black car 11.0 meters ahead.",
+      "reasoning": "Follow the route. Maintain the reduced speed to stay behind the black car that is to the front in 11.0 meters.",
+      "prompt": "Current speed: 5.4 m/s. Command: follow the road. What should the ego do next?",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 2061,
+      "step_index": 26,
+      "subtask": "The vehicle accelerates normally into the oncoming lane, then makes a slight, smooth course adjustment.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 5.6 m/s. Command: follow the road. Predict the waypoints.",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 1542,
+      "step_index": 11,
+      "subtask": "The vehicle follows the route, maintaining reduced speed with slight course adjustments.",
+      "reasoning": "Follow the route. Maintain the reduced speed.",
+      "prompt": "Current speed: 10.1 m/s. Command: follow the road. What should the ego do next?",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 3144,
+      "step_index": 10,
+      "subtask": "The vehicle turns right smoothly, accelerating to stay behind the silver SUV ahead.",
+      "reasoning": "Turn right. Decelerate to stay behind the silver SUV that is to the front right in 11.8 meters.",
+      "prompt": "Current speed: 9.4 m/s. Command: go right at the next intersection in 16 meter then follow the road. Q: What are the important objects in the scene?",
+      "routing_command": "Command: go right at the next intersection in 16 meter then follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 2396,
+      "step_index": 141,
+      "subtask": "The vehicle follows the route with steady lane keeping and normally maintained reduced speed.",
+      "reasoning": "Follow the route. Maintain the reduced speed.",
+      "prompt": "Current speed: 19.8 m/s. Command: follow the road then go left at the next intersection. Q: Does the ego vehicle need to change lanes or deviate from the lane center due to an upcoming obstruction?",
+      "routing_command": "Command: follow the road then go left at the next intersection."
+    },
+    {
+      "split": "train",
+      "episode_index": 5102,
+      "step_index": 707,
+      "subtask": "The vehicle remained stopped, waiting behind the navy car.",
+      "reasoning": "Turn left. Remain stopped to stay behind the navy car that is to the front.",
+      "prompt": "Current speed: 0.0 m/s. Command: go left at the next intersection in 13 meter then do a lane change to the right. Q: What lane marking is on the right side of the ego car?",
+      "routing_command": "Command: go left at the next intersection in 13 meter then do a lane change to the right."
+    },
+    {
+      "split": "train",
+      "episode_index": 4648,
+      "step_index": 184,
+      "subtask": "The vehicle accelerates normally while making a slight adjustment to the left.",
+      "reasoning": "Follow the route. Accelerate because the traffic light is green.",
+      "prompt": "Current speed: 2.3 m/s. Command: follow the road then go straight at the next intersection. What should the ego do next?",
+      "routing_command": "Command: follow the road then go straight at the next intersection."
+    },
+    {
+      "split": "train",
+      "episode_index": 957,
+      "step_index": 80,
+      "subtask": "The vehicle cautiously waits for a gap in traffic before changing lanes.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 0.0 m/s. Command: follow the road. Predict the waypoints.",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 191,
+      "step_index": 9,
+      "subtask": "The vehicle normally follows the route, maintaining reduced speed behind the navy SUV ahead with slight right adjustments.",
+      "reasoning": "Follow the route. Maintain the reduced speed to stay behind the navy SUV that is to the front.",
+      "prompt": "Current speed: 7.4 m/s. Command: follow the road. Predict the waypoints.",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 397,
+      "step_index": 121,
+      "subtask": "The vehicle smoothly adjusts its course leftward while steadily maintaining speed behind the maroon car.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 7.4 m/s. Command: go right at the next intersection in 116 meter then follow the road. What should the ego do next?",
+      "routing_command": "Command: go right at the next intersection in 116 meter then follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 2817,
+      "step_index": 71,
+      "subtask": "The vehicle smoothly adjusts course right while normally maintaining speed behind the dark green car at 10.9 meters.",
+      "reasoning": "Follow the route. Maintain the reduced speed to stay behind the dark green car that is to the front in 10.9 meters.",
+      "prompt": "Current speed: 8.0 m/s. Command: follow the road. What should the ego do next?",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 2141,
+      "step_index": 245,
+      "subtask": "The vehicle cautiously decelerates to stay behind the front black car at 23.6 meters.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 14.4 m/s. Command: follow the road. Predict the waypoints.",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 4287,
+      "step_index": 544,
+      "subtask": "The vehicle remained stopped, following the black car ahead.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 0.0 m/s. Command: follow the road then go left at the next intersection. What should the ego do next?",
+      "routing_command": "Command: follow the road then go left at the next intersection."
+    },
+    {
+      "split": "train",
+      "episode_index": 2465,
+      "step_index": 42,
+      "subtask": "The vehicle cautiously makes a left turn after stopping at a stop sign.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 0.0 m/s. Command: go left at the next intersection in 19 meter then follow the road. Predict the waypoints.",
+      "routing_command": "Command: go left at the next intersection in 19 meter then follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 530,
+      "step_index": 53,
+      "subtask": "The vehicle cautiously decelerates to follow the route, making slight adjustments.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 10.7 m/s. Command: follow the road then go left at the next intersection. What should the ego do next?",
+      "routing_command": "Command: follow the road then go left at the next intersection."
+    },
+    {
+      "split": "train",
+      "episode_index": 2141,
+      "step_index": 182,
+      "subtask": "The vehicle remains stopped normally due to the red traffic light.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 0.0 m/s. Command: go straight at the next intersection in 26 meter then follow the road. What should the ego do next?",
+      "routing_command": "Command: go straight at the next intersection in 26 meter then follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 4865,
+      "step_index": 240,
+      "subtask": "The vehicle remains stopped normally at a red traffic light.",
+      "reasoning": "Follow the route. Remain stopped due to the red traffic light in 4.5 meters.",
+      "prompt": "Current speed: 0.0 m/s. Command: go straight at the next intersection in 20 meter then follow the road. What should the ego do next?",
+      "routing_command": "Command: go straight at the next intersection in 20 meter then follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 1175,
+      "step_index": 63,
+      "subtask": "The vehicle normally makes a wide right adjustment to change lanes.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 5.1 m/s. Command: follow the road. Predict the waypoints.",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 2906,
+      "step_index": 187,
+      "subtask": "The vehicle normally follows the route, maintaining a reduced speed behind the navy car to the front right.",
+      "reasoning": "Follow the route. Maintain the reduced speed to stay behind the navy car that is to the front right in 12.2 meters.",
+      "prompt": "Current speed: 7.8 m/s. Command: follow the road. What should the ego do next?",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 1847,
+      "step_index": 66,
+      "subtask": "The vehicle cautiously waits for a gap in traffic before changing lanes.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 0.0 m/s. Command: follow the road. Predict the waypoints.",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 4793,
+      "step_index": 25,
+      "subtask": "The vehicle normally decelerates to stay behind the front right navy car, then accelerates.",
+      "reasoning": "Follow the route. Decelerate to stay behind the navy car that is to the front right in 13.5 meters.",
+      "prompt": "Current speed: 7.5 m/s. Command: follow the road then go left at the next intersection. What should the ego do next?",
+      "routing_command": "Command: follow the road then go left at the next intersection."
+    },
+    {
+      "split": "train",
+      "episode_index": 4023,
+      "step_index": 349,
+      "subtask": "The vehicle maintains steady lane keeping, cautiously following the silver car ahead at 19.2 meters.",
+      "reasoning": "Follow the route.",
+      "prompt": "Current speed: 9.3 m/s. Command: follow the road then go right at the next intersection. Predict the waypoints.",
+      "routing_command": "Command: follow the road then go right at the next intersection."
+    },
+    {
+      "split": "train",
+      "episode_index": 3582,
+      "step_index": 5,
+      "subtask": "The vehicle follows the route, accelerating normally to keep pace with the dark green SUV ahead.",
+      "reasoning": "Follow the route. Accelerate to follow the dark green SUV that is to the front in 12.5 meters.",
+      "prompt": "Current speed: 6.8 m/s. Command: follow the road. Predict the waypoints.",
+      "routing_command": "Command: follow the road."
+    },
+    {
+      "split": "train",
+      "episode_index": 1391,
+      "step_index": 169,
+      "subtask": "The vehicle remains stopped normally due to the red traffic light in 4.8 meters.",
+      "reasoning": "Follow the route. Remain stopped due to the red traffic light in 4.8 meters.",
+      "prompt": "Current speed: 0.0 m/s. Command: go straight at the next intersection in 20 meter then follow the road. Predict the waypoints.",
+      "routing_command": "Command: go straight at the next intersection in 20 meter then follow the road."
+    }
+  ]
+}

@@ -1,0 +1,100 @@
+The vehicle cautiously follows the route, maintaining steady lane keeping behind the front car.
+The vehicle smoothly adjusts course to the right while cautiously maintaining speed behind the police car.
+The vehicle maintains a steady course, following the black car ahead at a normal pace.
+The vehicle remains stopped normally at the red traffic light.
+The vehicle smoothly decelerates to a stop, cautiously adjusting course to the left due to a pedestrian.
+The vehicle maintains a steady speed while following the route, staying behind the dark green SUV.
+The vehicle smoothly follows the route, cautiously reducing speed through the junction with steady lane keeping.
+The vehicle normally follows the route, maintaining reduced speed behind the front black car.
+The vehicle accelerates steadily to follow the front black car, maintaining a straight course.
+The vehicle turns right aggressively while accelerating through the clear junction.
+The vehicle accelerates normally and makes a sharp left adjustment following the route.
+The vehicle cautiously waits for a gap before normally changing lanes.
+The vehicle turns right smoothly while accelerating to follow the maroon car.
+The vehicle follows the route, accelerating normally and then making a sharp right adjustment.
+The vehicle cautiously adjusts its course to follow the black car, braking if necessary for the walker.
+The vehicle follows the route, maintaining reduced speed cautiously with slight adjustments to the left.
+The vehicle steadily decelerates to a stop while maintaining a straight course.
+The vehicle cautiously decelerates and adjusts course to follow the yellow car ahead.
+The vehicle remains stopped, patiently waiting behind the stationary maroon car.
+The vehicle remained stopped behind the maroon car 2.8 meters ahead, maintaining a steady course.
+The vehicle decelerates smoothly to stay behind the black car ahead, driving cautiously.
+The vehicle accelerates through a wide left turn, cautiously monitoring oncoming traffic.
+Cautiously adjusting course, the vehicle waits for a gap before changing lanes to the lane with oncoming traffic.
+The vehicle remains stopped behind the black car at 8.8 meters, obeying the red traffic light.
+The vehicle follows the route and maintains reduced speed with a steady course.
+The vehicle cautiously follows the route and remains stopped behind the black car to the front right.
+The vehicle remains stopped behind the front black car due to a red traffic light, normally maintaining its position.
+The vehicle remained stopped, steadily maintaining its position behind the maroon SUV.
+The vehicle normally follows the route, accelerating and adjusting right.
+The vehicle cautiously waits for a gap in traffic before changing lanes.
+The vehicle remains stopped normally due to a red traffic light.
+The vehicle remained stopped normally due to the red traffic light.
+The vehicle follows the route, maintaining reduced speed with a smooth rightward course adjustment.
+The vehicle stayed stopped, waiting behind the navy car.
+The vehicle follows the dark green car, accelerating and then sharply adjusting course to the left.
+The vehicle stops steadily behind the dark green car.
+The vehicle accelerates to follow the dark green SUV at 17.4 meters, normally maintaining its lane.
+The vehicle remains stopped normally due to a red traffic light.
+The vehicle follows the route with a smooth rightward adjustment, then a gradual leftward adjustment, normally maintaining its speed before decelerating.
+The vehicle turns right normally, accelerating to follow the maroon car 14.6 meters ahead.
+The vehicle remains stopped to stay behind the black car that is to the front in 8.8 meters, driving normally.
+The vehicle accelerates normally to follow the black car in 9.5 meters.
+The vehicle follows the route with steady lane keeping and normal acceleration.
+Following the route, the vehicle smoothly adjusts left while maintaining reduced speed behind the yellow car.
+The vehicle accelerates normally to follow the gray car ahead, maintaining a steady course.
+The vehicle accelerates and makes a wide right adjustment through the junction.
+The vehicle smoothly follows the route, normally decelerating and accelerating to match target speed.
+The vehicle accelerates normally, maintaining a steady course before making a slight adjustment to the left.
+The vehicle accelerates and then adjusts its course smoothly while following the route.
+The vehicle steadily follows the route, maintaining a reduced speed behind the front black car.
+The vehicle decelerates steadily behind the maroon car, maintaining a straight course.
+The vehicle remained stopped behind the front black car at 9.2 meters, normally.
+The vehicle remains stopped, cautiously following the black car ahead.
+The vehicle remains stopped, then cautiously accelerates slightly forward to maintain position behind the maroon car.
+The vehicle remained stopped behind the maroon car to the front right in 8.4 meters.
+The vehicle steadily accelerates normally and maintains course along the route.
+The car is in a driving scenario.
+The vehicle cautiously accelerates to reach the speed limit with steady lane keeping.
+The vehicle cautiously decelerates and makes a slight rightward adjustment to follow the black car.
+The vehicle remains stopped behind the maroon car, normally adhering to the red traffic light.
+The vehicle cautiously stopped, then smoothly accelerated forward, maintaining its course.
+The vehicle cautiously waits for a gap before changing lanes.
+The car follows the route and maintains reduced speed, normally staying behind the orange car at 10.3 meters.
+The vehicle returns to its route with steady lane keeping, normally.
+The vehicle remains stopped, steadily maintaining its course behind the maroon car.
+The vehicle decelerates smoothly to follow the front car, then cautiously accelerates normally.
+The vehicle follows the route, accelerating normally and making a slight right course adjustment.
+The vehicle accelerates to follow the dark green SUV ahead, maintaining a steady lane keeping.
+The vehicle normally follows the route, steadily maintaining speed while making slight right adjustments.
+The vehicle normally accelerates to follow the front car, then abruptly decelerates to a stop.
+The vehicle remains stopped, following the route cautiously behind the orange car in 3.1 meters.
+The vehicle smoothly decelerates and then accelerates to follow the navy car ahead.
+The vehicle follows the black car, accelerating and then braking cautiously for the pedestrian.
+The vehicle follows the route, maintaining reduced speed cautiously behind the black SUV at 11.7 meters.
+The vehicle smoothly decelerates to follow the dark green SUV ahead, then normally accelerates forward.
+The vehicle remained stopped, cautiously preparing to follow the maroon car ahead.
+The vehicle follows the route, steadily maintaining speed behind the black car 11.0 meters ahead.
+The vehicle accelerates normally into the oncoming lane, then makes a slight, smooth course adjustment.
+The vehicle follows the route, maintaining reduced speed with slight course adjustments.
+The vehicle turns right smoothly, accelerating to stay behind the silver SUV ahead.
+The vehicle follows the route with steady lane keeping and normally maintained reduced speed.
+The vehicle remained stopped, waiting behind the navy car.
+The vehicle accelerates normally while making a slight adjustment to the left.
+The vehicle cautiously waits for a gap in traffic before changing lanes.
+The vehicle normally follows the route, maintaining reduced speed behind the navy SUV ahead with slight right adjustments.
+The vehicle smoothly adjusts its course leftward while steadily maintaining speed behind the maroon car.
+The vehicle smoothly adjusts course right while normally maintaining speed behind the dark green car at 10.9 meters.
+The vehicle cautiously decelerates to stay behind the front black car at 23.6 meters.
+The vehicle remained stopped, following the black car ahead.
+The vehicle cautiously makes a left turn after stopping at a stop sign.
+The vehicle cautiously decelerates to follow the route, making slight adjustments.
+The vehicle remains stopped normally due to the red traffic light.
+The vehicle remains stopped normally at a red traffic light.
+The vehicle normally makes a wide right adjustment to change lanes.
+The vehicle normally follows the route, maintaining a reduced speed behind the navy car to the front right.
+The vehicle cautiously waits for a gap in traffic before changing lanes.
+The vehicle normally decelerates to stay behind the front right navy car, then accelerates.
+The vehicle maintains steady lane keeping, cautiously following the silver car ahead at 19.2 meters.
+The vehicle follows the route, accelerating normally to keep pace with the dark green SUV ahead.
+The vehicle remains stopped normally due to the red traffic light in 4.8 meters.

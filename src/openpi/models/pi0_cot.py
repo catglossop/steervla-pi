@@ -24,7 +24,8 @@ Supervision (see ``_compute_loss_and_metrics``):
     - ``fast_ce`` / ``first_fast_ce`` (optional) supervise FAST action tokens.
 
 Suffix (Action expert, adaRMS):
-    [action tokens] — attend to images + prompt + subtask + FAST (not reasoning).
+    [action tokens] — attend to images + prompt + subtask only (not reasoning or FAST),
+    or images + prompt only when ``action_attend_subtask=False``.
 
 Losses: CE on reasoning + subtask (+ FAST when enabled), flow-matching on actions.
 """
@@ -107,6 +108,7 @@ class Pi0CoT(_model.BaseModel):
         self._cot_jit_decode = bool(config.cot_jit_decode)
         self._cot_jit_transformer_forward = bool(config.cot_jit_transformer_forward)
         self._cot_replay_reasoning = bool(config.cot_replay_reasoning)
+        self._action_attend_subtask = bool(config.action_attend_subtask)
         self.deterministic = True
 
     # ------------------------------------------------------------------
@@ -166,6 +168,8 @@ class Pi0CoT(_model.BaseModel):
         n_reasoning: int,
         n_fast: int,
         n_action: int,
+        *,
+        action_attend_subtask: bool = True,
     ) -> jnp.ndarray:
         """Build a (b, total, total) attention mask implementing:
 
@@ -173,7 +177,9 @@ class Pi0CoT(_model.BaseModel):
         - Reasoning: causal, attending to images + prompt + earlier reasoning
         - Subtask: causal, attending to images + prompt + reasoning + earlier subtask
         - FAST tokens: causal among themselves, attending to images + prompt + subtask
-        - Actions: causal among themselves, attend to images + prompt + subtask + FAST (NOT reasoning)
+        - Actions: causal among themselves, attend to images + prompt + subtask only
+          (NOT reasoning or FAST). When ``action_attend_subtask=False``, actions also
+          skip subtask.
         """
         total = prefix_mask.shape[1] + suffix_mask.shape[1]
 
@@ -189,16 +195,55 @@ class Pi0CoT(_model.BaseModel):
         # Prefix order: images, prompt, reasoning, subtask, [fast]. Suffix: action expert.
         reasoning_start = n_img + n_prompt
         reasoning_end = reasoning_start + n_reasoning
-        fast_start = reasoning_end + n_subtask
+        subtask_start = reasoning_end
+        subtask_end = subtask_start + n_subtask
+        fast_start = subtask_end
+        fast_end = fast_start + n_fast
         action_start = prefix_mask.shape[1]  # suffix
 
         col_is_reasoning = (jnp.arange(total) >= reasoning_start) & (jnp.arange(total) < reasoning_end)
+        col_is_subtask = (jnp.arange(total) >= subtask_start) & (jnp.arange(total) < subtask_end)
+        col_is_fast = (jnp.arange(total) >= fast_start) & (jnp.arange(total) < fast_end)
         row_is_action = (jnp.arange(total) >= action_start) & (jnp.arange(total) < action_start + n_action)
-        row_is_fast = (jnp.arange(total) >= fast_start) & (jnp.arange(total) < fast_start + n_fast)
-        row_blocks_reasoning = row_is_action | row_is_fast
-        block_mask = ~(row_blocks_reasoning[:, None] & col_is_reasoning[None, :])
+        row_is_fast = (jnp.arange(total) >= fast_start) & (jnp.arange(total) < fast_end)
+        blocked = (
+            (row_is_action[:, None] & col_is_reasoning[None, :])
+            | (row_is_action[:, None] & col_is_fast[None, :])
+            | (row_is_fast[:, None] & col_is_reasoning[None, :])
+        )
+        if not action_attend_subtask:
+            blocked = blocked | (row_is_action[:, None] & col_is_subtask[None, :])
+        block_mask = ~blocked
 
         return base_mask & block_mask[None, :, :]
+
+    @staticmethod
+    def _prefix_mask_for_action_suffix(
+        prefix_mask: jnp.ndarray,
+        *,
+        n_img: int,
+        n_prompt: int,
+        n_reasoning: int,
+        n_subtask: int,
+        n_fast: int,
+        action_attend_subtask: bool = True,
+    ) -> jnp.ndarray:
+        """Valid prefix columns visible to the flow-matching action expert (KV-cache inference)."""
+        prefix_len = prefix_mask.shape[1]
+        reasoning_start = n_img + n_prompt
+        reasoning_end = reasoning_start + n_reasoning
+        subtask_start = reasoning_end
+        subtask_end = subtask_start + n_subtask
+        fast_start = subtask_end
+        fast_end = fast_start + n_fast
+        pos = jnp.arange(prefix_len)
+        col_is_reasoning = (pos >= reasoning_start) & (pos < reasoning_end)
+        col_is_subtask = (pos >= subtask_start) & (pos < subtask_end)
+        col_is_fast = (pos >= fast_start) & (pos < fast_end)
+        visible = prefix_mask & ~col_is_reasoning[None, :] & ~col_is_fast[None, :]
+        if not action_attend_subtask:
+            visible = visible & ~col_is_subtask[None, :]
+        return visible
 
     # ------------------------------------------------------------------
     # Training: compute_loss
@@ -260,6 +305,7 @@ class Pi0CoT(_model.BaseModel):
         attn_mask = self._build_attention_mask(
             prefix_mask, prefix_ar, suffix_mask, suffix_ar,
             n_img, n_prompt, n_subtask, n_reasoning, n_fast, n_action,
+            action_attend_subtask=self._action_attend_subtask,
         )
 
         # --- Forward pass ---
@@ -813,7 +859,7 @@ class Pi0CoT(_model.BaseModel):
         observation: _model.Observation,
         kv_cache,
         prefix_mask: jnp.ndarray,
-        prefix_mask_no_reasoning: jnp.ndarray,
+        prefix_mask_for_action: jnp.ndarray,
         dt: jnp.ndarray,
         x_t: jnp.ndarray,
         t: jnp.ndarray,
@@ -827,7 +873,7 @@ class Pi0CoT(_model.BaseModel):
         suffix_ar = jnp.array(suffix_ar_list)
         suffix_attn_mask = pi0.make_attn_mask(suffix_mask, suffix_ar)
         action_to_prefix = einops.repeat(
-            prefix_mask_no_reasoning, "b p -> b s p", s=suffix_tokens.shape[1]
+            prefix_mask_for_action, "b p -> b s p", s=suffix_tokens.shape[1]
         )
         full_attn_mask = jnp.concatenate([action_to_prefix, suffix_attn_mask], axis=-1)
         positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
@@ -914,6 +960,7 @@ class Pi0CoT(_model.BaseModel):
             n_reasoning,
             n_fast,
             0,
+            action_attend_subtask=self._action_attend_subtask,
         )
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
@@ -924,13 +971,16 @@ class Pi0CoT(_model.BaseModel):
         if noise is None:
             noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
 
-        # Build a per-column mask that blocks reasoning tokens from action attention
-        prefix_len = prefix_mask.shape[1]
-        reasoning_start = n_img + n_prompt
-        reasoning_end = reasoning_start + n_reasoning
-        col_is_reasoning = (jnp.arange(prefix_len) >= reasoning_start) & (jnp.arange(prefix_len) < reasoning_end)
-        # Shape (b, prefix_len): valid prefix tokens minus reasoning columns
-        prefix_mask_no_reasoning = prefix_mask & ~col_is_reasoning[None, :]
+        # Build a per-column mask for the action expert prefix KV cache.
+        prefix_mask_for_action = self._prefix_mask_for_action_suffix(
+            prefix_mask,
+            n_img=n_img,
+            n_prompt=n_prompt,
+            n_reasoning=n_reasoning,
+            n_subtask=n_subtask,
+            n_fast=n_fast,
+            action_attend_subtask=self._action_attend_subtask,
+        )
 
         def step(carry):
             x_t, t = carry
@@ -940,9 +990,9 @@ class Pi0CoT(_model.BaseModel):
             suffix_ar = jnp.array(suffix_ar_list)
             suffix_attn_mask = pi0.make_attn_mask(suffix_mask, suffix_ar)
 
-            # (b, suffix_len, prefix_len): each action token sees prefix minus reasoning
+            # (b, suffix_len, prefix_len): each action token sees images + prompt + subtask
             action_to_prefix = einops.repeat(
-                prefix_mask_no_reasoning, "b p -> b s p", s=suffix_tokens.shape[1]
+                prefix_mask_for_action, "b p -> b s p", s=suffix_tokens.shape[1]
             )
             full_attn_mask = jnp.concatenate([action_to_prefix, suffix_attn_mask], axis=-1)
 

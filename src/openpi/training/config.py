@@ -545,6 +545,7 @@ class RLDSSteerVLADataConfig(DataConfigFactory):
                         "observation/current_speed": "observation/current_speed",
                         "actions": "actions",
                         "prompt": "prompt",
+                        "dataset_id": "dataset_id",
                     }
                 )
             ]
@@ -645,6 +646,7 @@ class RLDSSteerVLACoTDataConfig(RLDSSteerVLADataConfig):
                         "prompt": "prompt",
                         "subtask": "subtask",
                         "reasoning": "reasoning",
+                        "dataset_id": "dataset_id",
                     }
                 )
             ]
@@ -811,6 +813,8 @@ class TrainConfig:
     save_interval: int = 1000
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
     keep_period: int | None = 5000
+    # Maximum number of checkpoints Orbax retains (excluding keep_period steps).
+    max_to_keep: int | None = 1
 
     # If true, will overwrite the checkpoint directory if it already exists.
     overwrite: bool = False
@@ -838,6 +842,7 @@ class TrainConfig:
     # eg. if total device is 4 and fsdp devices is 2; then the model will shard to 2 devices and run
     # data parallel between 2 groups of devices.
     fsdp_devices: int = 1
+    skip_norm_stats: bool = False
 
     @property
     def assets_dirs(self) -> pathlib.Path:
@@ -1633,14 +1638,14 @@ _CONFIGS = [
             include_ego_history=False,
             include_xy_action=False,
             speed_in_prompt=True,
-            proprio_norm=True,
+            proprio_norm=False,
             action_dim=4,
             output_action_format=steervla_rlds_dataset.OutputActionFormat.DELTA_XY_T_DELTA_XY_SPACE,
             lang_label_type=steervla_rlds_dataset.LangLabelType.ROUTING_COMMAND,
             dataset_name_weight_mappings={
                 "simlingo_dataset_all_img512_1116": 1.0,
-                "simlingo_dataset_acceleration_negative5_img512_1116": 0.2,
-                "simlingo_dataset_acceleration_negative1_img512_1116": 0.1,
+                "simlingo_dataset_acceleration_negative5_img512_1116": 0.4,
+                "simlingo_dataset_acceleration_negative1_img512_1116": 0.2,
                 "simlingo_dataset_acceleration_positive1_img512_1116": 0.1,
                 "simlingo_dataset_acceleration_positive5_img512_1116": 0.2,
                 "simlingo_dataset_lateral_control12_img512_1116": 0.1,
@@ -1667,7 +1672,7 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1_000,
-            peak_lr=1e-4,
+            peak_lr=2e-5,
             decay_steps=200_000,
             decay_lr=1e-5,
         ),
@@ -1680,6 +1685,78 @@ _CONFIGS = [
         num_workers=0,
         checkpoint_base_dir="gs://cat-logs",
         resume=True,
+        skip_norm_stats=True,
+    ),
+    TrainConfig(
+        name="pi05_steervla_cot_simplified_reasoning_no_attention",
+        model=pi0_config.Pi0CoTConfig(
+            action_dim=32,
+            action_horizon=10,
+            max_token_len=200,
+            max_subtask_len=64,
+            max_reasoning_len=64,
+            cot_loss_weight=0.1,
+            knowledge_insulation=False,
+            use_fast_tokens=True,
+            action_attend_subtask=False,
+        ),
+        data=RLDSSteerVLACoTDataConfig(
+            repo_id="steervla_simlingo_cot",
+            rlds_data_dir="/raid/datasets/steervla",
+            dataset_format=steervla_rlds_dataset.DatasetFormat.SIMLINGO,
+            include_ego_history=False,
+            include_xy_action=False,
+            speed_in_prompt=True,
+            proprio_norm=False,
+            action_dim=4,
+            output_action_format=steervla_rlds_dataset.OutputActionFormat.DELTA_XY_T_DELTA_XY_SPACE,
+            lang_label_type=steervla_rlds_dataset.LangLabelType.ROUTING_COMMAND,
+            dataset_name_weight_mappings={
+                "simlingo_dataset_all_img512_1116": 1.0,
+                "simlingo_dataset_acceleration_negative5_img512_1116": 0.4,
+                "simlingo_dataset_acceleration_negative1_img512_1116": 0.2,
+                "simlingo_dataset_acceleration_positive1_img512_1116": 0.1,
+                "simlingo_dataset_acceleration_positive5_img512_1116": 0.2,
+                "simlingo_dataset_lateral_control12_img512_1116": 0.1,
+                "simlingo_dataset_lateral_control_higher5_img512_1116": 0.3,
+                "simlingo_dataset_start_from_stop_img512_1116": 0.2,
+                "simlingo_dataset_vehicle_front_img512_1116": 0.3,
+                "simlingo_dataset_vehicle_side_img512_1116": 0.1,
+                "simlingo_dataset_leading_object_vehicle_img512_1116": 0.05,
+                "simlingo_dataset_leading_object_traffic_stop_img512_1116": 0.2,
+                "simlingo_dataset_leading_object_traffic_light_img512_1116": 0.2,
+                "simlingo_dataset_leading_object_walker_img512_1116": 0.2,
+                "simlingo_dataset_changed_route_img512_1116": 0.2,
+                "simlingo_dataset_parking_lane_img512_1116": 0.3,
+            },
+            hl_dataset_name_weight_mappings={
+                "simplified_reasoning_dataset": 1.85,
+            },
+            hl_dataset_format=steervla_rlds_dataset.DatasetFormat.SIMLINGO,
+            hl_cot_reasoning_key="gemini_refined_label",
+            hl_cot_subtask_key="prompt",
+            max_subtask_len=64,
+            max_reasoning_len=64,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2e-5,
+            decay_steps=200_000,
+            decay_lr=1e-5,
+        ),
+        num_train_steps=200_000,
+        batch_size=512,
+        fsdp_devices=8,
+        log_interval=1,
+        eval_interval=100,
+        save_interval=1000,
+        keep_period=1000,
+        max_to_keep=10,
+        num_workers=0,
+        checkpoint_base_dir="gs://cat-logs",
+        resume=True,
+        skip_norm_stats=True,
     ),
     TrainConfig(
         name="pi05_steervla_finetune",

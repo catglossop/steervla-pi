@@ -343,6 +343,7 @@ def main(config: _config.TrainConfig):
     checkpoint_manager, resuming = _checkpoints.initialize_checkpoint_dir(
         run_dir,
         keep_period=config.keep_period,
+        max_to_keep=config.max_to_keep,
         overwrite=config.overwrite,
         resume=resume_flag,
     )
@@ -365,6 +366,7 @@ def main(config: _config.TrainConfig):
         config,
         sharding=data_sharding,
         shuffle=True,
+        skip_norm_stats=config.skip_norm_stats,
     )
     data_iter = iter(data_loader)
     
@@ -376,6 +378,7 @@ def main(config: _config.TrainConfig):
         sharding=data_sharding,
         shuffle=False,
         split="val",
+        skip_norm_stats=config.skip_norm_stats,
     )
     eval_data_iter = iter(eval_data_loader)
     
@@ -411,6 +414,12 @@ def main(config: _config.TrainConfig):
     data_config = data_loader.data_config()
     eval_action_dim = data_config.steervla_action_dim
     eval_output_format = data_config.steervla_output_action_format.value if data_config.steervla_rlds else None
+    eval_dataset_names: list[str] | None = None
+    if data_config.steervla_rlds:
+        eval_dataset_names = [
+            *(d.name for d in data_config.steervla_datasets),
+            *(d.name for d in data_config.steervla_hl_datasets),
+        ]
 
     start_step = int(train_state.step)
     pbar = tqdm.tqdm(
@@ -456,6 +465,7 @@ def main(config: _config.TrainConfig):
                     step=step,
                     action_dim=eval_action_dim,
                     output_action_format=eval_output_format,
+                    dataset_names=eval_dataset_names,
                 )
                 run_cot_visualization(
                     state=train_state,
