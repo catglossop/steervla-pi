@@ -370,8 +370,11 @@ def main(config: _config.TrainConfig):
     )
     data_iter = iter(data_loader)
     
-    # Eval data loader
-    eval_batch_size = config.batch_size // jax.device_count()
+    # Eval data loader. The eval batch is sharded across the full mesh just like the train batch, so
+    # it must stay divisible by jax.device_count() -- round down rather than take the exact quotient,
+    # which is not a multiple of the device count for non-power-of-two meshes (e.g. 192 / 3 -> 64).
+    num_devices = jax.device_count()
+    eval_batch_size = max(num_devices, (config.batch_size // num_devices) // num_devices * num_devices)
     eval_config = dataclasses.replace(config, batch_size=eval_batch_size)
     eval_data_loader = _data_loader.create_data_loader(
         eval_config,

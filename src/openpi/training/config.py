@@ -1679,13 +1679,13 @@ _CONFIGS = [
         ),
         num_train_steps=200_000,
         batch_size=512,
-        fsdp_devices=8,
+        fsdp_devices=3,
         log_interval=1,
         eval_interval=100,
         save_interval=2000,
         num_workers=0,
         checkpoint_base_dir="gs://cat-logs",
-        resume=True,
+        resume=False,
         skip_norm_stats=True,
     ),
     TrainConfig(
@@ -1849,25 +1849,26 @@ _CONFIGS = [
     *polaris_config.get_polaris_configs(),
 ]
 
-# Context-Smoothed Pre-training variant of pi05_steervla_cot_ki. Derived from that config so the
-# dataset mixture and schedule stay in sync; only the model, weight loader and resume differ.
-_steervla_cot_ki = _CONFIGS[[c.name for c in _CONFIGS].index("pi05_steervla_cot_ki")]
+# Context-Smoothed Pre-training variant of pi05_steervla_cot_simplified_reasoning. Derived from that
+# config so the dataset mixture and schedule stay in sync; only the model, weight loader, batch size
+# and resume differ.
+_steervla_cot = _CONFIGS[[c.name for c in _CONFIGS].index("pi05_steervla_cot_simplified_reasoning")]
 _CONFIGS.append(
     dataclasses.replace(
-        _steervla_cot_ki,
-        name="pi05_steervla_cot_ki_csp",
-        exp_name="pi05_steervla_cot_ki_csp",
+        _steervla_cot,
+        name="pi05_steervla_cot_simplified_reasoning_csp",
+        exp_name="pi05_steervla_cot_simplified_reasoning_csp",
         model=dataclasses.replace(
-            _steervla_cot_ki.model,
+            _steervla_cot.model,
             context_smoothing=context_smoothing.ContextSmoothingConfig(),
         ),
         # Norm stats live under `assets/<config.name>`, so the rename above would orphan them.
         # Reuse the parent config's, since CSP changes nothing about the data distribution.
         data=dataclasses.replace(
-            _steervla_cot_ki.data,
+            _steervla_cot.data,
             assets=AssetsConfig(
-                assets_dir=f"./assets/{_steervla_cot_ki.name}",
-                asset_id=_steervla_cot_ki.data.repo_id,
+                assets_dir=f"./assets/{_steervla_cot.name}",
+                asset_id=_steervla_cot.data.repo_id,
             ),
         ),
         # ctx_time_mlp_* postdate pi05_base, so they must survive the checkpoint merge.
@@ -1875,9 +1876,13 @@ _CONFIGS.append(
             "gs://openpi-assets/checkpoints/pi05_base/params",
             missing_regex=".*(lora|ctx_time_mlp).*",
         ),
+        # train.py requires batch_size % jax.device_count() == 0. The parent's 512 assumes 8 devices;
+        # this run uses 3 (fsdp_devices=3), and 512 % 3 != 0. 192 divides evenly and keeps the same
+        # 64 examples/device as the parent.
+        batch_size=192,
         # The CSP params change the train-state structure, so orbax cannot resume from the non-CSP
         # run. To warm-start from that run's weights instead of pi05_base, point the weight loader at
-        # "gs://cat-logs/pi05_steervla_cot_ki/pi05_steervla_cot_ki/99999/params".
+        # that run's `<step>/params` directory.
         resume=False,
         resume_dir=None,
         resume_step=None,
