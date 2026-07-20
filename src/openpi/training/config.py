@@ -1621,6 +1621,30 @@ _CONFIGS = [
         ema_decay=None,
     ),
     TrainConfig(
+        name="pi05_steervla_cot_simplified_reasoning_traffic_light_only",
+        model=pi0_config.Pi0CoTConfig(
+            max_token_len=200,
+            max_subtask_len=64,
+            max_reasoning_len=64,
+            knowledge_insulation=False,
+            use_fast_tokens=True,
+        ),
+        data=RLDSSteerVLACoTDataConfig(
+            repo_id="steervla_simlingo_cot",
+            rlds_data_dir="gs://tian-us-central2/tensorflow_datasets",
+            dataset_format=steervla_rlds_dataset.DatasetFormat.SIMLINGO,
+            include_ego_history=False,
+            action_dim=4,
+            dataset_name_weight_mappings={
+                "simlingo_dataset_leading_object_traffic_light_img512_1116": 1.0,
+            },
+            max_subtask_len=64,
+            max_reasoning_len=64,
+        ),
+        batch_size=8,
+        fsdp_devices=1,
+    ),
+    TrainConfig(
         name="pi05_steervla_cot_simplified_reasoning",
         model=pi0_config.Pi0CoTConfig(
             action_dim=32,

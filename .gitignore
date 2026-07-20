@@ -3,6 +3,8 @@ assets/
 checkpoints/
 data/
 wandb/
+rl_token_embeddings/
+rl_token_ae/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
