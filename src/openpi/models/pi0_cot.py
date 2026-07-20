@@ -459,6 +459,16 @@ class Pi0CoT(_model.BaseModel):
                     first_fast_logits, fast_targets[:, :1], bridge_fast_ok
                 )
 
+            # High-level (reasoning-only) examples have no ground-truth actions, so their
+            # FAST action tokens are meaningless targets (derived from dummy/zero actions).
+            # Detect them via an all-False ``action_loss_mask`` -- the same per-sample signal
+            # that already zeroes their flow loss -- and drop FAST supervision for them so it
+            # is only applied to samples that actually carry ground-truth actions.
+            if observation.action_loss_mask is not None:
+                action_supervised = jnp.any(observation.action_loss_mask, axis=1).astype(fast_ce.dtype)
+                fast_ce = fast_ce * action_supervised
+                first_fast_ce = first_fast_ce * action_supervised
+
         cot_loss = reasoning_ce + subtask_ce + first_reasoning_ce + first_subtask_ce + fast_ce + first_fast_ce
 
         # Combine: flow loss is per-timestep (batch, horizon), cot_loss is scalar per batch
