@@ -1041,38 +1041,16 @@ class Pi0CoT(_model.BaseModel):
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon:])
         return x_t + dt * v_t, t + dt
 
-    @override
-    def sample_actions(
-        self,
-        rng: at.KeyArrayLike,
-        observation: _model.Observation,
-        *,
-        num_steps: int | at.Int[at.Array, ""] = 10,
-        noise: at.Float[at.Array, "b ah ad"] | None = None,
-        image_keys: Sequence[str] | None = None,
-        t_context: float | at.Float[at.Array, " b"] | None = None,
-    ) -> _model.Actions:
-        """Flow-match denoise from prefix KV + action suffix.
+    def _prefix_for_sampling(self, rng, observation, t_context):
+        """Embed + run the frozen prefix (images [+ctx smoothing] + prompt + reasoning + subtask [+ fast]).
 
-        ``t_context``: context noise level in [0, 1] for a CSP-trained model. ``None`` (the default)
-        means no context smoothing -- the clean, precise-imitation regime, identical to a model
-        trained without CSP. A TMRL high-level policy selects this per action chunk.
-
-        ``jit_denoise_steps``: Python loop over ``num_steps``, each iteration calling this
-        module's jitted :meth:`_denoise_flow_step` (separate XLA program per step; usually
-        between fused ``while_loop`` and fully eager in peak VRAM and speed).
-
-        ``low_memory_denoise``: fully eager Python loop (no per-step ``nnx.jit``). Do not wrap
-        the whole :meth:`sample_actions` in ``nnx.jit`` when using either loop mode.
+        ``observation`` must already be preprocessed and ``t_context`` already validated/broadcast.
+        Shared by :meth:`sample_actions` and :meth:`sample_actions_with_prefix` so both see an
+        identical prefix (token order ``[img, prompt, reasoning, subtask, (fast)]``). Returns
+        ``(prefix_out, prefix_mask, kv_cache, prefix_mask_for_action, rng)``; ``rng`` is threaded back
+        because it may be split for context-smoothing noise.
         """
-        keys = tuple(image_keys) if image_keys is not None else self._preprocess_image_keys
-        observation = _model.preprocess_observation(None, observation, train=False, image_keys=keys)
         batch_size = observation.state.shape[0]
-
-        if t_context is not None:
-            if self.context_smoothing is None:
-                raise ValueError("t_context requires a model trained with context_smoothing enabled")
-            t_context = jnp.broadcast_to(jnp.asarray(t_context, dtype=jnp.float32), (batch_size,))
 
         # --- Build prefix: images + prompt + reasoning + subtask ---
         img_tokens, img_masks, img_ar = self._embed_images(observation)
@@ -1130,13 +1108,9 @@ class Pi0CoT(_model.BaseModel):
             action_attend_subtask=self._action_attend_subtask,
         )
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
-
-        # --- Denoising loop ---
-        n_steps_i = int(num_steps)
-        dt = -1.0 / float(n_steps_i)
-        if noise is None:
-            noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+        (prefix_out, _), kv_cache = self.PaliGemma.llm(
+            [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
+        )
 
         # Build a per-column mask for the action expert prefix KV cache.
         prefix_mask_for_action = self._prefix_mask_for_action_suffix(
@@ -1148,6 +1122,15 @@ class Pi0CoT(_model.BaseModel):
             n_fast=n_fast,
             action_attend_subtask=self._action_attend_subtask,
         )
+        return prefix_out, prefix_mask, kv_cache, prefix_mask_for_action, rng
+
+    def _denoise(self, rng, observation, kv_cache, prefix_mask, prefix_mask_for_action, num_steps, noise, t_context):
+        """Flow-match denoise the action suffix under the frozen prefix ``kv_cache``."""
+        batch_size = observation.state.shape[0]
+        n_steps_i = int(num_steps)
+        dt = -1.0 / float(n_steps_i)
+        if noise is None:
+            noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
 
         def step(carry):
             x_t, t = carry
@@ -1175,7 +1158,6 @@ class Pi0CoT(_model.BaseModel):
             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon:])
             return x_t + dt * v_t, t + dt
 
-
         t0 = jnp.asarray(1.0, dtype=noise.dtype)
 
         def cond(carry):
@@ -1184,3 +1166,75 @@ class Pi0CoT(_model.BaseModel):
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, t0))
         return x_0
+
+    def _prepare_sampling(self, rng, observation, image_keys, t_context):
+        """Shared front half of the two samplers: preprocess obs, validate/broadcast ``t_context``,
+        and run the frozen prefix. Returns ``(observation, t_context, prefix_out, prefix_mask,
+        kv_cache, prefix_mask_for_action, rng)``."""
+        keys = tuple(image_keys) if image_keys is not None else self._preprocess_image_keys
+        observation = _model.preprocess_observation(None, observation, train=False, image_keys=keys)
+        if t_context is not None:
+            if self.context_smoothing is None:
+                raise ValueError("t_context requires a model trained with context_smoothing enabled")
+            batch_size = observation.state.shape[0]
+            t_context = jnp.broadcast_to(jnp.asarray(t_context, dtype=jnp.float32), (batch_size,))
+        prefix_out, prefix_mask, kv_cache, prefix_mask_for_action, rng = self._prefix_for_sampling(
+            rng, observation, t_context
+        )
+        return observation, t_context, prefix_out, prefix_mask, kv_cache, prefix_mask_for_action, rng
+
+    @override
+    def sample_actions(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        num_steps: int | at.Int[at.Array, ""] = 10,
+        noise: at.Float[at.Array, "b ah ad"] | None = None,
+        image_keys: Sequence[str] | None = None,
+        t_context: float | at.Float[at.Array, " b"] | None = None,
+    ) -> _model.Actions:
+        """Flow-match denoise from prefix KV + action suffix.
+
+        ``t_context``: context noise level in [0, 1] for a CSP-trained model. ``None`` (the default)
+        means no context smoothing -- the clean, precise-imitation regime, identical to a model
+        trained without CSP. A TMRL high-level policy selects this per action chunk.
+
+        ``jit_denoise_steps``: Python loop over ``num_steps``, each iteration calling this
+        module's jitted :meth:`_denoise_flow_step` (separate XLA program per step; usually
+        between fused ``while_loop`` and fully eager in peak VRAM and speed).
+
+        ``low_memory_denoise``: fully eager Python loop (no per-step ``nnx.jit``). Do not wrap
+        the whole :meth:`sample_actions` in ``nnx.jit`` when using either loop mode.
+        """
+        observation, t_context, _prefix_out, prefix_mask, kv_cache, prefix_mask_for_action, rng = (
+            self._prepare_sampling(rng, observation, image_keys, t_context)
+        )
+        return self._denoise(
+            rng, observation, kv_cache, prefix_mask, prefix_mask_for_action, num_steps, noise, t_context
+        )
+
+    def sample_actions_with_prefix(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        num_steps: int | at.Int[at.Array, ""] = 10,
+        noise: at.Float[at.Array, "b ah ad"] | None = None,
+        image_keys: Sequence[str] | None = None,
+        t_context: float | at.Float[at.Array, " b"] | None = None,
+    ) -> tuple[_model.Actions, jnp.ndarray, jnp.ndarray]:
+        """Like :meth:`sample_actions`, but also return the frozen prefix it already computes.
+
+        Returns ``(actions, prefix_out, prefix_mask)``: ``prefix_out`` is the final-layer hidden
+        states over ``[img, prompt, reasoning, subtask, (fast)]`` (``stop_gradient``, f32[b, M, D])
+        and ``prefix_mask`` the matching bool[b, M]. Lets callers reuse the prefix (e.g. as an RL
+        state feature) without a second PaliGemma forward.
+        """
+        observation, t_context, prefix_out, prefix_mask, kv_cache, prefix_mask_for_action, rng = (
+            self._prepare_sampling(rng, observation, image_keys, t_context)
+        )
+        actions = self._denoise(
+            rng, observation, kv_cache, prefix_mask, prefix_mask_for_action, num_steps, noise, t_context
+        )
+        return actions, jax.lax.stop_gradient(prefix_out), prefix_mask
