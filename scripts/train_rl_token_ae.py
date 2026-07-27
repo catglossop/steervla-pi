@@ -17,9 +17,9 @@ from openpi.models.rl_token import RLTokenAEConfig, RLTokenAutoencoder
 
 @dataclasses.dataclass
 class Args:
-    train_dir: str = "./rl_token_embeddings/composite_v0/train"
-    val_dir: str | None = "./rl_token_embeddings/composite_v0/val"
-    output_dir: str = "./rl_token_ae/composite_v0"
+    train_dir: str = "./rl_token_embeddings/composite_v1/train"
+    val_dir: str | None = "./rl_token_embeddings/composite_v1/val"
+    output_dir: str = "./rl_token_ae/composite_v1"
     batch_size: int = 32
     lr: float = 1e-4
     cosine_lr: bool = False
