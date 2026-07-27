@@ -21,15 +21,15 @@ import openpi.training.sharding as sharding
 
 DEFAULT_CHECKPOINT = (
     "gs://cat-logs/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning/"
-    "pi05_steervla_cot_simplified_reasoning_20260523_222304/20000"
+    "pi05_steervla_cot_simplified_reasoning_20260523_222304/8000"
 )
 
 
 @dataclasses.dataclass
 class Args:
-    config_name: str = "pi05_steervla_cot_simplified_reasoning_traffic_light_only"
+    config_name: str = "pi05_steervla_cot_simplified_reasoning_composite"
     checkpoint_dir: str = DEFAULT_CHECKPOINT
-    output_dir: str = "./rl_token_embeddings/traffic_light_v0"
+    output_dir: str = "./rl_token_embeddings/composite_v0"
     num_batches: int = 500
     split: str = "train"
     shuffle: bool = False
