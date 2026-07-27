@@ -929,30 +929,17 @@ class Pi0CoT(_model.BaseModel):
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon:])
         return x_t + dt * v_t, t + dt
 
-    @override
-    def sample_actions(
-        self,
-        rng: at.KeyArrayLike,
-        observation: _model.Observation,
-        *,
-        num_steps: int | at.Int[at.Array, ""] = 10,
-        noise: at.Float[at.Array, "b ah ad"] | None = None,
-        image_keys: Sequence[str] | None = None,
-    ) -> _model.Actions:
-        """Flow-match denoise from prefix KV + action suffix.
+    def _prefix_for_sampling(self, observation: _model.Observation):
+        """Embed + run the frozen prefix (images + prompt + reasoning + subtask [+ fast]).
 
-        ``jit_denoise_steps``: Python loop over ``num_steps``, each iteration calling this
-        module's jitted :meth:`_denoise_flow_step` (separate XLA program per step; usually
-        between fused ``while_loop`` and fully eager in peak VRAM and speed).
-
-        ``low_memory_denoise``: fully eager Python loop (no per-step ``nnx.jit``). Do not wrap
-        the whole :meth:`sample_actions` in ``nnx.jit`` when using either loop mode.
+        ``observation`` must already be preprocessed. Returns
+        ``(prefix_out, prefix_mask, kv_cache, prefix_mask_no_reasoning)``; shared by
+        :meth:`sample_actions` and :meth:`sample_actions_with_prefix` so both see an
+        identical prefix (token order ``[img, prompt, reasoning, subtask, (fast)]``,
+        FAST->reasoning knowledge insulation).
         """
-        keys = tuple(image_keys) if image_keys is not None else self._preprocess_image_keys
-        observation = _model.preprocess_observation(None, observation, train=False, image_keys=keys)
         batch_size = observation.state.shape[0]
 
-        # --- Build prefix: images + prompt + reasoning + subtask ---
         img_tokens, img_masks, img_ar = self._embed_images(observation)
         n_img = sum(t.shape[1] for t in img_tokens)
 
@@ -960,9 +947,6 @@ class Pi0CoT(_model.BaseModel):
         prompt_mask = observation.tokenized_prompt_mask
         n_prompt = prompt_emb.shape[1]
 
-        # During inference, subtask/reasoning may be provided as ground-truth
-        # (for teacher-forced eval) or could be autoregressively generated.
-        # For now, we support teacher-forced inference with provided tokens.
         reasoning_emb = self._embed_text_tokens(observation.tokenized_reasoning)
         reasoning_mask = observation.tokenized_reasoning_mask
         n_reasoning = reasoning_emb.shape[1]
@@ -974,21 +958,19 @@ class Pi0CoT(_model.BaseModel):
         prefix_parts = img_tokens + [prompt_emb, reasoning_emb, subtask_emb]
         prefix_mask_parts = img_masks + [prompt_mask, reasoning_mask, subtask_mask]
         prefix_ar_list = img_ar + [False] * n_prompt + [True] * n_reasoning + [True] * n_subtask
+        n_fast = 0
         if self._use_fast_tokens and observation.tokenized_fast is not None:
             fast_emb = self._embed_text_tokens(observation.tokenized_fast)
-            fast_mask = observation.tokenized_fast_mask
             prefix_parts.append(fast_emb)
-            prefix_mask_parts.append(fast_mask)
+            prefix_mask_parts.append(observation.tokenized_fast_mask)
             prefix_ar_list += [True] * fast_emb.shape[1]
+            n_fast = observation.tokenized_fast.shape[1]
 
         prefix_tokens = jnp.concatenate(prefix_parts, axis=1)
         prefix_mask = jnp.concatenate(prefix_mask_parts, axis=1)
         prefix_ar = jnp.array(prefix_ar_list)
 
         # Prefix attention (blocks FAST/action from reasoning when fast tokens are present).
-        n_fast = 0
-        if self._use_fast_tokens and observation.tokenized_fast is not None:
-            n_fast = observation.tokenized_fast.shape[1]
         empty_suffix_mask = jnp.zeros((batch_size, 0), dtype=jnp.bool_)
         empty_suffix_ar = jnp.array([], dtype=jnp.bool_)
         prefix_attn_mask = self._build_attention_mask(
@@ -1004,21 +986,26 @@ class Pi0CoT(_model.BaseModel):
             0,
         )
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+        (prefix_out, _), kv_cache = self.PaliGemma.llm(
+            [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
+        )
 
-        # --- Denoising loop ---
-        n_steps_i = int(num_steps)
-        dt = -1.0 / float(n_steps_i)
-        if noise is None:
-            noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
-
-        # Build a per-column mask that blocks reasoning tokens from action attention
+        # Per-column mask blocking reasoning tokens from action attention (reused each denoise step).
         prefix_len = prefix_mask.shape[1]
         reasoning_start = n_img + n_prompt
         reasoning_end = reasoning_start + n_reasoning
         col_is_reasoning = (jnp.arange(prefix_len) >= reasoning_start) & (jnp.arange(prefix_len) < reasoning_end)
-        # Shape (b, prefix_len): valid prefix tokens minus reasoning columns
         prefix_mask_no_reasoning = prefix_mask & ~col_is_reasoning[None, :]
+
+        return prefix_out, prefix_mask, kv_cache, prefix_mask_no_reasoning
+
+    def _denoise(self, rng, observation, kv_cache, prefix_mask, prefix_mask_no_reasoning, num_steps, noise):
+        """Flow-match denoise the action suffix under the frozen prefix ``kv_cache``."""
+        batch_size = observation.state.shape[0]
+        n_steps_i = int(num_steps)
+        dt = -1.0 / float(n_steps_i)
+        if noise is None:
+            noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
 
         def step(carry):
             x_t, t = carry
@@ -1046,7 +1033,6 @@ class Pi0CoT(_model.BaseModel):
             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon:])
             return x_t + dt * v_t, t + dt
 
-
         t0 = jnp.asarray(1.0, dtype=noise.dtype)
 
         def cond(carry):
@@ -1055,3 +1041,41 @@ class Pi0CoT(_model.BaseModel):
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, t0))
         return x_0
+
+    @override
+    def sample_actions(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        num_steps: int | at.Int[at.Array, ""] = 10,
+        noise: at.Float[at.Array, "b ah ad"] | None = None,
+        image_keys: Sequence[str] | None = None,
+    ) -> _model.Actions:
+        """Flow-match denoise from a frozen prefix KV + action suffix (teacher-forced CoT)."""
+        keys = tuple(image_keys) if image_keys is not None else self._preprocess_image_keys
+        observation = _model.preprocess_observation(None, observation, train=False, image_keys=keys)
+        _, prefix_mask, kv_cache, prefix_mask_no_reasoning = self._prefix_for_sampling(observation)
+        return self._denoise(rng, observation, kv_cache, prefix_mask, prefix_mask_no_reasoning, num_steps, noise)
+
+    def sample_actions_with_prefix(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        num_steps: int | at.Int[at.Array, ""] = 10,
+        noise: at.Float[at.Array, "b ah ad"] | None = None,
+        image_keys: Sequence[str] | None = None,
+    ) -> tuple[_model.Actions, jnp.ndarray, jnp.ndarray]:
+        """Like :meth:`sample_actions`, but also return the frozen prefix it already computes.
+
+        Returns ``(actions, prefix_out, prefix_mask)``: ``prefix_out`` is the final-layer
+        hidden states over ``[img, prompt, reasoning, subtask, (fast)]`` (``stop_gradient``,
+        f32[b, M, D]) and ``prefix_mask`` the matching bool[b, M]. Lets callers reuse the
+        prefix (e.g. as an RL state feature) without a second PaliGemma forward.
+        """
+        keys = tuple(image_keys) if image_keys is not None else self._preprocess_image_keys
+        observation = _model.preprocess_observation(None, observation, train=False, image_keys=keys)
+        prefix_out, prefix_mask, kv_cache, prefix_mask_no_reasoning = self._prefix_for_sampling(observation)
+        actions = self._denoise(rng, observation, kv_cache, prefix_mask, prefix_mask_no_reasoning, num_steps, noise)
+        return actions, jax.lax.stop_gradient(prefix_out), prefix_mask
