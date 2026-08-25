@@ -622,18 +622,27 @@ class RLDSSteerVLACoTDataConfig(RLDSSteerVLADataConfig):
                     )
                 )
 
-        assert len(resolved_datasets) > 0
-
         resolved_hl_datasets: list[steervla_rlds_dataset.SteerVLARLDSDataset] = []
         if self.hl_dataset_name_weight_mappings is not None:
             for name, weight in self.hl_dataset_name_weight_mappings.items():
                 resolved_hl_datasets.append(
                     steervla_rlds_dataset.SteerVLARLDSDataset(
-                        name=name, 
-                        weight=weight, 
+                        name=name,
+                        weight=weight,
                         version=self.hl_dataset_version,
                     )
                 )
+
+        # An HL-only mixture is legal: high-level datasets get ``action_supervision=False``, so
+        # their ``action_loss_mask`` is all-False, which zeroes the flow loss (pi0_cot.py:389)
+        # and drops FAST supervision (pi0_cot.py:468). Such a run trains the subtask/reasoning
+        # heads alone. ``SteerVLARldsDataset`` concatenates ``datasets`` and ``hl_datasets`` into
+        # one weighted source list, so an empty ``datasets`` is fine downstream. Only require
+        # that the mixture is not *entirely* empty.
+        assert len(resolved_datasets) + len(resolved_hl_datasets) > 0, (
+            "Must specify at least one dataset via `datasets`, `dataset_name_weight_mappings`, "
+            "or `hl_dataset_name_weight_mappings`."
+        )
 
         repack_transform = _transforms.Group(
             inputs=[
@@ -1828,6 +1837,264 @@ _CONFIGS = [
         resume=False,
         skip_norm_stats=True,
     ),
+    #
+    # Offline CAST-relabel HL fine-tune. The "collect-then-finetune" half of the CAST loop in
+    # ogbench-carla: a frozen policy rolls out, a VLM reviews each window and rewrites the
+    # subtask/reasoning of the chunks it blames, every chunk is written to disk, and
+    # ogbench-carla/impls/vlas/cast_hl_to_rlds.py converts the corpus to the SIMLINGO RLDS
+    # layout below. The online counterpart interleaves the same relabeling with
+    # SteerVLAActor.update_hl gradient steps during the rollout.
+    #
+    # Architecture and every data-format field are copied verbatim from
+    # pi05_steervla_cot_simplified_reasoning_no_ego_history: the corpus is a recording of *that*
+    # policy acting, so restoring it under any other architecture/action format would be
+    # restoring a different model against the same bytes.
+    #
+    # Two datasets rather than one. The converter's --split supervision emits the corrective
+    # half (VLM replaced the subtask -> the executed action no longer matches it) separately
+    # from the reinforcing half (subtask kept -> action and subtask still agree). Only the
+    # second may be action-supervised; the first must stay action-masked, which is exactly what
+    # hl_dataset_name_weight_mappings does. This also satisfies the create() assertion that at
+    # least one action-supervised dataset exists.
+    #
+    TrainConfig(
+        name="pi05_steervla_cast_hl_finetune",
+        model=pi0_config.Pi0CoTConfig(
+            action_dim=32,
+            action_horizon=10,
+            max_token_len=200,
+            max_subtask_len=64,
+            max_reasoning_len=64,
+            cot_loss_weight=0.1,
+            knowledge_insulation=False,
+            use_fast_tokens=True,
+        ),
+        data=RLDSSteerVLACoTDataConfig(
+            repo_id="steervla_simlingo_cot",
+            rlds_data_dir="/raid/datasets/steervla",
+            dataset_format=steervla_rlds_dataset.DatasetFormat.SIMLINGO,
+            include_ego_history=False,
+            include_xy_action=False,
+            speed_in_prompt=True,
+            proprio_norm=False,
+            action_dim=4,
+            output_action_format=steervla_rlds_dataset.OutputActionFormat.DELTA_XY_T_DELTA_XY_SPACE,
+            lang_label_type=steervla_rlds_dataset.LangLabelType.ROUTING_COMMAND,
+            # GOOD/unlabeled chunks: the model's own subtask with the action it actually took.
+            dataset_name_weight_mappings={
+                "cast_relabel_hl_v1_reinforce": 1.0,
+            },
+            # BAD chunks: VLM-corrected subtask + fresh reasoning, action masked out.
+            hl_dataset_name_weight_mappings={
+                "cast_relabel_hl_v1_corrective": 1.0,
+            },
+            hl_dataset_format=steervla_rlds_dataset.DatasetFormat.SIMLINGO,
+            hl_cot_reasoning_key="gemini_refined_label",
+            hl_cot_subtask_key="prompt",
+            # The non-HL keys must be overridden too. They default to the SimLingo action-dataset
+            # layout (reasoning="commentary", subtask="gemini_refined_label"), but the converter
+            # writes ONE schema for both halves — subtask in "prompt", reasoning in
+            # "gemini_refined_label" — and there is no "commentary" field, so the defaults raise
+            # KeyError('commentary') inside the tf.data restructure.
+            cot_reasoning_key="gemini_refined_label",
+            cot_subtask_key="prompt",
+            max_subtask_len=64,
+            max_reasoning_len=64,
+        ),
+        # Continue from the checkpoint the collection policy was running, not from pi05_base —
+        # this is a fine-tune of the behavior policy on its own reviewed rollouts.
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://cat-logs/pi05_steervla_cot_simplified_reasoning_no_ego_history/"
+            "pi05_steervla_simplified_reasoning_no_ego_history_v1/"
+            "pi05_steervla_simplified_reasoning_no_ego_history_v1_20260718_201640/6000/params"
+        ),
+        # ~5.5k samples total, so a short low-LR pass. 2000 steps at batch 16 is ~6 epochs;
+        # the pretrain LR (2e-5 over 200k steps) would wreck an already-converged policy on a
+        # corpus this size.
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=100,
+            peak_lr=5e-6,
+            decay_steps=2_000,
+            decay_lr=1e-6,
+        ),
+        num_train_steps=2_000,
+        batch_size=16,
+        fsdp_devices=1,
+        log_interval=10,
+        eval_interval=100,
+        save_interval=500,
+        max_to_keep=5,
+        num_workers=0,
+        checkpoint_base_dir="/raid/users/cglossop/steervla_pi_ckpts",
+        resume=False,
+        skip_norm_stats=True,
+    ),
+    #
+    # CoT-only variant of pi05_steervla_cast_hl_finetune. Three differences, all aimed at
+    # supervising *only* the subtask and reasoning heads:
+    #
+    #  1. **No low-level action supervision, on either half.** Both halves of the corpus are
+    #     registered under ``hl_dataset_name_weight_mappings``, which sets
+    #     ``action_supervision=False`` and therefore an all-False ``action_loss_mask``. That
+    #     zeroes the flow loss (pi0_cot.py:389). The sibling config action-supervised the
+    #     reinforcing half, and its curves showed exactly what that costs: reinforce val loss
+    #     fell 6x to ``action_mse`` 0.0000 while the corrective loss sat flat from step ~400 --
+    #     i.e. most of the budget went into re-fitting the policy's own behaviour.
+    #  2. **No FAST token supervision** (``use_fast_tokens=False``). The mask above already drops
+    #     FAST CE for action-unsupervised samples (pi0_cot.py:468); turning the feature off is
+    #     the explicit version and also removes the FAST tokens from the sequence layout.
+    #  3. **BAD upweighted 80/20 over GOOD**, matching the online updater's
+    #     ``hl_online_bad_fraction=0.8`` (see ogbench-carla
+    #     ``impls/configs/steervla_cast_relabel_config.py``). At 1.0/1.0 the 3281 reinforcing
+    #     frames outvote the 2224 corrective ones as soon as the easy reinforcing loss collapses.
+    #
+    # Not reproduced from the online updater: ``hl_online_precursor_fraction=0.5``, the 50/50
+    # direct-vs-precursor split *within* the BAD share. The RLDS loader samples uniformly inside
+    # a dataset, so that would need the converter to emit corrective as two datasets
+    # (``--keep`` by credit_source) rather than one.
+    #
+    # ``cot_loss_weight`` is raised 0.1 -> 1.0 because it is now the *only* term in the loss:
+    # ``combined = flow_loss + cot_loss_weight * cot_loss`` (pi0_cot.py:476) with flow_loss
+    # identically zero, so leaving it at 0.1 would just scale every gradient down 10x.
+    #
+    TrainConfig(
+        name="pi05_steervla_cast_hl_finetune_cot_only",
+        model=pi0_config.Pi0CoTConfig(
+            action_dim=32,
+            action_horizon=10,
+            max_token_len=200,
+            max_subtask_len=64,
+            max_reasoning_len=64,
+            cot_loss_weight=1.0,
+            knowledge_insulation=False,
+            use_fast_tokens=False,
+        ),
+        data=RLDSSteerVLACoTDataConfig(
+            repo_id="steervla_simlingo_cot",
+            rlds_data_dir="/raid/datasets/steervla",
+            dataset_format=steervla_rlds_dataset.DatasetFormat.SIMLINGO,
+            include_ego_history=False,
+            include_xy_action=False,
+            speed_in_prompt=True,
+            proprio_norm=False,
+            action_dim=4,
+            output_action_format=steervla_rlds_dataset.OutputActionFormat.DELTA_XY_T_DELTA_XY_SPACE,
+            lang_label_type=steervla_rlds_dataset.LangLabelType.ROUTING_COMMAND,
+            # Empty: nothing is action-supervised in this run.
+            dataset_name_weight_mappings={},
+            hl_dataset_name_weight_mappings={
+                "cast_relabel_hl_v1_corrective": 0.8,
+                "cast_relabel_hl_v1_reinforce": 0.2,
+            },
+            hl_dataset_format=steervla_rlds_dataset.DatasetFormat.SIMLINGO,
+            hl_cot_reasoning_key="gemini_refined_label",
+            hl_cot_subtask_key="prompt",
+            cot_reasoning_key="gemini_refined_label",
+            cot_subtask_key="prompt",
+            max_subtask_len=64,
+            max_reasoning_len=64,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://cat-logs/pi05_steervla_cot_simplified_reasoning_no_ego_history/"
+            "pi05_steervla_simplified_reasoning_no_ego_history_v1/"
+            "pi05_steervla_simplified_reasoning_no_ego_history_v1_20260718_201640/6000/params"
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=100,
+            peak_lr=5e-6,
+            decay_steps=2_000,
+            decay_lr=1e-6,
+        ),
+        num_train_steps=2_000,
+        batch_size=16,
+        fsdp_devices=1,
+        log_interval=10,
+        eval_interval=100,
+        save_interval=500,
+        max_to_keep=5,
+        num_workers=0,
+        checkpoint_base_dir="/raid/users/cglossop/steervla_pi_ckpts",
+        resume=False,
+        skip_norm_stats=True,
+    ),
+    #
+    # Single-route, 500-sample probe. Same CoT-only supervision as
+    # pi05_steervla_cast_hl_finetune_cot_only (no action loss on either half, no FAST tokens),
+    # but the corpus is cut down to 500 samples drawn only from `generalization-wall-1095` --
+    # the route it is then evaluated on -- and the learning rate is dropped 5x.
+    #
+    # Why 500: both full-corpus runs reached their corrective-loss minimum at ~step 400, i.e.
+    # roughly one epoch, so the useful signal appears to be a few hundred samples' worth. This
+    # asks whether that same amount of *in-distribution* data, applied gently, moves the policy
+    # on the route it came from.
+    #
+    # The dataset is built with `--split none --limit 500`, so it is ONE dataset containing both
+    # halves (168 corrective / 332 reinforcing, 11 episodes). `--split supervision` would apply
+    # the limit per half and yield up to 1000 samples, not 500. Consequence: the 0.8/0.2 BAD
+    # upweight used by the sibling config cannot be expressed here -- the draw is uniform.
+    #
+    # 300 steps at batch 16 is ~10 epochs over 500 samples; peak_lr 1e-6 (vs 5e-6) keeps that
+    # many passes from simply memorising 11 episodes. Checkpoints every 100 steps because the
+    # interesting region is early and the whole run is short.
+    #
+    TrainConfig(
+        name="pi05_steervla_cast_hl_wall1095_500",
+        model=pi0_config.Pi0CoTConfig(
+            action_dim=32,
+            action_horizon=10,
+            max_token_len=200,
+            max_subtask_len=64,
+            max_reasoning_len=64,
+            cot_loss_weight=1.0,
+            knowledge_insulation=False,
+            use_fast_tokens=False,
+        ),
+        data=RLDSSteerVLACoTDataConfig(
+            repo_id="steervla_simlingo_cot",
+            rlds_data_dir="/raid/datasets/steervla",
+            dataset_format=steervla_rlds_dataset.DatasetFormat.SIMLINGO,
+            include_ego_history=False,
+            include_xy_action=False,
+            speed_in_prompt=True,
+            proprio_norm=False,
+            action_dim=4,
+            output_action_format=steervla_rlds_dataset.OutputActionFormat.DELTA_XY_T_DELTA_XY_SPACE,
+            lang_label_type=steervla_rlds_dataset.LangLabelType.ROUTING_COMMAND,
+            dataset_name_weight_mappings={},
+            hl_dataset_name_weight_mappings={
+                "cast_wall1095_500": 1.0,
+            },
+            hl_dataset_format=steervla_rlds_dataset.DatasetFormat.SIMLINGO,
+            hl_cot_reasoning_key="gemini_refined_label",
+            hl_cot_subtask_key="prompt",
+            cot_reasoning_key="gemini_refined_label",
+            cot_subtask_key="prompt",
+            max_subtask_len=64,
+            max_reasoning_len=64,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://cat-logs/pi05_steervla_cot_simplified_reasoning_no_ego_history/"
+            "pi05_steervla_simplified_reasoning_no_ego_history_v1/"
+            "pi05_steervla_simplified_reasoning_no_ego_history_v1_20260718_201640/6000/params"
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=20,
+            peak_lr=1e-6,
+            decay_steps=300,
+            decay_lr=1e-7,
+        ),
+        num_train_steps=300,
+        batch_size=16,
+        fsdp_devices=1,
+        log_interval=10,
+        eval_interval=25,
+        save_interval=100,
+        max_to_keep=5,
+        num_workers=0,
+        checkpoint_base_dir="/raid/users/cglossop/steervla_pi_ckpts",
+        resume=False,
+        skip_norm_stats=True,
+    ),
     TrainConfig(
         name="pi05_steervla_cot_simplified_reasoning_commentary",
         model=pi0_config.Pi0CoTConfig(
@@ -2097,6 +2364,42 @@ _CONFIGS.append(
         resume_step=None,
     )
 )
+
+# Per-route CAST finetunes. One config per route, each trained only on the corpus collected by
+# rolling the base policy out on *that* route with CAST relabeling, then redeployed on the same
+# route. Derived from pi05_steervla_cast_hl_finetune_cot_only (itself derived from
+# pi05_steervla_cot_simplified_reasoning_no_ego_history) so the architecture, action format and
+# CoT-only supervision stay in sync; only the datasets and the checkpoint cadence differ.
+#
+# Cadence: both earlier offline runs put their corrective-validation minimum at ~step 400 and
+# overfit after, so these run 1000 steps and checkpoint every 250 — enough resolution to pick a
+# checkpoint at the minimum rather than at the end, without writing eight 46 GB checkpoints.
+_cast_cot_only = _CONFIGS[[c.name for c in _CONFIGS].index("pi05_steervla_cast_hl_finetune_cot_only")]
+for _route_tag, _dataset_prefix in (
+    ("oppveh", "cast_route_oppveh_v1"),
+    ("enteractor", "cast_route_enteractor_v1"),
+    ("signalized", "cast_route_signalized_v1"),
+    ("merger", "cast_route_merger_v1"),
+):
+    _CONFIGS.append(
+        dataclasses.replace(
+            _cast_cot_only,
+            name=f"pi05_steervla_cast_route_{_route_tag}",
+            data=dataclasses.replace(
+                _cast_cot_only.data,
+                # Corrective upweighted 0.8/0.2 over reinforcing, matching the online updater's
+                # hl_online_bad_fraction. Both halves are high-level, so nothing is action
+                # supervised: action_loss_mask is all-False and the flow loss is zeroed.
+                hl_dataset_name_weight_mappings={
+                    f"{_dataset_prefix}_corrective": 0.8,
+                    f"{_dataset_prefix}_reinforce": 0.2,
+                },
+            ),
+            num_train_steps=1_000,
+            save_interval=250,
+            eval_interval=50,
+        )
+    )
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")
