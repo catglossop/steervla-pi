@@ -2236,7 +2236,7 @@ _CONFIGS = [
     #
     # Baseline: ``pi05_steervla_cot_simplified_reasoning_no_ego_history``. Data mixture, action
     # format, LR schedule and batch size are copied verbatim so this is a clean A/B against it.
-    # Five things change:
+    # Four things change:
     #
     # 1. HL reasoning target reverted to ``gemini_refined_label``. In simplified_reasoning_dataset
     #    that key holds traffic_light_status (4 distinct values), not the meta-action narration it
@@ -2247,10 +2247,11 @@ _CONFIGS = [
     #
     # 2. ``skip_norm_stats=False`` -- actions and state are actually normalized. Without it the
     #    model trains on the fixed divisors in steervla_rlds_dataset.py, which leave the four
-    #    action dims on wildly different scales (measured over simlingo_dataset_all: dim0
-    #    std 0.196, dim1 std 0.074, dim2 mean 0.954 / std 0.096 -- delta_xy_space is never divided
-    #    at all -- dim3 std 0.272). Flow loss is a uniform MSE over dims, so per-dim gradient
-    #    tracks per-dim variance and time-domain lateral control gets ~4% of the learnable signal.
+    #    action dims on unrelated scales: dim0 std 0.196, dim1 std 0.074, dim2 mean 0.954 /
+    #    std 0.096 (delta_xy_space is never divided at all), dim3 std 0.272. Flow loss is a
+    #    uniform MSE over dims, so per-dim gradient tracks per-dim variance -- see the table
+    #    below; unnormalized, dim3 takes 59% of the budget and time-domain lateral control
+    #    (dim1) gets 7%. Normalizing brings the spread from 2.9x down to 1.8x.
     #    It also fixes the state channel: ``CoTPaligemmaTokenizer.tokenize_prompt`` discretizes
     #    state against fixed [-1, 1] bins, so with proprio_norm=False every speed >= 1 m/s
     #    saturated to token 255 and every course <= -1 deg produced token -1.
@@ -2289,34 +2290,22 @@ _CONFIGS = [
     #    the ground-truth subtask. That is a code change in steervla_visualization.py and applies
     #    to every CoT config; compare runs on the gen_* metrics, not the oracle ``eval/ade_*``.
     #
-    # 5. ``unnormalized_action_dims=(2,)`` -- dim 2 (delta_xy_space.x) is exempted from
-    #    normalization while dims 0/1/3 and the state are normalized as usual.
-    #
-    #    Dim 2 spikes at ~0.95 while the vehicle is moving and collapses toward 0 when it is
-    #    stopped or turning hard, so its q01..q99 band is narrow (0.507..0.9996) with a long left
-    #    tail. Quantile norm maps that band onto [-1, 1] and inflates the tail to about -3.
-    #
-    #    Flow loss is a uniform MSE over dims, so per-dim gradient tracks per-dim variance.
-    #    Share of action variance over the weighted mixture, measured on 25.6k action vectors:
+    # On measuring per-dim action balance: filter to action-supervised rows first. The HL
+    # dataset carries dummy (zero) actions and an all-False action_loss_mask, so its rows
+    # contribute nothing to the flow loss -- but they are ~31% of the mixture, and on dim 2 a
+    # dummy zero normalizes to -3.06, which makes an unfiltered measurement look like dim 2 has
+    # a huge tail. Variance share over real-action (simlingo_dataset_*) rows only:
     #
     #        dim              0      1      2      3     spread
-    #        no norm        30%     4%     7%    58%       3.7x
-    #        dim2 normed    ~6%    ~2%    89%    ~2%       7.0x
-    #        dim2 exempt  42.8%  10.2%  31.8%  15.2%       2.0x   <- this config
+    #        no norm       26.3%   7.2%   7.6%  58.9%      2.9x
+    #        normalized    41.9%  13.0%  25.3%  19.9%      1.8x   <- this config
     #
-    #    Exempting is worth it because dim 2 is the dimension that needs the loss budget least:
-    #    while moving, space-frame steps are unit length (|(x, y)| = 0.9987 +/- 0.0064), so
-    #    x = sqrt(1 - y^2) reconstructs it from dim 3 with R^2 = 0.993.
+    # Plain quantile normalization is the best balance available here, so no dimension is
+    # exempted. ``RLDSSteerVLADataConfig.unnormalized_action_dims`` exists if a future action
+    # layout needs it, but leaving it empty is correct for this one.
     #
-    #    Note dim 2 stays off-center (mean ~0.64) since it is not rescaled; the action head learns
-    #    that offset in its bias. If the mixture weights change, re-measure -- dim 2's spread is
-    #    driven by how many stopped/turning frames the mixture contains.
-    #
-    #    Exempting is preferred over dropping the dimension: ``DELTA_XY_T_DELTA_COURSE_SPACE``
-    #    with ``action_dim=3`` would also fix the imbalance, but it changes the policy's output
-    #    contract and every consumer with it. An exempted dim keeps the units the RLDS loader
-    #    emitted, and Unnormalize inverts the same identity map, so the deployed output space is
-    #    byte-for-byte what it was before -- no CARLA-side change.
+    # ``compute_norm_stats.py`` already applies the same filter when building the stats
+    # (it reported excluding 156491/499968 rows = 31.3%, matching the 31.4% HL mixture weight).
     #
     TrainConfig(
         name="pi05_steervla_cot_norm_compact",
@@ -2341,8 +2330,6 @@ _CONFIGS = [
             speed_in_prompt=True,
             proprio_norm=False,
             action_dim=4,
-            # dim 2 (delta_xy_space.x) keeps its raw units -- see the note above.
-            unnormalized_action_dims=(2,),
             output_action_format=steervla_rlds_dataset.OutputActionFormat.DELTA_XY_T_DELTA_XY_SPACE,
             lang_label_type=steervla_rlds_dataset.LangLabelType.ROUTING_COMMAND,
             dataset_name_weight_mappings={
