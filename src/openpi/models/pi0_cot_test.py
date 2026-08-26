@@ -9,11 +9,14 @@ import dataclasses
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 import openpi.models.model as _model
 import openpi.models.pi0_config as _pi0_config
 from openpi.models.pi0_cot import Pi0CoT
 import openpi.shared.array_typing as at
+import openpi.training.config as _config
+import openpi.transforms as _transforms
 
 # Static helper under test; exercised directly because its failure mode (indexing into a
 # masked-out camera block) is invisible in end-to-end output.
@@ -161,3 +164,47 @@ def test_inference_image_keys_overrides_image_keys_at_sampling_only():
     # Training consumes every declared stream; sampling honours the inference override.
     assert model._image_keys == tuple(_model.IMAGE_KEYS)  # noqa: SLF001
     assert model._preprocess_image_keys == ("base_0_rgb",)  # noqa: SLF001
+
+
+def test_exempted_dim_is_identity_and_round_trips():
+    """An exempted action dim must pass through Normalize/Unnormalize unchanged.
+
+    This is what lets a config rebalance the flow-matching loss across action dims without
+    touching the policy's output contract: the deployed consumer keeps seeing the units the
+    dataset emitted.
+    """
+    stats = _transforms.NormStats(
+        mean=np.array([0.2, 0.0, 0.95, 0.0]),
+        std=np.array([0.2, 0.1, 0.1, 0.3]),
+        q01=np.array([-0.1, -0.35, 0.51, -0.8]),
+        q99=np.array([0.7, 0.35, 1.0, 0.8]),
+    )
+    exempt = _config._exempt_dims_from_normalization({"actions": stats}, "actions", (2,))["actions"]  # noqa: SLF001
+
+    # Identity-inducing stats on the exempted dim only; every other dim untouched.
+    np.testing.assert_array_equal(exempt.q01, [-0.1, -0.35, -1.0, -0.8])
+    np.testing.assert_array_equal(exempt.q99, [0.7, 0.35, 1.0, 0.8])
+    np.testing.assert_array_equal(exempt.mean, [0.2, 0.0, 0.0, 0.0])
+    np.testing.assert_array_equal(exempt.std, [0.2, 0.1, 1.0, 0.3])
+    # Source stats must not be mutated in place.
+    assert stats.q01[2] == 0.51
+
+    rng = np.random.default_rng(0)
+    raw = rng.uniform(-1.5, 1.5, (64, 4))
+    for use_quantiles in (True, False):
+        normed = _transforms.Normalize({"actions": exempt}, use_quantiles=use_quantiles)({"actions": raw})["actions"]
+        np.testing.assert_allclose(normed[:, 2], raw[:, 2], atol=1e-5)
+        # Round trip through the 32-dim padded vector the policy actually returns.
+        padded = np.concatenate([normed, np.zeros((64, 28))], axis=-1)
+        back = _transforms.Unnormalize({"actions": exempt}, use_quantiles=use_quantiles)({"actions": padded})[
+            "actions"
+        ]
+        np.testing.assert_allclose(back[:, :4], raw, atol=1e-5)
+
+
+def test_exempt_dims_rejects_out_of_range():
+    stats = _transforms.NormStats(mean=np.zeros(4), std=np.ones(4), q01=-np.ones(4), q99=np.ones(4))
+    with pytest.raises(ValueError, match="out of range"):
+        _config._exempt_dims_from_normalization({"actions": stats}, "actions", (4,))  # noqa: SLF001
+    with pytest.raises(ValueError, match="no 'actions' norm stats"):
+        _config._exempt_dims_from_normalization({"state": stats}, "actions", (0,))  # noqa: SLF001

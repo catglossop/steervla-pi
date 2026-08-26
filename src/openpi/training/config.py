@@ -10,6 +10,7 @@ from typing import Any, Literal, Protocol, TypeAlias
 
 import etils.epath as epath
 import flax.nnx as nnx
+import numpy as np
 from typing_extensions import override
 import tyro
 
@@ -488,6 +489,49 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
         )
 
 
+def _exempt_dims_from_normalization(
+    norm_stats: dict[str, _transforms.NormStats] | None,
+    key: str,
+    dims: Sequence[int],
+) -> dict[str, _transforms.NormStats] | None:
+    """Make ``Normalize``/``Unnormalize`` the identity on selected dimensions of one stats key.
+
+    Both transforms are per-dimension affine maps driven entirely by the stats, so a dimension is
+    exempted purely by choosing stats whose map is the identity: ``mean=0, std=1`` for z-score and
+    ``q01=-1, q99=+1`` for quantile norm, since ``(x - (-1)) / 2 * 2 - 1 == x``. ``Unnormalize``
+    inverts that same map, so the round trip is preserved -- an exempted dimension reaches the
+    policy's consumer in exactly the units the dataset emitted, and the model's output space is
+    unchanged.
+
+    Use this for a dimension whose distribution makes quantile normalization actively harmful: a
+    narrow spike with a long tail, where mapping q01..q99 onto [-1, 1] inflates the tail and hands
+    the dimension a disproportionate share of the flow-matching loss.
+
+    ``training/checkpoints.py`` snapshots ``DataConfig.norm_stats`` into the checkpoint assets dir
+    and ``policies/policy_config.py`` serves from that snapshot, so applying this at config-load
+    time reaches inference too -- training and deployment cannot disagree.
+    """
+    if norm_stats is None or not dims:
+        return norm_stats
+    if key not in norm_stats:
+        raise ValueError(f"Cannot exempt dims {tuple(dims)}: no '{key}' norm stats (have {sorted(norm_stats)})")
+
+    stats = norm_stats[key]
+    width = np.asarray(stats.mean).shape[-1]
+    if bad := [d for d in dims if not 0 <= d < width]:
+        raise ValueError(f"Dim(s) {bad} out of range for '{key}' norm stats of width {width}")
+
+    idx = list(dims)
+    mean, std = np.array(stats.mean), np.array(stats.std)
+    mean[idx], std[idx] = 0.0, 1.0
+    q01 = None if stats.q01 is None else np.array(stats.q01)
+    q99 = None if stats.q99 is None else np.array(stats.q99)
+    if q01 is not None and q99 is not None:
+        q01[idx], q99[idx] = -1.0, 1.0
+
+    return {**norm_stats, key: _transforms.NormStats(mean=mean, std=std, q01=q01, q99=q99)}
+
+
 @dataclasses.dataclass(frozen=True)
 class RLDSSteerVLADataConfig(DataConfigFactory):
     """
@@ -510,6 +554,11 @@ class RLDSSteerVLADataConfig(DataConfigFactory):
     proprio_norm: bool = True
     action_dim: int = 2
 
+    # Action dimensions passed through ``Normalize``/``Unnormalize`` untouched, indexed into the
+    # pre-padding action vector. The model's output space is unchanged; an exempted dim just keeps
+    # the units the RLDS loader emitted. See ``_exempt_dims_from_normalization``.
+    unnormalized_action_dims: tuple[int, ...] = ()
+
     # Option 1: explicit dataset list.
     datasets: Sequence[steervla_rlds_dataset.SteerVLARLDSDataset] = ()
 
@@ -522,6 +571,18 @@ class RLDSSteerVLADataConfig(DataConfigFactory):
     lang_label_type: tyro.conf.Suppress[steervla_rlds_dataset.LangLabelType] = steervla_rlds_dataset.LangLabelType.ROUTING_COMMAND
     routing_command_in_prompt: bool = False
     add_suffix_to_prompt: bool = False
+
+    def _base_config(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        """``create_base_config`` plus any declared per-dimension normalization exemptions."""
+        base = self.create_base_config(assets_dirs, model_config)
+        if not self.unnormalized_action_dims:
+            return base
+        return dataclasses.replace(
+            base,
+            norm_stats=_exempt_dims_from_normalization(
+                base.norm_stats, "actions", self.unnormalized_action_dims
+            ),
+        )
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -569,7 +630,7 @@ class RLDSSteerVLADataConfig(DataConfigFactory):
         assert self.rlds_data_dir is not None, "Need to set rlds_data_dir for RLDS data loader."
 
         return dataclasses.replace(
-            self.create_base_config(assets_dirs, model_config),
+            self._base_config(assets_dirs, model_config),
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
@@ -702,7 +763,7 @@ class RLDSSteerVLACoTDataConfig(RLDSSteerVLADataConfig):
         assert self.rlds_data_dir is not None
 
         return dataclasses.replace(
-            self.create_base_config(assets_dirs, model_config),
+            self._base_config(assets_dirs, model_config),
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
@@ -2175,7 +2236,7 @@ _CONFIGS = [
     #
     # Baseline: ``pi05_steervla_cot_simplified_reasoning_no_ego_history``. Data mixture, action
     # format, LR schedule and batch size are copied verbatim so this is a clean A/B against it.
-    # Four things change:
+    # Five things change:
     #
     # 1. HL reasoning target reverted to ``gemini_refined_label``. In simplified_reasoning_dataset
     #    that key holds traffic_light_status (4 distinct values), not the meta-action narration it
@@ -2228,17 +2289,34 @@ _CONFIGS = [
     #    the ground-truth subtask. That is a code change in steervla_visualization.py and applies
     #    to every CoT config; compare runs on the gen_* metrics, not the oracle ``eval/ade_*``.
     #
-    # KNOWN ISSUE, left as an explicit decision rather than silently changed: action dim 2
-    # (delta_xy_space.x) is a near-constant ~0.95 with a long left tail. Quantile normalization
-    # maps its narrow q01..q99 band (0.507..0.9996) onto [-1, 1], which blows the tail out to
-    # roughly -3 and leaves dim2 with std 1.84 against 0.52 / 0.26 / 0.31 for dims 0/1/3 -- i.e.
-    # ~89% of the flow-loss variance lands on it. And it is largely redundant: space-frame steps
-    # are unit length (|(x, y)| = 0.9987 +/- 0.0064), so x = sqrt(1 - y^2) with R^2 = 0.993
-    # against dim3. Normalization is still the right call for dims 0/1/3 and for the state
-    # channel, but if dim2 dominates training, the fix is to stop emitting it:
-    # ``output_action_format=DELTA_XY_T_DELTA_COURSE_SPACE`` with ``action_dim=3`` carries the
-    # same heading information without the redundancy. That changes the policy's output contract,
-    # so the CARLA consumer has to change with it -- hence not done here.
+    # 5. ``unnormalized_action_dims=(2,)`` -- dim 2 (delta_xy_space.x) is exempted from
+    #    normalization while dims 0/1/3 and the state are normalized as usual.
+    #
+    #    Dim 2 spikes at ~0.95 while the vehicle is moving and collapses toward 0 when it is
+    #    stopped or turning hard, so its q01..q99 band is narrow (0.507..0.9996) with a long left
+    #    tail. Quantile norm maps that band onto [-1, 1] and inflates the tail to about -3.
+    #
+    #    Flow loss is a uniform MSE over dims, so per-dim gradient tracks per-dim variance.
+    #    Share of action variance over the weighted mixture, measured on 25.6k action vectors:
+    #
+    #        dim              0      1      2      3     spread
+    #        no norm        30%     4%     7%    58%       3.7x
+    #        dim2 normed    ~6%    ~2%    89%    ~2%       7.0x
+    #        dim2 exempt  42.8%  10.2%  31.8%  15.2%       2.0x   <- this config
+    #
+    #    Exempting is worth it because dim 2 is the dimension that needs the loss budget least:
+    #    while moving, space-frame steps are unit length (|(x, y)| = 0.9987 +/- 0.0064), so
+    #    x = sqrt(1 - y^2) reconstructs it from dim 3 with R^2 = 0.993.
+    #
+    #    Note dim 2 stays off-center (mean ~0.64) since it is not rescaled; the action head learns
+    #    that offset in its bias. If the mixture weights change, re-measure -- dim 2's spread is
+    #    driven by how many stopped/turning frames the mixture contains.
+    #
+    #    Exempting is preferred over dropping the dimension: ``DELTA_XY_T_DELTA_COURSE_SPACE``
+    #    with ``action_dim=3`` would also fix the imbalance, but it changes the policy's output
+    #    contract and every consumer with it. An exempted dim keeps the units the RLDS loader
+    #    emitted, and Unnormalize inverts the same identity map, so the deployed output space is
+    #    byte-for-byte what it was before -- no CARLA-side change.
     #
     TrainConfig(
         name="pi05_steervla_cot_norm_compact",
@@ -2263,6 +2341,8 @@ _CONFIGS = [
             speed_in_prompt=True,
             proprio_norm=False,
             action_dim=4,
+            # dim 2 (delta_xy_space.x) keeps its raw units -- see the note above.
+            unnormalized_action_dims=(2,),
             output_action_format=steervla_rlds_dataset.OutputActionFormat.DELTA_XY_T_DELTA_XY_SPACE,
             lang_label_type=steervla_rlds_dataset.LangLabelType.ROUTING_COMMAND,
             dataset_name_weight_mappings={
