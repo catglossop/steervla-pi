@@ -423,6 +423,13 @@ def main(config: _config.TrainConfig):
             *(d.name for d in data_config.steervla_datasets),
             *(d.name for d in data_config.steervla_hl_datasets),
         ]
+    # The eval loader applies Normalize iff the run does, so the visualizer must apply the matching
+    # inverse before converting to physical units. None when the run trains in raw (unnormalized)
+    # action space, which makes every unnormalize_for_eval call a no-op.
+    eval_norm_stats = None if config.skip_norm_stats else data_config.norm_stats
+    eval_proprio_norm = bool(data_config.steervla_proprio_norm) if data_config.steervla_rlds else True
+    # Meaningful leading state dims; the rest is zero padding out to model.action_dim.
+    eval_state_dim = 8 if data_config.steervla_include_ego_history else 2
 
     start_step = int(train_state.step)
     pbar = tqdm.tqdm(
@@ -469,6 +476,10 @@ def main(config: _config.TrainConfig):
                     action_dim=eval_action_dim,
                     output_action_format=eval_output_format,
                     dataset_names=eval_dataset_names,
+                    norm_stats=eval_norm_stats,
+                    use_quantile_norm=data_config.use_quantile_norm,
+                    proprio_norm=eval_proprio_norm,
+                    state_dim=eval_state_dim,
                 )
                 run_cot_visualization(
                     state=train_state,
@@ -480,6 +491,10 @@ def main(config: _config.TrainConfig):
                     action_dim=eval_action_dim,
                     model_action_dim=config.model.action_dim,
                     output_action_format=eval_output_format,
+                    norm_stats=eval_norm_stats,
+                    use_quantile_norm=data_config.use_quantile_norm,
+                    proprio_norm=eval_proprio_norm,
+                    state_dim=eval_state_dim,
                 )
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:

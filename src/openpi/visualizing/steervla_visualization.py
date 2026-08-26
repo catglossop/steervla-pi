@@ -22,10 +22,62 @@ import wandb
 import openpi.models.model as _model
 import openpi.shared.array_typing as at
 import openpi.training.utils as training_utils
+import openpi.transforms as _transforms
 import openpi.models.pi0_cot as pi0_cot
 from openpi.models.tokenizer import CoTPaligemmaTokenizer
 
 matplotlib.use("Agg")
+
+
+# ---------------------------------------------------------------------------
+# Norm-stat handling
+#
+# When a config trains with ``skip_norm_stats=False``, the model lives in normalized action/state
+# space, so ``denormalize_actions`` (which only undoes the fixed divisors baked into
+# ``steervla_rlds_dataset.py``) is not enough on its own -- the quantile normalization has to be
+# undone first. ``norm_stats=None`` reproduces the old behaviour exactly.
+# ---------------------------------------------------------------------------
+
+def unnormalize_for_eval(
+    values: np.ndarray,
+    norm_stats: dict[str, _transforms.NormStats] | None,
+    key: str,
+    *,
+    use_quantiles: bool = True,
+) -> np.ndarray:
+    """Undo training-time ``Normalize`` for one key. No-op when stats are absent."""
+    values = np.asarray(jax.device_get(values))
+    if not norm_stats or key not in norm_stats:
+        return values
+    out = _transforms.Unnormalize({key: norm_stats[key]}, use_quantiles=use_quantiles)({key: values})
+    return np.asarray(out[key])
+
+
+def initial_speeds_from_state(
+    state: np.ndarray,
+    *,
+    proprio_norm: bool,
+    state_dim: int | None = None,
+) -> np.ndarray:
+    """Current speed (m/s) from the ego state, laid out as interleaved ``[speed, course]`` pairs.
+
+    ``state_dim`` is the number of *meaningful* leading dimensions (2 without ego history, 8 with
+    it). It matters because ``PadStatesAndActions`` zero-pads state out to ``model.action_dim``
+    (32), so a plain ``state[:, -2]`` reads padding, not the current speed. The current speed is
+    the first element of the last real pair.
+
+    ``proprio_norm`` mirrors the loader flag: when the RLDS loader divided speed by 20, undo it;
+    when it did not (every current SteerVLA config sets ``proprio_norm=False``), the value is
+    already in m/s. The state passed here must already be norm-stat-unnormalized.
+    """
+    state = np.asarray(state)
+    if state.shape[-1] < 2:
+        return np.zeros(state.shape[0])
+    dim = state.shape[-1] if state_dim is None else min(state_dim, state.shape[-1])
+    if dim < 2:
+        return np.zeros(state.shape[0])
+    speeds = state[:, dim - 2]
+    return speeds * 20.0 if proprio_norm else speeds
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +359,37 @@ def eval_step(
     })
 
 
+def sample_actions_from_generated_cot(
+    model,
+    rng: at.KeyArrayLike,
+    observation: _model.Observation,
+    cot_out: dict,
+) -> np.ndarray:
+    """Actions conditioned on the model's *own* reasoning/subtask, as at deployment.
+
+    ``eval_step`` samples actions from the observation as it comes off the loader, which still
+    carries the ground-truth ``tokenized_reasoning`` / ``tokenized_subtask``. That measures
+    "actions given a perfect subtask" -- an oracle the deployed policy never has, since
+    ``Policy.infer_with_cot`` runs ``sample_cot`` first and feeds the generated tokens back in.
+
+    This mirrors ``infer_with_cot`` so the reported ADE/FDE tracks the deployed policy. Anything
+    that changes CoT generation quality (reasoning targets, CoT loss weight, decoding temperature)
+    is invisible to the oracle metric but shows up here.
+    """
+    gen_observation = observation.replace(
+        tokenized_reasoning=cot_out["tokenized_reasoning"],
+        tokenized_reasoning_mask=cot_out["tokenized_reasoning_mask"],
+        tokenized_subtask=cot_out["tokenized_subtask"],
+        tokenized_subtask_mask=cot_out["tokenized_subtask_mask"],
+    )
+    if "tokenized_fast" in cot_out and "tokenized_fast_mask" in cot_out:
+        gen_observation = gen_observation.replace(
+            tokenized_fast=cot_out["tokenized_fast"],
+            tokenized_fast_mask=cot_out["tokenized_fast_mask"],
+        )
+    return np.asarray(jax.device_get(model.sample_actions(rng, gen_observation)))
+
+
 # ---------------------------------------------------------------------------
 # Main visualization entry-point
 # ---------------------------------------------------------------------------
@@ -323,8 +406,17 @@ def run_visualization_evaluation(
     vis_samples: int = 5,
     dataset_names: Sequence[str] | None = None,
     accel_decel_vis_samples: int = 3,
+    norm_stats: dict[str, _transforms.NormStats] | None = None,
+    use_quantile_norm: bool = True,
+    proprio_norm: bool = False,
+    state_dim: int | None = None,
 ) -> dict[str, float]:
-    """Run evaluation on process 0 only; other hosts barrier-wait (no duplicate GPU eval)."""
+    """Run evaluation on process 0 only; other hosts barrier-wait (no duplicate GPU eval).
+
+    NOTE: the ADE/FDE reported here are *oracle-conditioned* -- ``eval_step`` samples actions from
+    the batch observation, which still carries the ground-truth reasoning/subtask. See
+    ``eval/gen_ade_*`` in ``run_cot_visualization`` for the deployed-path numbers.
+    """
     if jax.process_index() != 0:
         multihost_utils.sync_global_devices("steervla_eval_traj")
         return {}
@@ -332,8 +424,13 @@ def run_visualization_evaluation(
     try:
         eval_info = eval_step(state, rng, batch)
 
-        pred_actions = np.asarray(eval_info["pred_actions"])
-        gt_actions = np.asarray(eval_info["gt_actions"])
+        # Back out of normalized space before the fixed-divisor denormalization below.
+        pred_actions = unnormalize_for_eval(
+            eval_info["pred_actions"], norm_stats, "actions", use_quantiles=use_quantile_norm
+        )
+        gt_actions = unnormalize_for_eval(
+            eval_info["gt_actions"], norm_stats, "actions", use_quantiles=use_quantile_norm
+        )
 
         # Determine which samples carry action supervision (i.e., are NOT high-level / CoT-only).
         # HL samples have action_loss_mask=False for all timesteps and should be excluded
@@ -349,9 +446,10 @@ def run_visualization_evaluation(
         pred_denorm = denormalize_actions(pred_actions, action_dim, output_action_format)
         gt_denorm = denormalize_actions(gt_actions, action_dim, output_action_format)
 
-        # Extract initial speeds from state (last value before normalization, ×20 to undo /20)
-        states = np.asarray(jax.device_get(observation.state))
-        initial_speeds = states[:, -2] * 20.0 if states.shape[-1] >= 2 else np.zeros(states.shape[0])
+        states = unnormalize_for_eval(
+            observation.state, norm_stats, "state", use_quantiles=use_quantile_norm
+        )
+        initial_speeds = initial_speeds_from_state(states, proprio_norm=proprio_norm, state_dim=state_dim)
 
         # Compute waypoints
         pred_wp = compute_waypoints(pred_denorm, initial_speeds, dt, output_action_format)
@@ -667,6 +765,10 @@ def run_cot_visualization(
     model_action_dim: int | None = None,
     output_action_format: str | None = None,
     dt: float = 0.5,
+    norm_stats: dict[str, _transforms.NormStats] | None = None,
+    use_quantile_norm: bool = True,
+    proprio_norm: bool = False,
+    state_dim: int | None = None,
 ) -> None:
     """Log CoT visuals: autoregressive ``sample_cot`` vs ground-truth reasoning/subtask.
 
@@ -701,6 +803,7 @@ def run_cot_visualization(
         gt_actions = batch[1]
         cot_metrics = _cot_aux_metrics_from_eval(model, rng, observation, gt_actions)
 
+        cot_out = None
         if hasattr(model, "sample_cot"):
             cot_rng = jax.random.fold_in(rng, step)
             cot_out = model.sample_cot(cot_rng, observation, temperature=temperature)
@@ -733,9 +836,40 @@ def run_cot_visualization(
         else:
             non_hl_mask = np.ones(prompt_ids.shape[0], dtype=bool)
 
-        gt_actions_np = np.asarray(jax.device_get(gt_actions))
-        states = np.asarray(jax.device_get(observation.state))
-        initial_speeds = states[:, -2] * 20.0 if states.shape[-1] >= 2 else np.zeros(states.shape[0])
+        gt_actions_np = unnormalize_for_eval(
+            gt_actions, norm_stats, "actions", use_quantiles=use_quantile_norm
+        )
+        states = unnormalize_for_eval(
+            observation.state, norm_stats, "state", use_quantiles=use_quantile_norm
+        )
+        initial_speeds = initial_speeds_from_state(states, proprio_norm=proprio_norm, state_dim=state_dim)
+
+        # --- Deployed-path action metrics: condition on the model's own CoT, not the GT one. ---
+        # This is the number to compare runs on. ``eval/ade_*`` from run_visualization_evaluation
+        # conditions on the ground-truth subtask, which the deployed policy never has.
+        if cot_out is not None and np.any(non_hl_mask):
+            act_rng = jax.random.fold_in(rng, step + 1)
+            gen_actions = sample_actions_from_generated_cot(model, act_rng, observation, cot_out)
+            gen_actions = unnormalize_for_eval(
+                gen_actions, norm_stats, "actions", use_quantiles=use_quantile_norm
+            )
+            gen_denorm = denormalize_actions(gen_actions, action_dim, output_action_format)
+            gt_denorm_all = denormalize_actions(gt_actions_np, action_dim, output_action_format)
+            gen_wp = compute_waypoints(gen_denorm, initial_speeds, dt, output_action_format)
+            gt_wp_for_gen = compute_waypoints(gt_denorm_all, initial_speeds, dt, output_action_format)
+
+            gen_metrics = compute_trajectory_metrics(gen_wp[non_hl_mask], gt_wp_for_gen[non_hl_mask])
+            # Rename ade_/fde_ -> gen_ade_/gen_fde_ so both paths can be plotted side by side.
+            cot_metrics.update({k.replace("eval/", "eval/gen_"): v for k, v in gen_metrics.items()})
+            cot_metrics["eval/gen_action_mse"] = float(
+                np.mean(
+                    (
+                        gen_actions[non_hl_mask, ..., :action_dim]
+                        - gt_actions_np[non_hl_mask, ..., :action_dim]
+                    )
+                    ** 2
+                )
+            )
 
         fast_recon_actions = None
         fast_recon_wp = None
@@ -753,6 +887,11 @@ def run_cot_visualization(
                     for i in range(fast_ids.shape[0])
                 ],
                 axis=0,
+            )
+            # FAST tokens are built from the actions *after* Normalize (TokenizeCoTPrompt runs
+            # last), so the reconstruction lands in normalized space and needs the same inverse.
+            fast_recon_actions = unnormalize_for_eval(
+                fast_recon_actions, norm_stats, "actions", use_quantiles=use_quantile_norm
             )
             gt_denorm = denormalize_actions(gt_actions_np, action_dim, output_action_format)
             fast_denorm = denormalize_actions(fast_recon_actions, action_dim, output_action_format)

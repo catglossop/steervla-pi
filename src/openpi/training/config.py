@@ -663,12 +663,20 @@ class RLDSSteerVLACoTDataConfig(RLDSSteerVLADataConfig):
         )
 
 
+        # Derived from the model config so the emitted cameras and ``inputs_spec`` cannot disagree
+        # (``scripts/train.py`` validates the batch against the spec).
+        image_keys = getattr(model_config, "image_keys", None)
+
         data_transforms = _transforms.Group(
             inputs=[steervla_policy.SteerVLAInputs(
                 model_type=model_config.model_type,
-                speed_in_prompt=True,
+                # CoT injects the speed string here rather than in the RLDS loader; see
+                # ``steervla_speed_in_prompt=False`` below. Injecting in both places would put the
+                # speed in the prompt twice.
+                speed_in_prompt=self.speed_in_prompt,
                 include_ego_history=self.include_ego_history,
                 proprio_norm=False,
+                image_keys=image_keys,
             )],
             outputs=[steervla_policy.SteerVLAOutputs(action_dim=self.action_dim)],
         )
@@ -2163,6 +2171,148 @@ _CONFIGS = [
         checkpoint_base_dir="gs://cat-logs",
         resume=False,
         skip_norm_stats=True,
+    ),
+    #
+    # Baseline: ``pi05_steervla_cot_simplified_reasoning_no_ego_history``. Data mixture, action
+    # format, LR schedule and batch size are copied verbatim so this is a clean A/B against it.
+    # Four things change:
+    #
+    # 1. HL reasoning target reverted to ``gemini_refined_label``. In simplified_reasoning_dataset
+    #    that key holds traffic_light_status (4 distinct values), not the meta-action narration it
+    #    names in the simlingo_dataset_* family. ``commentary`` (the
+    #    ..._commentary variant) put a second, much richer text distribution on the reasoning head
+    #    with nothing in the input to disambiguate it from the LL family's ``commentary``, which is
+    #    38% the literal string "Follow the route.".
+    #
+    # 2. ``skip_norm_stats=False`` -- actions and state are actually normalized. Without it the
+    #    model trains on the fixed divisors in steervla_rlds_dataset.py, which leave the four
+    #    action dims on wildly different scales (measured over simlingo_dataset_all: dim0
+    #    std 0.196, dim1 std 0.074, dim2 mean 0.954 / std 0.096 -- delta_xy_space is never divided
+    #    at all -- dim3 std 0.272). Flow loss is a uniform MSE over dims, so per-dim gradient
+    #    tracks per-dim variance and time-domain lateral control gets ~4% of the learnable signal.
+    #    It also fixes the state channel: ``CoTPaligemmaTokenizer.tokenize_prompt`` discretizes
+    #    state against fixed [-1, 1] bins, so with proprio_norm=False every speed >= 1 m/s
+    #    saturated to token 255 and every course <= -1 deg produced token -1.
+    #
+    #    REQUIRES, before the first training step:
+    #        uv run --group rlds scripts/compute_norm_stats.py \
+    #            --config-name pi05_steervla_cot_norm_compact
+    #    Stats land in assets/<config name>/<repo_id>/, so they are already isolated from the rest
+    #    of the family; the distinct repo_id just makes the normalized variant obvious on disk.
+    #    Renaming this config orphans its stats -- point AssetsConfig at the old name instead.
+    #
+    # 3. Single camera + right-sized token budgets. The old prefix was 1160 tokens/sample
+    #    (768 image = 3x256 with two all-zero dummy streams, 200 prompt, 64 reasoning, 64 subtask,
+    #    64 FAST) against a measured ~93 actually used. Now 256 + 72 + 56 + 40 + 48 = 472, a 2.5x
+    #    cut in prefix length. The dummy streams were already masked out of attention, so
+    #    dropping them is a no-op for the math -- identical loss/actions up to bfloat16
+    #    accumulation order and identical CoT tokens, see
+    #    pi0_cot_test.test_dropping_masked_dummy_cameras_is_a_no_op -- and it saves two full
+    #    SigLIP forwards per sample.
+    #
+    #    Caps are set from untruncated segment lengths measured over the actual weighted mixture
+    #    (mean / p99 / max): prompt 48/61/64, reasoning 14/36/48, subtask 19/28/34. Each cap is
+    #    max + headroom rounded to a multiple of 8. Do not trim further without re-measuring --
+    #    ``_pad_or_truncate`` truncates from the front, so an overflowing segment silently loses
+    #    its ``<end_of_*>`` delimiter.
+    #
+    #    max_fast_len is measured on NORMALIZED actions (16.3/28/36), not raw ones (12.3/21/26):
+    #    normalizing widens the action range, which lengthens the FAST encoding. At 32 this
+    #    truncated 0.3% of samples. Re-measure if the norm stats or action format change.
+    #
+    #    NOTE: max_subtask_len / max_reasoning_len / max_fast_len exist on BOTH the model config
+    #    (drives inputs_spec) and the data config (drives the tokenizer). They must agree.
+    #
+    # 4. Eval now also reports the deployed path (``eval/gen_ade_*``, ``eval/gen_fde_*``,
+    #    ``eval/gen_action_mse``), sampling actions from the model's own generated CoT rather than
+    #    the ground-truth subtask. That is a code change in steervla_visualization.py and applies
+    #    to every CoT config; compare runs on the gen_* metrics, not the oracle ``eval/ade_*``.
+    #
+    # KNOWN ISSUE, left as an explicit decision rather than silently changed: action dim 2
+    # (delta_xy_space.x) is a near-constant ~0.95 with a long left tail. Quantile normalization
+    # maps its narrow q01..q99 band (0.507..0.9996) onto [-1, 1], which blows the tail out to
+    # roughly -3 and leaves dim2 with std 1.84 against 0.52 / 0.26 / 0.31 for dims 0/1/3 -- i.e.
+    # ~89% of the flow-loss variance lands on it. And it is largely redundant: space-frame steps
+    # are unit length (|(x, y)| = 0.9987 +/- 0.0064), so x = sqrt(1 - y^2) with R^2 = 0.993
+    # against dim3. Normalization is still the right call for dims 0/1/3 and for the state
+    # channel, but if dim2 dominates training, the fix is to stop emitting it:
+    # ``output_action_format=DELTA_XY_T_DELTA_COURSE_SPACE`` with ``action_dim=3`` carries the
+    # same heading information without the redundancy. That changes the policy's output contract,
+    # so the CARLA consumer has to change with it -- hence not done here.
+    #
+    TrainConfig(
+        name="pi05_steervla_cot_norm_compact",
+        model=pi0_config.Pi0CoTConfig(
+            action_dim=32,
+            action_horizon=10,
+            max_token_len=72,
+            max_subtask_len=40,
+            max_reasoning_len=56,
+            max_fast_len=48,
+            cot_loss_weight=0.1,
+            knowledge_insulation=False,
+            use_fast_tokens=True,
+            image_keys=("base_0_rgb",),
+        ),
+        data=RLDSSteerVLACoTDataConfig(
+            repo_id="steervla_simlingo_cot_normed",
+            rlds_data_dir="/raid/datasets/steervla",
+            dataset_format=steervla_rlds_dataset.DatasetFormat.SIMLINGO,
+            include_ego_history=False,
+            include_xy_action=False,
+            speed_in_prompt=True,
+            proprio_norm=False,
+            action_dim=4,
+            output_action_format=steervla_rlds_dataset.OutputActionFormat.DELTA_XY_T_DELTA_XY_SPACE,
+            lang_label_type=steervla_rlds_dataset.LangLabelType.ROUTING_COMMAND,
+            dataset_name_weight_mappings={
+                "simlingo_dataset_all_img512_1116": 1.0,
+                "simlingo_dataset_acceleration_negative5_img512_1116": 0.4,
+                "simlingo_dataset_acceleration_negative1_img512_1116": 0.2,
+                "simlingo_dataset_acceleration_positive1_img512_1116": 0.1,
+                "simlingo_dataset_acceleration_positive5_img512_1116": 0.2,
+                "simlingo_dataset_lateral_control12_img512_1116": 0.1,
+                "simlingo_dataset_lateral_control_higher5_img512_1116": 0.3,
+                "simlingo_dataset_start_from_stop_img512_1116": 0.2,
+                "simlingo_dataset_vehicle_front_img512_1116": 0.3,
+                "simlingo_dataset_vehicle_side_img512_1116": 0.1,
+                "simlingo_dataset_leading_object_vehicle_img512_1116": 0.05,
+                "simlingo_dataset_leading_object_traffic_stop_img512_1116": 0.2,
+                "simlingo_dataset_leading_object_traffic_light_img512_1116": 0.2,
+                "simlingo_dataset_leading_object_walker_img512_1116": 0.2,
+                "simlingo_dataset_changed_route_img512_1116": 0.2,
+                "simlingo_dataset_parking_lane_img512_1116": 0.3,
+            },
+            hl_dataset_name_weight_mappings={
+                "simplified_reasoning_dataset": 1.85,
+            },
+            hl_dataset_format=steervla_rlds_dataset.DatasetFormat.SIMLINGO,
+            hl_cot_reasoning_key="gemini_refined_label",
+            hl_cot_subtask_key="prompt",
+            max_subtask_len=40,
+            max_reasoning_len=56,
+            max_fast_len=48,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2e-5,
+            decay_steps=200_000,
+            decay_lr=1e-5,
+        ),
+        num_train_steps=200_000,
+        # Held at the baseline's 192 for a clean A/B. The shorter prefix leaves headroom to raise
+        # this -- keep it divisible by jax.device_count() (train.py asserts).
+        batch_size=192,
+        fsdp_devices=3,
+        log_interval=1,
+        eval_interval=100,
+        save_interval=2000,
+        max_to_keep=10,
+        num_workers=0,
+        checkpoint_base_dir="gs://cat-logs",
+        resume=False,
+        skip_norm_stats=False,
     ),
     TrainConfig(
         name="pi05_steervla_cot_simplified_reasoning_no_attention",
