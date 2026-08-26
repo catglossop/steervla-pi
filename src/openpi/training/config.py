@@ -2258,7 +2258,7 @@ _CONFIGS = [
     #
     #    REQUIRES, before the first training step:
     #        uv run --group rlds scripts/compute_norm_stats.py \
-    #            --config-name pi05_steervla_cot_norm_compact
+    #            --config-name pi05_steervla_cot_simplified_reasoning_norm
     #    Stats land in assets/<config name>/<repo_id>/, so they are already isolated from the rest
     #    of the family; the distinct repo_id just makes the normalized variant obvious on disk.
     #    Renaming this config orphans its stats -- point AssetsConfig at the old name instead.
@@ -2308,7 +2308,7 @@ _CONFIGS = [
     # (it reported excluding 156491/499968 rows = 31.3%, matching the 31.4% HL mixture weight).
     #
     TrainConfig(
-        name="pi05_steervla_cot_norm_compact",
+        name="pi05_steervla_cot_simplified_reasoning_norm",
         model=pi0_config.Pi0CoTConfig(
             action_dim=32,
             action_horizon=10,
