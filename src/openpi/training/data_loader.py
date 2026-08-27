@@ -166,6 +166,7 @@ def create_rlds_dataset(
             batch_size=batch_size,
             datasets=data_config.steervla_datasets,
             dataset_format=data_config.steervla_dataset_format,
+            ll_datasets=data_config.steervla_ll_datasets,
             hl_datasets=data_config.steervla_hl_datasets,
             hl_dataset_format=data_config.steervla_hl_dataset_format,
             cot_reasoning_key=data_config.steervla_cot_reasoning_key,

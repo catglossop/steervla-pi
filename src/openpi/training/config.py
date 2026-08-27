@@ -10,6 +10,7 @@ from typing import Any, Literal, Protocol, TypeAlias
 
 import etils.epath as epath
 import flax.nnx as nnx
+import numpy as np
 from typing_extensions import override
 import tyro
 
@@ -107,6 +108,8 @@ class DataConfig:
     steervla_dataset_format: steervla_rlds_dataset.DatasetFormat = steervla_rlds_dataset.DatasetFormat.NUSCENES
     # Optional high-level (reasoning/subtask-only) datasets for CoT training.
     steervla_hl_datasets: Sequence[steervla_rlds_dataset.SteerVLARLDSDataset] = ()
+    # Action-only sources: flow expert supervised, CoT cross-entropy switched off.
+    steervla_ll_datasets: Sequence[steervla_rlds_dataset.SteerVLARLDSDataset] = ()
     steervla_hl_dataset_format: steervla_rlds_dataset.DatasetFormat = steervla_rlds_dataset.DatasetFormat.NUSCENES
     steervla_cot_reasoning_key: str = "commentary"
     steervla_cot_subtask_key: str = "gemini_refined_label"
@@ -488,6 +491,85 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
         )
 
 
+# Relative sampling weights across the SimLingo scenario datasets. Shared by every SteerVLA
+# mixture so the scenario balance stays in one place; ``_mixture_share`` rescales the whole set to
+# a target share of the batch without disturbing the ratios between them.
+_SIMLINGO_SCENARIO_WEIGHTS = {
+    "simlingo_dataset_all_img512_1116": 1.0,
+    "simlingo_dataset_acceleration_negative5_img512_1116": 0.4,
+    "simlingo_dataset_acceleration_negative1_img512_1116": 0.2,
+    "simlingo_dataset_acceleration_positive1_img512_1116": 0.1,
+    "simlingo_dataset_acceleration_positive5_img512_1116": 0.2,
+    "simlingo_dataset_lateral_control12_img512_1116": 0.1,
+    "simlingo_dataset_lateral_control_higher5_img512_1116": 0.3,
+    "simlingo_dataset_start_from_stop_img512_1116": 0.2,
+    "simlingo_dataset_vehicle_front_img512_1116": 0.3,
+    "simlingo_dataset_vehicle_side_img512_1116": 0.1,
+    "simlingo_dataset_leading_object_vehicle_img512_1116": 0.05,
+    "simlingo_dataset_leading_object_traffic_stop_img512_1116": 0.2,
+    "simlingo_dataset_leading_object_traffic_light_img512_1116": 0.2,
+    "simlingo_dataset_leading_object_walker_img512_1116": 0.2,
+    "simlingo_dataset_changed_route_img512_1116": 0.2,
+    "simlingo_dataset_parking_lane_img512_1116": 0.3,
+}
+
+
+def _mixture_share(weights: dict[str, float], share: float) -> dict[str, float]:
+    """Rescale ``weights`` so they sum to ``share`` of the batch, preserving their ratios.
+
+    ``SteerVLARldsDataset`` normalises across every bucket it is given, so expressing each bucket
+    as its intended fraction of the batch makes the mixture readable at the call site: the shares
+    across buckets simply sum to 1.
+    """
+    total = sum(weights.values())
+    if total <= 0:
+        raise ValueError("Mixture weights must sum to a positive value")
+    return {name: weight / total * share for name, weight in weights.items()}
+
+
+def _exempt_dims_from_normalization(
+    norm_stats: dict[str, _transforms.NormStats] | None,
+    key: str,
+    dims: Sequence[int],
+) -> dict[str, _transforms.NormStats] | None:
+    """Make ``Normalize``/``Unnormalize`` the identity on selected dimensions of one stats key.
+
+    Both transforms are per-dimension affine maps driven entirely by the stats, so a dimension is
+    exempted purely by choosing stats whose map is the identity: ``mean=0, std=1`` for z-score and
+    ``q01=-1, q99=+1`` for quantile norm, since ``(x - (-1)) / 2 * 2 - 1 == x``. ``Unnormalize``
+    inverts that same map, so the round trip is preserved -- an exempted dimension reaches the
+    policy's consumer in exactly the units the dataset emitted, and the model's output space is
+    unchanged.
+
+    Use this for a dimension whose distribution makes quantile normalization actively harmful: a
+    narrow spike with a long tail, where mapping q01..q99 onto [-1, 1] inflates the tail and hands
+    the dimension a disproportionate share of the flow-matching loss.
+
+    ``training/checkpoints.py`` snapshots ``DataConfig.norm_stats`` into the checkpoint assets dir
+    and ``policies/policy_config.py`` serves from that snapshot, so applying this at config-load
+    time reaches inference too -- training and deployment cannot disagree.
+    """
+    if norm_stats is None or not dims:
+        return norm_stats
+    if key not in norm_stats:
+        raise ValueError(f"Cannot exempt dims {tuple(dims)}: no '{key}' norm stats (have {sorted(norm_stats)})")
+
+    stats = norm_stats[key]
+    width = np.asarray(stats.mean).shape[-1]
+    if bad := [d for d in dims if not 0 <= d < width]:
+        raise ValueError(f"Dim(s) {bad} out of range for '{key}' norm stats of width {width}")
+
+    idx = list(dims)
+    mean, std = np.array(stats.mean), np.array(stats.std)
+    mean[idx], std[idx] = 0.0, 1.0
+    q01 = None if stats.q01 is None else np.array(stats.q01)
+    q99 = None if stats.q99 is None else np.array(stats.q99)
+    if q01 is not None and q99 is not None:
+        q01[idx], q99[idx] = -1.0, 1.0
+
+    return {**norm_stats, key: _transforms.NormStats(mean=mean, std=std, q01=q01, q99=q99)}
+
+
 @dataclasses.dataclass(frozen=True)
 class RLDSSteerVLADataConfig(DataConfigFactory):
     """
@@ -510,6 +592,11 @@ class RLDSSteerVLADataConfig(DataConfigFactory):
     proprio_norm: bool = True
     action_dim: int = 2
 
+    # Action dimensions passed through ``Normalize``/``Unnormalize`` untouched, indexed into the
+    # pre-padding action vector. The model's output space is unchanged; an exempted dim just keeps
+    # the units the RLDS loader emitted. See ``_exempt_dims_from_normalization``.
+    unnormalized_action_dims: tuple[int, ...] = ()
+
     # Option 1: explicit dataset list.
     datasets: Sequence[steervla_rlds_dataset.SteerVLARLDSDataset] = ()
 
@@ -522,6 +609,18 @@ class RLDSSteerVLADataConfig(DataConfigFactory):
     lang_label_type: tyro.conf.Suppress[steervla_rlds_dataset.LangLabelType] = steervla_rlds_dataset.LangLabelType.ROUTING_COMMAND
     routing_command_in_prompt: bool = False
     add_suffix_to_prompt: bool = False
+
+    def _base_config(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        """``create_base_config`` plus any declared per-dimension normalization exemptions."""
+        base = self.create_base_config(assets_dirs, model_config)
+        if not self.unnormalized_action_dims:
+            return base
+        return dataclasses.replace(
+            base,
+            norm_stats=_exempt_dims_from_normalization(
+                base.norm_stats, "actions", self.unnormalized_action_dims
+            ),
+        )
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -569,7 +668,7 @@ class RLDSSteerVLADataConfig(DataConfigFactory):
         assert self.rlds_data_dir is not None, "Need to set rlds_data_dir for RLDS data loader."
 
         return dataclasses.replace(
-            self.create_base_config(assets_dirs, model_config),
+            self._base_config(assets_dirs, model_config),
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
@@ -603,6 +702,11 @@ class RLDSSteerVLACoTDataConfig(RLDSSteerVLADataConfig):
     max_fast_len: int = 64
     # Optional high-level (reasoning/subtask-only) datasets.
     hl_dataset_name_weight_mappings: tyro.conf.Suppress[dict[str, float] | None] = None
+    # Optional action-only datasets: the flow expert is supervised, the CoT cross-entropy is not.
+    # Names may repeat those in ``dataset_name_weight_mappings`` -- the same corpus can be drawn
+    # from twice under different supervision, which is how a mixture like
+    # "20% full updates / 70% action-only" over one corpus is expressed.
+    ll_dataset_name_weight_mappings: tyro.conf.Suppress[dict[str, float] | None] = None
     hl_dataset_version: tyro.conf.Suppress[str | None] = None
     hl_dataset_format: tyro.conf.Suppress[steervla_rlds_dataset.DatasetFormat | None] = None
     # Source keys for CoT targets.
@@ -617,6 +721,15 @@ class RLDSSteerVLACoTDataConfig(RLDSSteerVLADataConfig):
         if self.dataset_name_weight_mappings is not None:
             for name, weight in self.dataset_name_weight_mappings.items():
                 resolved_datasets.append(
+                    steervla_rlds_dataset.SteerVLARLDSDataset(
+                        name=name, weight=weight, version=self.dataset_version,
+                    )
+                )
+
+        resolved_ll_datasets: list[steervla_rlds_dataset.SteerVLARLDSDataset] = []
+        if self.ll_dataset_name_weight_mappings is not None:
+            for name, weight in self.ll_dataset_name_weight_mappings.items():
+                resolved_ll_datasets.append(
                     steervla_rlds_dataset.SteerVLARLDSDataset(
                         name=name, weight=weight, version=self.dataset_version,
                     )
@@ -639,9 +752,9 @@ class RLDSSteerVLACoTDataConfig(RLDSSteerVLADataConfig):
         # heads alone. ``SteerVLARldsDataset`` concatenates ``datasets`` and ``hl_datasets`` into
         # one weighted source list, so an empty ``datasets`` is fine downstream. Only require
         # that the mixture is not *entirely* empty.
-        assert len(resolved_datasets) + len(resolved_hl_datasets) > 0, (
+        assert len(resolved_datasets) + len(resolved_ll_datasets) + len(resolved_hl_datasets) > 0, (
             "Must specify at least one dataset via `datasets`, `dataset_name_weight_mappings`, "
-            "or `hl_dataset_name_weight_mappings`."
+            "`ll_dataset_name_weight_mappings`, or `hl_dataset_name_weight_mappings`."
         )
 
         repack_transform = _transforms.Group(
@@ -653,6 +766,7 @@ class RLDSSteerVLACoTDataConfig(RLDSSteerVLADataConfig):
                         "observation/current_speed": "observation/current_speed",
                         "actions": "actions",
                         "action_loss_mask": "action_loss_mask",
+                        "cot_loss_mask": "cot_loss_mask",
                         "prompt": "prompt",
                         "subtask": "subtask",
                         "reasoning": "reasoning",
@@ -663,12 +777,20 @@ class RLDSSteerVLACoTDataConfig(RLDSSteerVLADataConfig):
         )
 
 
+        # Derived from the model config so the emitted cameras and ``inputs_spec`` cannot disagree
+        # (``scripts/train.py`` validates the batch against the spec).
+        image_keys = getattr(model_config, "image_keys", None)
+
         data_transforms = _transforms.Group(
             inputs=[steervla_policy.SteerVLAInputs(
                 model_type=model_config.model_type,
-                speed_in_prompt=True,
+                # CoT injects the speed string here rather than in the RLDS loader; see
+                # ``steervla_speed_in_prompt=False`` below. Injecting in both places would put the
+                # speed in the prompt twice.
+                speed_in_prompt=self.speed_in_prompt,
                 include_ego_history=self.include_ego_history,
                 proprio_norm=False,
+                image_keys=image_keys,
             )],
             outputs=[steervla_policy.SteerVLAOutputs(action_dim=self.action_dim)],
         )
@@ -694,7 +816,7 @@ class RLDSSteerVLACoTDataConfig(RLDSSteerVLADataConfig):
         assert self.rlds_data_dir is not None
 
         return dataclasses.replace(
-            self.create_base_config(assets_dirs, model_config),
+            self._base_config(assets_dirs, model_config),
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
@@ -702,6 +824,7 @@ class RLDSSteerVLACoTDataConfig(RLDSSteerVLADataConfig):
             rlds_data_dir=self.rlds_data_dir,
             steervla_datasets=tuple(resolved_datasets),
             steervla_dataset_format=self.dataset_format,
+            steervla_ll_datasets=tuple(resolved_ll_datasets),
             steervla_hl_datasets=tuple(resolved_hl_datasets),
             steervla_hl_dataset_format=self.hl_dataset_format or self.dataset_format,
             steervla_cot_reasoning_key=self.cot_reasoning_key,
@@ -1957,6 +2080,7 @@ _CONFIGS = [
     # ``combined = flow_loss + cot_loss_weight * cot_loss`` (pi0_cot.py:476) with flow_loss
     # identically zero, so leaving it at 0.1 would just scale every gradient down 10x.
     #
+    
     TrainConfig(
         name="pi05_steervla_cast_hl_finetune_cot_only",
         model=pi0_config.Pi0CoTConfig(
@@ -2163,6 +2287,241 @@ _CONFIGS = [
         checkpoint_base_dir="gs://cat-logs",
         resume=False,
         skip_norm_stats=True,
+    ),
+    #
+    # Baseline: ``pi05_steervla_cot_simplified_reasoning_no_ego_history``. Data mixture, action
+    # format, LR schedule and batch size are copied verbatim so this is a clean A/B against it.
+    # Four things change:
+    #
+    # 1. HL reasoning target reverted to ``gemini_refined_label``. In simplified_reasoning_dataset
+    #    that key holds traffic_light_status (4 distinct values), not the meta-action narration it
+    #    names in the simlingo_dataset_* family. ``commentary`` (the
+    #    ..._commentary variant) put a second, much richer text distribution on the reasoning head
+    #    with nothing in the input to disambiguate it from the LL family's ``commentary``, which is
+    #    38% the literal string "Follow the route.".
+    #
+    # 2. ``skip_norm_stats=False`` -- actions and state are actually normalized. Without it the
+    #    model trains on the fixed divisors in steervla_rlds_dataset.py, which leave the four
+    #    action dims on unrelated scales: dim0 std 0.196, dim1 std 0.074, dim2 mean 0.954 /
+    #    std 0.096 (delta_xy_space is never divided at all), dim3 std 0.272. Flow loss is a
+    #    uniform MSE over dims, so per-dim gradient tracks per-dim variance -- see the table
+    #    below; unnormalized, dim3 takes 59% of the budget and time-domain lateral control
+    #    (dim1) gets 7%. Normalizing brings the spread from 2.9x down to 1.8x.
+    #    It also fixes the state channel: ``CoTPaligemmaTokenizer.tokenize_prompt`` discretizes
+    #    state against fixed [-1, 1] bins, so with proprio_norm=False every speed >= 1 m/s
+    #    saturated to token 255 and every course <= -1 deg produced token -1.
+    #
+    #    REQUIRES, before the first training step:
+    #        uv run --group rlds scripts/compute_norm_stats.py \
+    #            --config-name pi05_steervla_cot_simplified_reasoning_norm
+    #    Stats land in assets/<config name>/<repo_id>/, so they are already isolated from the rest
+    #    of the family; the distinct repo_id just makes the normalized variant obvious on disk.
+    #    Renaming this config orphans its stats -- point AssetsConfig at the old name instead.
+    #
+    # 3. Single camera + right-sized token budgets. The old prefix was 1160 tokens/sample
+    #    (768 image = 3x256 with two all-zero dummy streams, 200 prompt, 64 reasoning, 64 subtask,
+    #    64 FAST) against a measured ~93 actually used. Now 256 + 72 + 56 + 40 + 48 = 472, a 2.5x
+    #    cut in prefix length. The dummy streams were already masked out of attention, so
+    #    dropping them is a no-op for the math -- identical loss/actions up to bfloat16
+    #    accumulation order and identical CoT tokens, see
+    #    pi0_cot_test.test_dropping_masked_dummy_cameras_is_a_no_op -- and it saves two full
+    #    SigLIP forwards per sample.
+    #
+    #    Caps are set from untruncated segment lengths measured over the actual weighted mixture
+    #    (mean / p99 / max): prompt 48/61/64, reasoning 14/36/48, subtask 19/28/34. Each cap is
+    #    max + headroom rounded to a multiple of 8. Do not trim further without re-measuring --
+    #    ``_pad_or_truncate`` truncates from the front, so an overflowing segment silently loses
+    #    its ``<end_of_*>`` delimiter.
+    #
+    #    max_fast_len is measured on NORMALIZED actions (16.3/28/36), not raw ones (12.3/21/26):
+    #    normalizing widens the action range, which lengthens the FAST encoding. At 32 this
+    #    truncated 0.3% of samples. Re-measure if the norm stats or action format change.
+    #
+    #    NOTE: max_subtask_len / max_reasoning_len / max_fast_len exist on BOTH the model config
+    #    (drives inputs_spec) and the data config (drives the tokenizer). They must agree.
+    #
+    # 4. Eval now also reports the deployed path (``eval/gen_ade_*``, ``eval/gen_fde_*``,
+    #    ``eval/gen_action_mse``), sampling actions from the model's own generated CoT rather than
+    #    the ground-truth subtask. That is a code change in steervla_visualization.py and applies
+    #    to every CoT config; compare runs on the gen_* metrics, not the oracle ``eval/ade_*``.
+    #
+    # On measuring per-dim action balance: filter to action-supervised rows first. The HL
+    # dataset carries dummy (zero) actions and an all-False action_loss_mask, so its rows
+    # contribute nothing to the flow loss -- but they are ~31% of the mixture, and on dim 2 a
+    # dummy zero normalizes to -3.06, which makes an unfiltered measurement look like dim 2 has
+    # a huge tail. Variance share over real-action (simlingo_dataset_*) rows only:
+    #
+    #        dim              0      1      2      3     spread
+    #        no norm       26.3%   7.2%   7.6%  58.9%      2.9x
+    #        normalized    41.9%  13.0%  25.3%  19.9%      1.8x   <- this config
+    #
+    # Plain quantile normalization is the best balance available here, so no dimension is
+    # exempted. ``RLDSSteerVLADataConfig.unnormalized_action_dims`` exists if a future action
+    # layout needs it, but leaving it empty is correct for this one.
+    #
+    # ``compute_norm_stats.py`` already applies the same filter when building the stats
+    # (it reported excluding 156491/499968 rows = 31.3%, matching the 31.4% HL mixture weight).
+    #
+    TrainConfig(
+        name="pi05_steervla_cot_simplified_reasoning_norm",
+        model=pi0_config.Pi0CoTConfig(
+            action_dim=32,
+            action_horizon=10,
+            max_token_len=72,
+            max_subtask_len=40,
+            max_reasoning_len=56,
+            max_fast_len=48,
+            cot_loss_weight=0.1,
+            knowledge_insulation=False,
+            use_fast_tokens=True,
+            image_keys=("base_0_rgb",),
+        ),
+        data=RLDSSteerVLACoTDataConfig(
+            repo_id="steervla_simlingo_cot_normed",
+            rlds_data_dir="/raid/datasets/steervla",
+            dataset_format=steervla_rlds_dataset.DatasetFormat.SIMLINGO,
+            include_ego_history=False,
+            include_xy_action=False,
+            speed_in_prompt=True,
+            proprio_norm=False,
+            action_dim=4,
+            output_action_format=steervla_rlds_dataset.OutputActionFormat.DELTA_XY_T_DELTA_XY_SPACE,
+            lang_label_type=steervla_rlds_dataset.LangLabelType.ROUTING_COMMAND,
+            dataset_name_weight_mappings={
+                "simlingo_dataset_all_img512_1116": 1.0,
+                "simlingo_dataset_acceleration_negative5_img512_1116": 0.4,
+                "simlingo_dataset_acceleration_negative1_img512_1116": 0.2,
+                "simlingo_dataset_acceleration_positive1_img512_1116": 0.1,
+                "simlingo_dataset_acceleration_positive5_img512_1116": 0.2,
+                "simlingo_dataset_lateral_control12_img512_1116": 0.1,
+                "simlingo_dataset_lateral_control_higher5_img512_1116": 0.3,
+                "simlingo_dataset_start_from_stop_img512_1116": 0.2,
+                "simlingo_dataset_vehicle_front_img512_1116": 0.3,
+                "simlingo_dataset_vehicle_side_img512_1116": 0.1,
+                "simlingo_dataset_leading_object_vehicle_img512_1116": 0.05,
+                "simlingo_dataset_leading_object_traffic_stop_img512_1116": 0.2,
+                "simlingo_dataset_leading_object_traffic_light_img512_1116": 0.2,
+                "simlingo_dataset_leading_object_walker_img512_1116": 0.2,
+                "simlingo_dataset_changed_route_img512_1116": 0.2,
+                "simlingo_dataset_parking_lane_img512_1116": 0.3,
+            },
+            hl_dataset_name_weight_mappings={
+                "simplified_reasoning_dataset": 1.85,
+            },
+            hl_dataset_format=steervla_rlds_dataset.DatasetFormat.SIMLINGO,
+            hl_cot_reasoning_key="gemini_refined_label",
+            hl_cot_subtask_key="prompt",
+            max_subtask_len=40,
+            max_reasoning_len=56,
+            max_fast_len=48,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2e-5,
+            decay_steps=200_000,
+            decay_lr=1e-5,
+        ),
+        num_train_steps=200_000,
+        # Held at the baseline's 192 for a clean A/B. The shorter prefix leaves headroom to raise
+        # this -- keep it divisible by jax.device_count() (train.py asserts).
+        batch_size=192,
+        fsdp_devices=3,
+        log_interval=1,
+        eval_interval=100,
+        save_interval=2000,
+        max_to_keep=10,
+        num_workers=0,
+        checkpoint_base_dir="gs://cat-logs",
+        resume=False,
+        skip_norm_stats=False,
+    ),
+    #
+    # Three-way supervision mixture, derived from pi05_steervla_cot_simplified_reasoning_norm.
+    # Identical model, action format, normalization and schedule; only the mixture differs.
+    #
+    #   10%  simplified_reasoning_dataset   CoT only    (dummy actions -> flow loss zeroed)
+    #   20%  simlingo scenarios             flow + CoT  (a full update)
+    #   70%  simlingo scenarios             flow only   (CoT text is context, not a target)
+    #
+    # Motivation: the CoT heads fit their targets within ~2k steps (cot_subtask_ce plateaus around
+    # 0.5-0.6, cot_reasoning_ce below 0.1), after which most of the CoT gradient is spent
+    # re-learning what the model already knows. Shifting the balance toward action-only updates
+    # spends that capacity on the flow expert instead, while keeping enough CoT supervision to
+    # stop the reasoning/subtask heads drifting.
+    #
+    # The 20% and 70% buckets draw from the SAME corpus at the same scenario ratios -- a dataset
+    # name may appear in both ``dataset_name_weight_mappings`` and
+    # ``ll_dataset_name_weight_mappings``, and each occurrence becomes its own weighted source.
+    #
+    # "Flow only" gates the CoT cross-entropy per sample (``Observation.cot_loss_mask``); it does
+    # NOT remove the CoT segments from the prefix. The action expert still attends to a
+    # ground-truth subtask on every sample, so this does not by itself narrow the oracle-vs-
+    # generated gap that ``eval/gen_ade_*`` measures -- that needs subtask dropout or scheduled
+    # sampling, which is a separate change.
+    #
+    # Check the realised mixture in wandb: ``train/cot_supervised_frac`` should sit near 0.30
+    # (10% CoT-only + 20% full) and ``train/action_supervised_frac`` near 0.90 (20% + 70%).
+    #
+    TrainConfig(
+        name="pi05_steervla_cot_simplified_reasoning_norm_ll_heavy",
+        model=pi0_config.Pi0CoTConfig(
+            action_dim=32,
+            action_horizon=10,
+            max_token_len=72,
+            max_subtask_len=40,
+            max_reasoning_len=56,
+            max_fast_len=48,
+            cot_loss_weight=0.1,
+            knowledge_insulation=False,
+            use_fast_tokens=True,
+            image_keys=("base_0_rgb",),
+        ),
+        data=RLDSSteerVLACoTDataConfig(
+            # Same corpus, action format and state layout as the _norm config, so its norm stats
+            # apply unchanged -- the mixture shifts which rows are drawn, not what a row contains.
+            repo_id="steervla_simlingo_cot_normed",
+            assets=AssetsConfig(
+                assets_dir="./assets/pi05_steervla_cot_simplified_reasoning_norm",
+                asset_id="steervla_simlingo_cot_normed",
+            ),
+            rlds_data_dir="/raid/datasets/steervla",
+            dataset_format=steervla_rlds_dataset.DatasetFormat.SIMLINGO,
+            include_ego_history=False,
+            include_xy_action=False,
+            speed_in_prompt=True,
+            proprio_norm=False,
+            action_dim=4,
+            output_action_format=steervla_rlds_dataset.OutputActionFormat.DELTA_XY_T_DELTA_XY_SPACE,
+            lang_label_type=steervla_rlds_dataset.LangLabelType.ROUTING_COMMAND,
+            dataset_name_weight_mappings=_mixture_share(_SIMLINGO_SCENARIO_WEIGHTS, 0.20),
+            ll_dataset_name_weight_mappings=_mixture_share(_SIMLINGO_SCENARIO_WEIGHTS, 0.70),
+            hl_dataset_name_weight_mappings={"simplified_reasoning_dataset": 0.10},
+            hl_dataset_format=steervla_rlds_dataset.DatasetFormat.SIMLINGO,
+            hl_cot_reasoning_key="gemini_refined_label",
+            hl_cot_subtask_key="prompt",
+            max_subtask_len=40,
+            max_reasoning_len=56,
+            max_fast_len=48,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2e-5,
+            decay_steps=200_000,
+            decay_lr=1e-5,
+        ),
+        num_train_steps=200_000,
+        batch_size=384,
+        fsdp_devices=4,
+        log_interval=1,
+        eval_interval=100,
+        save_interval=2000,
+        max_to_keep=10,
+        num_workers=0,
+        checkpoint_base_dir="gs://cat-logs",
+        resume=False,
+        skip_norm_stats=False,
     ),
     TrainConfig(
         name="pi05_steervla_cot_simplified_reasoning_no_attention",

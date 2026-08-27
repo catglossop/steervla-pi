@@ -96,6 +96,12 @@ class SteerVLAInputs(transforms.DataTransformFn):
     speed_in_prompt: bool = True
     include_ego_history: bool = True
     proprio_norm: bool = True
+    # Camera streams to emit. ``None`` keeps the historical behaviour of emitting all three
+    # PaliGemma slots, with the two wrist slots filled with zeros and masked off. Driving is
+    # single-camera, so those two are pure padding: masked-off image tokens are excluded from
+    # attention but still cost a SigLIP forward and 2x256 dead prefix positions per sample.
+    # Set ``("base_0_rgb",)`` to drop them. Must match ``Pi0CoTConfig.image_keys``.
+    image_keys: tuple[str, ...] | None = None
 
     def __call__(self, data: dict) -> dict:
         base_image = _parse_image(data["observation/image"])
@@ -117,16 +123,31 @@ class SteerVLAInputs(transforms.DataTransformFn):
             case _:
                 raise ValueError(f"Unsupported model type: {self.model_type}")
 
+        image_dict = dict(zip(names, images, strict=True))
+        image_mask_dict = dict(zip(names, image_masks, strict=True))
+
+        if self.image_keys is not None:
+            missing = set(self.image_keys) - set(image_dict)
+            if missing:
+                raise ValueError(
+                    f"image_keys {sorted(missing)} are not produced for model_type={self.model_type}; "
+                    f"available: {sorted(image_dict)}"
+                )
+            image_dict = {k: image_dict[k] for k in self.image_keys}
+            image_mask_dict = {k: image_mask_dict[k] for k in self.image_keys}
+
         inputs = {
             "state": state,
-            "image": dict(zip(names, images, strict=True)),
-            "image_mask": dict(zip(names, image_masks, strict=True)),
+            "image": image_dict,
+            "image_mask": image_mask_dict,
         }
 
         if "actions" in data:
             inputs["actions"] = np.asarray(data["actions"], dtype=np.float32)
         if "action_loss_mask" in data:
             inputs["action_loss_mask"] = np.asarray(data["action_loss_mask"], dtype=np.bool_)
+        if "cot_loss_mask" in data:
+            inputs["cot_loss_mask"] = np.asarray(data["cot_loss_mask"], dtype=np.bool_)
         if "dataset_id" in data:
             inputs["dataset_id"] = np.asarray(data["dataset_id"], dtype=np.int32)
 

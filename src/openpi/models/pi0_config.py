@@ -143,10 +143,22 @@ class Pi0CoTConfig(_model.BaseModelConfig):
     # Supervise FAST-discretized actions in the VLM prefix (after subtask).
     use_fast_tokens: bool = False
 
-    # If set, :meth:`Pi0CoT.sample_cot` / :meth:`Pi0CoT.sample_actions` pass this to
-    # ``preprocess_observation(..., image_keys=...)`` when the call does not pass
-    # ``image_keys`` explicitly. Example: ``("base_0_rgb",)`` for single-camera CARLA
-    # (skip wrist streams). ``None`` means use all :data:`openpi.models.model.IMAGE_KEYS`.
+    # Camera streams the model consumes, in *both* training and inference. ``None`` means all of
+    # :data:`openpi.models.model.IMAGE_KEYS`, which is what upstream pi0 assumes.
+    #
+    # Single-camera setups (SteerVLA/CARLA) should set ``("base_0_rgb",)``. The dummy wrist streams
+    # are already inert -- their ``image_mask`` is False, so ``_build_attention_mask`` zeroes their
+    # columns -- but they still cost a full SigLIP forward each and carry 2x256 dead tokens through
+    # every Gemma layer. Dropping them is mathematically a no-op and a large compute win.
+    #
+    # This also drives :meth:`inputs_spec`, so ``scripts/train.py`` batch validation and the data
+    # transforms stay in agreement (see ``SteerVLAInputs.image_keys``).
+    image_keys: tuple[str, ...] | None = None
+
+    # Inference-only override of :attr:`image_keys`, applied by :meth:`Pi0CoT.sample_cot` /
+    # :meth:`Pi0CoT.sample_actions` when the call does not pass ``image_keys`` explicitly. Use this
+    # to serve a checkpoint trained on all three streams from a single-camera rig; prefer
+    # :attr:`image_keys` when training a new model.
     inference_image_keys: tuple[str, ...] | None = None
 
     # CoT autoregressive single-step kernels in :meth:`Pi0CoT.sample_cot` use lazy post-restore
@@ -170,6 +182,11 @@ class Pi0CoTConfig(_model.BaseModelConfig):
     def model_type(self) -> _model.ModelType:
         return _model.ModelType.PI05
 
+    @property
+    def resolved_image_keys(self) -> tuple[str, ...]:
+        """Camera streams used for training and for :meth:`inputs_spec`."""
+        return tuple(self.image_keys) if self.image_keys is not None else tuple(_model.IMAGE_KEYS)
+
     @override
     def create(self, rng: at.KeyArrayLike) -> "Pi0CoT":
         from openpi.models.pi0_cot import Pi0CoT
@@ -188,18 +205,12 @@ class Pi0CoTConfig(_model.BaseModelConfig):
                 "tokenized_fast_mask": jax.ShapeDtypeStruct([batch_size, self.max_fast_len], bool),
             }
 
+        image_keys = self.resolved_image_keys
+
         with at.disable_typechecking():
             observation_spec = _model.Observation(
-                images={
-                    "base_0_rgb": image_spec,
-                    "left_wrist_0_rgb": image_spec,
-                    "right_wrist_0_rgb": image_spec,
-                },
-                image_masks={
-                    "base_0_rgb": image_mask_spec,
-                    "left_wrist_0_rgb": image_mask_spec,
-                    "right_wrist_0_rgb": image_mask_spec,
-                },
+                images=dict.fromkeys(image_keys, image_spec),
+                image_masks=dict.fromkeys(image_keys, image_mask_spec),
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
@@ -208,6 +219,7 @@ class Pi0CoTConfig(_model.BaseModelConfig):
                 tokenized_reasoning=jax.ShapeDtypeStruct([batch_size, self.max_reasoning_len], jnp.int32),
                 tokenized_reasoning_mask=jax.ShapeDtypeStruct([batch_size, self.max_reasoning_len], bool),
                 action_loss_mask=jax.ShapeDtypeStruct([batch_size, self.action_horizon], jnp.bool_),
+                cot_loss_mask=jax.ShapeDtypeStruct([batch_size], jnp.bool_),
                 **fast_spec,
             )
         action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)

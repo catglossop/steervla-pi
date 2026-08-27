@@ -130,10 +130,12 @@ class Pi0CoT(_model.BaseModel):
         self.max_reasoning_len = config.max_reasoning_len
         self.max_fast_len = config.max_fast_len
         self._use_fast_tokens = config.use_fast_tokens
+        # Camera streams consumed during training (and the default at inference).
+        self._image_keys: tuple[str, ...] = config.resolved_image_keys
         self._preprocess_image_keys: tuple[str, ...] = (
             tuple(config.inference_image_keys)
             if config.inference_image_keys is not None
-            else tuple(_model.IMAGE_KEYS)
+            else self._image_keys
         )
         self._cot_jit_decode = bool(config.cot_jit_decode)
         self._cot_jit_transformer_forward = bool(config.cot_jit_transformer_forward)
@@ -171,10 +173,17 @@ class Pi0CoT(_model.BaseModel):
     def _gather_last_valid_hidden(
         prefix_out: jnp.ndarray, prefix_mask: jnp.ndarray
     ) -> jnp.ndarray:
-        """Last valid timestep hidden state (b, 1, d) for next-token prediction."""
-        # idx = num_valid - 1, clamped (handles empty-mask edge case).
-        num_valid = jnp.sum(prefix_mask, axis=1)
-        idx = jnp.clip(num_valid - 1, 0, prefix_out.shape[1] - 1)
+        """Last valid timestep hidden state (b, 1, d) for next-token prediction.
+
+        Uses the index of the last ``True`` in ``prefix_mask``, NOT ``num_valid - 1``: valid
+        positions are not left-packed. An unused camera contributes a full block of masked-out
+        image tokens *before* the prompt, so with three streams and only ``base_0_rgb`` populated,
+        ``num_valid - 1`` lands inside the second (all-zero, masked) camera instead of on the last
+        prompt token -- which silently pointed ``first_reasoning_ce`` at a garbage hidden state.
+        """
+        pos = jnp.arange(prefix_mask.shape[1])
+        last_valid = jnp.max(jnp.where(prefix_mask, pos[None, :], -1), axis=1)
+        idx = jnp.clip(last_valid, 0, prefix_out.shape[1] - 1)  # clamp handles an all-False row
         b = prefix_out.shape[0]
         batch_i = jnp.arange(b)
         return prefix_out[batch_i, idx, :][:, None, :]
@@ -304,7 +313,9 @@ class Pi0CoT(_model.BaseModel):
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> tuple[jnp.ndarray, dict[str, jnp.ndarray]]:
         preprocess_rng, noise_rng, time_rng, ctx_time_rng, ctx_noise_rng = jax.random.split(rng, 5)
-        observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+        observation = _model.preprocess_observation(
+            preprocess_rng, observation, train=train, image_keys=self._image_keys
+        )
 
         batch_shape = actions.shape[:-2]
         noise = jax.random.normal(noise_rng, actions.shape)
@@ -471,6 +482,14 @@ class Pi0CoT(_model.BaseModel):
 
         cot_loss = reasoning_ce + subtask_ce + first_reasoning_ce + first_subtask_ce + fast_ce + first_fast_ce
 
+        # Per-sample CoT gate: mirrors ``action_loss_mask`` on the flow side. A False row still
+        # contributes its CoT segments as prefix context (the action expert keeps attending to the
+        # subtask) but back-propagates nothing through the token predictions -- i.e. it trains the
+        # action expert only. Note the individual ``cot_*_ce`` metrics below stay UNmasked, so they
+        # remain comparable across mixtures; only ``cot_loss`` reflects what is optimised.
+        if observation.cot_loss_mask is not None:
+            cot_loss = cot_loss * observation.cot_loss_mask.astype(cot_loss.dtype)
+
         # Combine: flow loss is per-timestep (batch, horizon), cot_loss is scalar per batch
         # Broadcast cot_loss to match flow_loss shape for the return
         combined = flow_loss + self.cot_loss_weight * cot_loss[:, None]
@@ -484,6 +503,14 @@ class Pi0CoT(_model.BaseModel):
             "cot_fast_ce": fast_ce,
             "cot_first_fast_ce": first_fast_ce,
         }
+        # Realised supervision mix of the batch, so a weighted three-bucket mixture can be checked
+        # against what was intended rather than assumed.
+        if observation.cot_loss_mask is not None:
+            metrics["cot_supervised_frac"] = jnp.mean(observation.cot_loss_mask.astype(jnp.float32))
+        if observation.action_loss_mask is not None:
+            metrics["action_supervised_frac"] = jnp.mean(
+                jnp.any(observation.action_loss_mask, axis=-1).astype(jnp.float32)
+            )
         if t_context is not None:
             metrics["t_context"] = t_context
             # Flow loss on the cleanest and noisiest halves of the batch, to see the imitation and

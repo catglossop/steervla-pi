@@ -119,6 +119,12 @@ class Observation(Generic[ArrayT]):
     tokenized_fast_mask: at.Bool[ArrayT, "*b lf"] | None = None
     # Optional per-timestep action loss mask (e.g., disable action supervision on HL-only samples).
     action_loss_mask: at.Bool[ArrayT, "*b ah"] | None = None
+    # Optional per-sample gate on the chain-of-thought cross-entropy loss. False means the sample
+    # trains the action (flow) expert only -- the CoT segments are still fed as prefix context, but
+    # nothing is back-propagated through their token predictions. Orthogonal to
+    # ``action_loss_mask``, which gates the flow loss; together the two express every combination
+    # of "supervise CoT" x "supervise actions" on a per-sample basis.
+    cot_loss_mask: at.Bool[ArrayT, "*b"] | None = None
     # Optional dataset index for eval grouping (matches steervla RLDS source order).
     dataset_id: at.Int[ArrayT, "*b"] | None = None
 
@@ -149,6 +155,7 @@ class Observation(Generic[ArrayT]):
             tokenized_fast=data.get("tokenized_fast"),
             tokenized_fast_mask=data.get("tokenized_fast_mask"),
             action_loss_mask=data.get("action_loss_mask"),
+            cot_loss_mask=data.get("cot_loss_mask"),
             dataset_id=data.get("dataset_id"),
         )
 
@@ -236,6 +243,7 @@ def preprocess_observation(
         tokenized_fast=observation.tokenized_fast,
         tokenized_fast_mask=observation.tokenized_fast_mask,
         action_loss_mask=observation.action_loss_mask,
+        cot_loss_mask=observation.cot_loss_mask,
     )
 
 

@@ -3,7 +3,7 @@ assets/
 checkpoints/
 data/
 wandb/
-
+scripts/*.png
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
