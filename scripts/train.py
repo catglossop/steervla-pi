@@ -419,9 +419,13 @@ def main(config: _config.TrainConfig):
     eval_output_format = data_config.steervla_output_action_format.value if data_config.steervla_rlds else None
     eval_dataset_names: list[str] | None = None
     if data_config.steervla_rlds:
+        # Order and mode-tagging must match SteerVLARldsDataset.dataset_names, which is what
+        # dataset_id indexes into: full-update sources, then action-only, then CoT-only. The tags
+        # keep per-dataset metric keys distinct when one corpus appears in several buckets.
         eval_dataset_names = [
             *(d.name for d in data_config.steervla_datasets),
-            *(d.name for d in data_config.steervla_hl_datasets),
+            *(f"{d.name}#flow_only" for d in data_config.steervla_ll_datasets),
+            *(f"{d.name}#cot_only" for d in data_config.steervla_hl_datasets),
         ]
     # The eval loader applies Normalize iff the run does, so the visualizer must apply the matching
     # inverse before converting to physical units. None when the run trains in raw (unnormalized)

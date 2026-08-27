@@ -108,6 +108,8 @@ class DataConfig:
     steervla_dataset_format: steervla_rlds_dataset.DatasetFormat = steervla_rlds_dataset.DatasetFormat.NUSCENES
     # Optional high-level (reasoning/subtask-only) datasets for CoT training.
     steervla_hl_datasets: Sequence[steervla_rlds_dataset.SteerVLARLDSDataset] = ()
+    # Action-only sources: flow expert supervised, CoT cross-entropy switched off.
+    steervla_ll_datasets: Sequence[steervla_rlds_dataset.SteerVLARLDSDataset] = ()
     steervla_hl_dataset_format: steervla_rlds_dataset.DatasetFormat = steervla_rlds_dataset.DatasetFormat.NUSCENES
     steervla_cot_reasoning_key: str = "commentary"
     steervla_cot_subtask_key: str = "gemini_refined_label"
@@ -489,6 +491,42 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
         )
 
 
+# Relative sampling weights across the SimLingo scenario datasets. Shared by every SteerVLA
+# mixture so the scenario balance stays in one place; ``_mixture_share`` rescales the whole set to
+# a target share of the batch without disturbing the ratios between them.
+_SIMLINGO_SCENARIO_WEIGHTS = {
+    "simlingo_dataset_all_img512_1116": 1.0,
+    "simlingo_dataset_acceleration_negative5_img512_1116": 0.4,
+    "simlingo_dataset_acceleration_negative1_img512_1116": 0.2,
+    "simlingo_dataset_acceleration_positive1_img512_1116": 0.1,
+    "simlingo_dataset_acceleration_positive5_img512_1116": 0.2,
+    "simlingo_dataset_lateral_control12_img512_1116": 0.1,
+    "simlingo_dataset_lateral_control_higher5_img512_1116": 0.3,
+    "simlingo_dataset_start_from_stop_img512_1116": 0.2,
+    "simlingo_dataset_vehicle_front_img512_1116": 0.3,
+    "simlingo_dataset_vehicle_side_img512_1116": 0.1,
+    "simlingo_dataset_leading_object_vehicle_img512_1116": 0.05,
+    "simlingo_dataset_leading_object_traffic_stop_img512_1116": 0.2,
+    "simlingo_dataset_leading_object_traffic_light_img512_1116": 0.2,
+    "simlingo_dataset_leading_object_walker_img512_1116": 0.2,
+    "simlingo_dataset_changed_route_img512_1116": 0.2,
+    "simlingo_dataset_parking_lane_img512_1116": 0.3,
+}
+
+
+def _mixture_share(weights: dict[str, float], share: float) -> dict[str, float]:
+    """Rescale ``weights`` so they sum to ``share`` of the batch, preserving their ratios.
+
+    ``SteerVLARldsDataset`` normalises across every bucket it is given, so expressing each bucket
+    as its intended fraction of the batch makes the mixture readable at the call site: the shares
+    across buckets simply sum to 1.
+    """
+    total = sum(weights.values())
+    if total <= 0:
+        raise ValueError("Mixture weights must sum to a positive value")
+    return {name: weight / total * share for name, weight in weights.items()}
+
+
 def _exempt_dims_from_normalization(
     norm_stats: dict[str, _transforms.NormStats] | None,
     key: str,
@@ -664,6 +702,11 @@ class RLDSSteerVLACoTDataConfig(RLDSSteerVLADataConfig):
     max_fast_len: int = 64
     # Optional high-level (reasoning/subtask-only) datasets.
     hl_dataset_name_weight_mappings: tyro.conf.Suppress[dict[str, float] | None] = None
+    # Optional action-only datasets: the flow expert is supervised, the CoT cross-entropy is not.
+    # Names may repeat those in ``dataset_name_weight_mappings`` -- the same corpus can be drawn
+    # from twice under different supervision, which is how a mixture like
+    # "20% full updates / 70% action-only" over one corpus is expressed.
+    ll_dataset_name_weight_mappings: tyro.conf.Suppress[dict[str, float] | None] = None
     hl_dataset_version: tyro.conf.Suppress[str | None] = None
     hl_dataset_format: tyro.conf.Suppress[steervla_rlds_dataset.DatasetFormat | None] = None
     # Source keys for CoT targets.
@@ -678,6 +721,15 @@ class RLDSSteerVLACoTDataConfig(RLDSSteerVLADataConfig):
         if self.dataset_name_weight_mappings is not None:
             for name, weight in self.dataset_name_weight_mappings.items():
                 resolved_datasets.append(
+                    steervla_rlds_dataset.SteerVLARLDSDataset(
+                        name=name, weight=weight, version=self.dataset_version,
+                    )
+                )
+
+        resolved_ll_datasets: list[steervla_rlds_dataset.SteerVLARLDSDataset] = []
+        if self.ll_dataset_name_weight_mappings is not None:
+            for name, weight in self.ll_dataset_name_weight_mappings.items():
+                resolved_ll_datasets.append(
                     steervla_rlds_dataset.SteerVLARLDSDataset(
                         name=name, weight=weight, version=self.dataset_version,
                     )
@@ -700,9 +752,9 @@ class RLDSSteerVLACoTDataConfig(RLDSSteerVLADataConfig):
         # heads alone. ``SteerVLARldsDataset`` concatenates ``datasets`` and ``hl_datasets`` into
         # one weighted source list, so an empty ``datasets`` is fine downstream. Only require
         # that the mixture is not *entirely* empty.
-        assert len(resolved_datasets) + len(resolved_hl_datasets) > 0, (
+        assert len(resolved_datasets) + len(resolved_ll_datasets) + len(resolved_hl_datasets) > 0, (
             "Must specify at least one dataset via `datasets`, `dataset_name_weight_mappings`, "
-            "or `hl_dataset_name_weight_mappings`."
+            "`ll_dataset_name_weight_mappings`, or `hl_dataset_name_weight_mappings`."
         )
 
         repack_transform = _transforms.Group(
@@ -714,6 +766,7 @@ class RLDSSteerVLACoTDataConfig(RLDSSteerVLADataConfig):
                         "observation/current_speed": "observation/current_speed",
                         "actions": "actions",
                         "action_loss_mask": "action_loss_mask",
+                        "cot_loss_mask": "cot_loss_mask",
                         "prompt": "prompt",
                         "subtask": "subtask",
                         "reasoning": "reasoning",
@@ -771,6 +824,7 @@ class RLDSSteerVLACoTDataConfig(RLDSSteerVLADataConfig):
             rlds_data_dir=self.rlds_data_dir,
             steervla_datasets=tuple(resolved_datasets),
             steervla_dataset_format=self.dataset_format,
+            steervla_ll_datasets=tuple(resolved_ll_datasets),
             steervla_hl_datasets=tuple(resolved_hl_datasets),
             steervla_hl_dataset_format=self.hl_dataset_format or self.dataset_format,
             steervla_cot_reasoning_key=self.cot_reasoning_key,
@@ -2372,6 +2426,93 @@ _CONFIGS = [
         # this -- keep it divisible by jax.device_count() (train.py asserts).
         batch_size=192,
         fsdp_devices=3,
+        log_interval=1,
+        eval_interval=100,
+        save_interval=2000,
+        max_to_keep=10,
+        num_workers=0,
+        checkpoint_base_dir="gs://cat-logs",
+        resume=False,
+        skip_norm_stats=False,
+    ),
+    #
+    # Three-way supervision mixture, derived from pi05_steervla_cot_simplified_reasoning_norm.
+    # Identical model, action format, normalization and schedule; only the mixture differs.
+    #
+    #   10%  simplified_reasoning_dataset   CoT only    (dummy actions -> flow loss zeroed)
+    #   20%  simlingo scenarios             flow + CoT  (a full update)
+    #   70%  simlingo scenarios             flow only   (CoT text is context, not a target)
+    #
+    # Motivation: the CoT heads fit their targets within ~2k steps (cot_subtask_ce plateaus around
+    # 0.5-0.6, cot_reasoning_ce below 0.1), after which most of the CoT gradient is spent
+    # re-learning what the model already knows. Shifting the balance toward action-only updates
+    # spends that capacity on the flow expert instead, while keeping enough CoT supervision to
+    # stop the reasoning/subtask heads drifting.
+    #
+    # The 20% and 70% buckets draw from the SAME corpus at the same scenario ratios -- a dataset
+    # name may appear in both ``dataset_name_weight_mappings`` and
+    # ``ll_dataset_name_weight_mappings``, and each occurrence becomes its own weighted source.
+    #
+    # "Flow only" gates the CoT cross-entropy per sample (``Observation.cot_loss_mask``); it does
+    # NOT remove the CoT segments from the prefix. The action expert still attends to a
+    # ground-truth subtask on every sample, so this does not by itself narrow the oracle-vs-
+    # generated gap that ``eval/gen_ade_*`` measures -- that needs subtask dropout or scheduled
+    # sampling, which is a separate change.
+    #
+    # Check the realised mixture in wandb: ``train/cot_supervised_frac`` should sit near 0.30
+    # (10% CoT-only + 20% full) and ``train/action_supervised_frac`` near 0.90 (20% + 70%).
+    #
+    TrainConfig(
+        name="pi05_steervla_cot_simplified_reasoning_norm_ll_heavy",
+        model=pi0_config.Pi0CoTConfig(
+            action_dim=32,
+            action_horizon=10,
+            max_token_len=72,
+            max_subtask_len=40,
+            max_reasoning_len=56,
+            max_fast_len=48,
+            cot_loss_weight=0.1,
+            knowledge_insulation=False,
+            use_fast_tokens=True,
+            image_keys=("base_0_rgb",),
+        ),
+        data=RLDSSteerVLACoTDataConfig(
+            # Same corpus, action format and state layout as the _norm config, so its norm stats
+            # apply unchanged -- the mixture shifts which rows are drawn, not what a row contains.
+            repo_id="steervla_simlingo_cot_normed",
+            assets=AssetsConfig(
+                assets_dir="./assets/pi05_steervla_cot_simplified_reasoning_norm",
+                asset_id="steervla_simlingo_cot_normed",
+            ),
+            rlds_data_dir="/raid/datasets/steervla",
+            dataset_format=steervla_rlds_dataset.DatasetFormat.SIMLINGO,
+            include_ego_history=False,
+            include_xy_action=False,
+            speed_in_prompt=True,
+            proprio_norm=False,
+            action_dim=4,
+            output_action_format=steervla_rlds_dataset.OutputActionFormat.DELTA_XY_T_DELTA_XY_SPACE,
+            lang_label_type=steervla_rlds_dataset.LangLabelType.ROUTING_COMMAND,
+            dataset_name_weight_mappings=_mixture_share(_SIMLINGO_SCENARIO_WEIGHTS, 0.20),
+            ll_dataset_name_weight_mappings=_mixture_share(_SIMLINGO_SCENARIO_WEIGHTS, 0.70),
+            hl_dataset_name_weight_mappings={"simplified_reasoning_dataset": 0.10},
+            hl_dataset_format=steervla_rlds_dataset.DatasetFormat.SIMLINGO,
+            hl_cot_reasoning_key="gemini_refined_label",
+            hl_cot_subtask_key="prompt",
+            max_subtask_len=40,
+            max_reasoning_len=56,
+            max_fast_len=48,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2e-5,
+            decay_steps=200_000,
+            decay_lr=1e-5,
+        ),
+        num_train_steps=200_000,
+        batch_size=384,
+        fsdp_devices=4,
         log_interval=1,
         eval_interval=100,
         save_interval=2000,

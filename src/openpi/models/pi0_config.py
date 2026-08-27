@@ -219,6 +219,7 @@ class Pi0CoTConfig(_model.BaseModelConfig):
                 tokenized_reasoning=jax.ShapeDtypeStruct([batch_size, self.max_reasoning_len], jnp.int32),
                 tokenized_reasoning_mask=jax.ShapeDtypeStruct([batch_size, self.max_reasoning_len], bool),
                 action_loss_mask=jax.ShapeDtypeStruct([batch_size, self.action_horizon], jnp.bool_),
+                cot_loss_mask=jax.ShapeDtypeStruct([batch_size], jnp.bool_),
                 **fast_spec,
             )
         action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)

@@ -208,3 +208,91 @@ def test_exempt_dims_rejects_out_of_range():
         _config._exempt_dims_from_normalization({"actions": stats}, "actions", (4,))  # noqa: SLF001
     with pytest.raises(ValueError, match="no 'actions' norm stats"):
         _config._exempt_dims_from_normalization({"state": stats}, "actions", (0,))  # noqa: SLF001
+
+
+def _supervision_losses(model, config, obs, actions, rng, *, cot_mask, action_mask):
+    b = obs.state.shape[0]
+    o = obs.replace(
+        cot_loss_mask=jnp.array(cot_mask, dtype=bool),
+        action_loss_mask=jnp.broadcast_to(
+            jnp.array(action_mask, dtype=bool)[:, None], (b, config.action_horizon)
+        ),
+    )
+    _, metrics = model.compute_loss_with_aux(rng, o, actions, train=False)
+    return np.asarray(metrics["cot_loss"]), np.asarray(metrics["flow_loss"]), metrics
+
+
+def test_cot_and_action_masks_gate_independently():
+    """The two masks must express all four supervision modes without interfering.
+
+    This is what lets one mixture hold "flow + CoT", "flow only" and "CoT only" buckets at once:
+    cot_loss_mask gates the chain-of-thought cross-entropy, action_loss_mask gates the flow loss,
+    and neither touches the other.
+    """
+    config = _tiny_config(("base_0_rgb",))
+    model = config.create(jax.random.key(0))
+    b = 4
+    image = jax.random.uniform(jax.random.key(1), (b, 224, 224, 3), minval=-1.0, maxval=1.0)
+    obs = _observation(config, image, ())
+    actions = jax.random.uniform(jax.random.key(3), (b, config.action_horizon, config.action_dim))
+    rng = jax.random.key(7)
+
+    #            flow+cot  flow-only  cot-only  neither
+    cot_mask = [True, False, True, False]
+    act_mask = [True, True, False, False]
+    cot_loss, flow_loss, _ = _supervision_losses(
+        model, config, obs, actions, rng, cot_mask=cot_mask, action_mask=act_mask
+    )
+
+    # rows: 0 = flow+cot, 1 = flow only, 2 = cot only, 3 = neither
+    supervised_cot = [i for i, m in enumerate(cot_mask) if m]
+    gated_cot = [i for i, m in enumerate(cot_mask) if not m]
+    supervised_flow = [i for i, m in enumerate(act_mask) if m]
+    gated_flow = [i for i, m in enumerate(act_mask) if not m]
+
+    for i in supervised_cot:
+        assert cot_loss[i] > 0, f"row {i}: CoT loss wrongly zeroed where it is supervised"
+    for i in gated_cot:
+        assert cot_loss[i] == 0.0, f"row {i}: CoT loss not zeroed by cot_loss_mask"
+    for i in supervised_flow:
+        assert flow_loss[i] > 0, f"row {i}: flow loss wrongly zeroed where it is supervised"
+    for i in gated_flow:
+        assert flow_loss[i] == 0.0, f"row {i}: flow loss not zeroed by action_loss_mask"
+
+
+def test_per_term_ce_metrics_stay_unmasked():
+    """``cot_loss`` reflects what is optimised; the per-term CE metrics stay reportable.
+
+    Masking the individual terms too would make them incomparable across mixtures -- a config with
+    more flow-only rows would show a spuriously lower cot_subtask_ce.
+    """
+    config = _tiny_config(("base_0_rgb",))
+    model = config.create(jax.random.key(0))
+    b = 4
+    image = jax.random.uniform(jax.random.key(1), (b, 224, 224, 3), minval=-1.0, maxval=1.0)
+    obs = _observation(config, image, ())
+    actions = jax.random.uniform(jax.random.key(3), (b, config.action_horizon, config.action_dim))
+
+    cot_loss, _, metrics = _supervision_losses(
+        model, config, obs, actions, jax.random.key(7),
+        cot_mask=[False] * b, action_mask=[True] * b,
+    )
+    assert float(jnp.mean(cot_loss)) == 0.0
+    assert float(jnp.mean(metrics["cot_subtask_ce"])) > 0.0
+    assert float(metrics["cot_supervised_frac"]) == 0.0
+    assert float(metrics["action_supervised_frac"]) == 1.0
+
+
+def test_ll_heavy_config_declares_the_intended_mixture():
+    import openpi.training.config as _config
+
+    cfg = _config.get_config("pi05_steervla_cot_simplified_reasoning_norm_ll_heavy")
+    data = cfg.data
+    assert sum(data.dataset_name_weight_mappings.values()) == pytest.approx(0.20)
+    assert sum(data.ll_dataset_name_weight_mappings.values()) == pytest.approx(0.70)
+    assert sum(data.hl_dataset_name_weight_mappings.values()) == pytest.approx(0.10)
+    # The 20% and 70% buckets must draw the same corpus at the same scenario ratios.
+    full, ll = data.dataset_name_weight_mappings, data.ll_dataset_name_weight_mappings
+    assert full.keys() == ll.keys()
+    ratios = {k: ll[k] / full[k] for k in full}
+    assert all(r == pytest.approx(0.70 / 0.20) for r in ratios.values())

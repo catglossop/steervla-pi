@@ -482,6 +482,14 @@ class Pi0CoT(_model.BaseModel):
 
         cot_loss = reasoning_ce + subtask_ce + first_reasoning_ce + first_subtask_ce + fast_ce + first_fast_ce
 
+        # Per-sample CoT gate: mirrors ``action_loss_mask`` on the flow side. A False row still
+        # contributes its CoT segments as prefix context (the action expert keeps attending to the
+        # subtask) but back-propagates nothing through the token predictions -- i.e. it trains the
+        # action expert only. Note the individual ``cot_*_ce`` metrics below stay UNmasked, so they
+        # remain comparable across mixtures; only ``cot_loss`` reflects what is optimised.
+        if observation.cot_loss_mask is not None:
+            cot_loss = cot_loss * observation.cot_loss_mask.astype(cot_loss.dtype)
+
         # Combine: flow loss is per-timestep (batch, horizon), cot_loss is scalar per batch
         # Broadcast cot_loss to match flow_loss shape for the return
         combined = flow_loss + self.cot_loss_weight * cot_loss[:, None]
@@ -495,6 +503,14 @@ class Pi0CoT(_model.BaseModel):
             "cot_fast_ce": fast_ce,
             "cot_first_fast_ce": first_fast_ce,
         }
+        # Realised supervision mix of the batch, so a weighted three-bucket mixture can be checked
+        # against what was intended rather than assumed.
+        if observation.cot_loss_mask is not None:
+            metrics["cot_supervised_frac"] = jnp.mean(observation.cot_loss_mask.astype(jnp.float32))
+        if observation.action_loss_mask is not None:
+            metrics["action_supervised_frac"] = jnp.mean(
+                jnp.any(observation.action_loss_mask, axis=-1).astype(jnp.float32)
+            )
         if t_context is not None:
             metrics["t_context"] = t_context
             # Flow loss on the cleanest and noisiest halves of the batch, to see the imitation and

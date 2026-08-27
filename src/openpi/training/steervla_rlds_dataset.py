@@ -55,6 +55,9 @@ class SteerVLARldsDataset:
         dataset_format: DatasetFormat = DatasetFormat.NUSCENES,
         hl_datasets: Sequence[SteerVLARLDSDataset] = (),
         hl_dataset_format: DatasetFormat | None = None,
+        # Action-only sources: the flow expert is supervised, the CoT cross-entropy is not. The CoT
+        # segments are still built and fed as prefix context; only their loss is switched off.
+        ll_datasets: Sequence[SteerVLARLDSDataset] = (),
         cot_reasoning_key: str = "commentary",
         cot_subtask_key: str = "gemini_refined_label",
         hl_cot_reasoning_key: str = "gemini_refined_label",
@@ -86,18 +89,28 @@ class SteerVLARldsDataset:
         if hl_datasets and not enable_cot:
             raise ValueError("High-level datasets require enable_cot=True.")
 
-        source_specs: list[tuple[SteerVLARLDSDataset, DatasetFormat, bool, str, str]] = [
-            (d, dataset_format, True, cot_reasoning_key, cot_subtask_key) for d in datasets
+        # (dataset, format, action_supervision, cot_supervision, cot_reasoning_key, cot_subtask_key)
+        # The three buckets are the three supervision modes in use:
+        #   datasets    -> flow + CoT   (a full update)
+        #   ll_datasets -> flow only    (action expert; CoT text is context, not a target)
+        #   hl_datasets -> CoT only     (dummy actions, action_loss_mask all-False)
+        # The same dataset name may appear in more than one bucket; each occurrence becomes its own
+        # weighted source with its own dataset_id.
+        source_specs: list[tuple[SteerVLARLDSDataset, DatasetFormat, bool, bool, str, str]] = [
+            (d, dataset_format, True, True, cot_reasoning_key, cot_subtask_key) for d in datasets
         ]
         source_specs += [
-            (d, hl_dataset_format or dataset_format, False, hl_cot_reasoning_key, hl_cot_subtask_key)
+            (d, dataset_format, True, False, cot_reasoning_key, cot_subtask_key) for d in ll_datasets
+        ]
+        source_specs += [
+            (d, hl_dataset_format or dataset_format, False, True, hl_cot_reasoning_key, hl_cot_subtask_key)
             for d in hl_datasets
         ]
 
         # Weights are normalized internally by sample_from_datasets; no need to sum to 1.0.
-        total_weight = sum(d.weight for d, _, _, _, _ in source_specs)
+        total_weight = sum(d.weight for d, *_ in source_specs)
         assert total_weight > 0, "Total dataset weight must be positive"
-        normalized_weights = [d.weight / total_weight for d, _, _, _, _ in source_specs]
+        normalized_weights = [d.weight / total_weight for d, *_ in source_specs]
 
         def _build_nuscenes_restructure(
             traj_map_tf=tf,
@@ -178,6 +191,7 @@ class SteerVLARldsDataset:
         def _build_simlingo_restructure(
             *,
             action_supervision: bool = True,
+            cot_supervision: bool = True,
             cot_reasoning_source_key: str = "commentary",
             cot_subtask_source_key: str = "gemini_refined_label",
         ):
@@ -292,6 +306,9 @@ class SteerVLARldsDataset:
                 if enable_cot:
                     result["subtask"] = traj[cot_subtask_source_key]
                     result["reasoning"] = traj[cot_reasoning_source_key]
+                    # Per-frame gate on the CoT cross-entropy. The text above is still emitted and
+                    # still becomes prefix context; this only decides whether it is a target.
+                    result["cot_loss_mask"] = tf.fill([traj_len], tf.cast(cot_supervision, tf.bool))
 
                 return result
 
@@ -313,6 +330,7 @@ class SteerVLARldsDataset:
             source_dataset_format: DatasetFormat,
             *,
             action_supervision: bool,
+            cot_supervision: bool,
             cot_reasoning_source_key: str,
             cot_subtask_source_key: str,
             dataset_id: int,
@@ -332,6 +350,7 @@ class SteerVLARldsDataset:
             elif source_dataset_format == DatasetFormat.SIMLINGO:
                 restructure_fn = _build_simlingo_restructure(
                     action_supervision=action_supervision,
+                    cot_supervision=cot_supervision,
                     cot_reasoning_source_key=cot_reasoning_source_key,
                     cot_subtask_source_key=cot_subtask_source_key,
                 )
@@ -375,31 +394,50 @@ class SteerVLARldsDataset:
 
         logging.info(f"Preparing {len(source_specs)} SteerVLA datasets...")
         logging.info("-" * 50)
-        for (ds, ds_format, action_supervision, cot_reason_key, cot_subtask_key), nw in zip(source_specs, normalized_weights):
+        def _mode(*, action_sup: bool, cot_sup: bool) -> str:
+            """Human-readable name for a (flow, CoT) supervision pair."""
+            return {(True, True): "flow+cot", (True, False): "flow_only", (False, True): "cot_only"}.get(
+                (action_sup, cot_sup), "unsupervised"
+            )
+
+        for (ds, ds_format, action_supervision, cot_supervision, cot_reason_key, cot_subtask_key), nw in zip(
+            source_specs, normalized_weights
+        ):
             ver = ds.version or "default"
             logging.info(
                 f"    {ds.name} (v{ver}) format={ds_format.name} "
                 f"cot_reasoning_key={cot_reason_key} cot_subtask_key={cot_subtask_key} "
-                f"action_supervision={action_supervision} "
+                f"mode={_mode(action_sup=action_supervision, cot_sup=cot_supervision)} "
                 f"weight={ds.weight:.3f} (normalized={nw:.4f})"
             )
         logging.info("-" * 50)
 
-        self.dataset_names = [ds.name for ds, _, _, _, _ in source_specs]
+        # A dataset can appear in several buckets, so tag the mode to keep per-dataset eval metric
+        # keys distinct (see _short_dataset_name / _compute_per_dataset_loss_metrics).
+        self.dataset_names = [
+            ds.name if _mode(action_sup=a, cot_sup=c) == "flow+cot" else f"{ds.name}#{_mode(action_sup=a, cot_sup=c)}"
+            for ds, _, a, c, _, _ in source_specs
+        ]
 
         all_datasets = [
             prepare_single_dataset(
                 ds,
                 ds_format,
                 action_supervision=action_supervision,
+                cot_supervision=cot_supervision,
                 cot_reasoning_source_key=cot_reason_key,
                 cot_subtask_source_key=cot_subtask_key,
                 dataset_id=dataset_id,
                 split=split,
             )
-            for dataset_id, (ds, ds_format, action_supervision, cot_reason_key, cot_subtask_key) in enumerate(
-                source_specs
-            )
+            for dataset_id, (
+                ds,
+                ds_format,
+                action_supervision,
+                cot_supervision,
+                cot_reason_key,
+                cot_subtask_key,
+            ) in enumerate(source_specs)
         ]
 
         final_dataset = dl.DLataset.sample_from_datasets(all_datasets, weights=normalized_weights)
