@@ -2080,6 +2080,7 @@ _CONFIGS = [
     # ``combined = flow_loss + cot_loss_weight * cot_loss`` (pi0_cot.py:476) with flow_loss
     # identically zero, so leaving it at 0.1 would just scale every gradient down 10x.
     #
+    
     TrainConfig(
         name="pi05_steervla_cast_hl_finetune_cot_only",
         model=pi0_config.Pi0CoTConfig(
