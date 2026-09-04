@@ -38,11 +38,64 @@ class LangLabelType(Enum):
     ROUTING_COMMAND = "routing_command"
 
 
+# Framing correction between SimLingo-derived RLDS builds.
+#
+# Every one of these datasets stores a 512x512 JPEG, but they were built from the same 1024x512
+# CARLA front camera under two *different* framings:
+#
+#   simlingo_dataset_*_img512_1116  crop (170, 0, 852, 359) of the 1024x512 source, then squash to 512x512
+#   simplified_reasoning_dataset    no crop -- the full 1024x512 frame squashed to 512x512
+#
+# So the high-level reasoning corpus shows a wider FOV and includes the ego hood, while the
+# low-level corpus is zoomed in on the road ahead with the bottom 30% cut off. Mixing them trains
+# the policy on two different cameras. Recovered by solving for the crop box that reproduces each
+# stored image from its source file under ``simlingo_rgb_zips`` (6/6 samples agree exactly;
+# mean abs residual 0.88/255, i.e. JPEG round-trip noise).
+#
+# Expressed normalized so it applies to the stored 512x512 image as well as the 1024x512 source:
+# on a 512x512 image it is the box (85, 0, 426, 359).
+SIMLINGO_FRAMING_CROP = (170 / 1024, 0.0, 852 / 1024, 359 / 512)
+
+# Datasets whose stored images need cropping to match ``SIMLINGO_FRAMING_CROP``. Consulted only when
+# a ``SteerVLARLDSDataset`` does not set ``image_crop`` itself. Datasets absent here are left alone,
+# which is correct for the simlingo_dataset_* builds (already in that framing) and for any corpus
+# whose framing has not been measured.
+DATASET_IMAGE_CROPS: dict[str, tuple[float, float, float, float]] = {
+    "simplified_reasoning_dataset": SIMLINGO_FRAMING_CROP,
+}
+
+# Datasets measured to already be in the canonical framing, so they need no correction. Kept
+# separate from "we have never looked" -- see ``resolve_image_crop``.
+CANONICAL_FRAMING_PREFIXES = ("simlingo_dataset_",)
+
+
+def resolve_image_crop(
+    dataset: "SteerVLARLDSDataset",
+) -> tuple[tuple[float, float, float, float] | None, bool]:
+    """Crop for a dataset, plus whether its framing is actually known.
+
+    Every source in a mixture must reach the model through the same camera framing, so a corpus
+    whose framing nobody has measured is a silent hazard rather than a safe default. Returning the
+    ``known`` flag lets the caller say so out loud instead of quietly assuming canonical.
+    """
+    if dataset.image_crop is not None:
+        return (dataset.image_crop or None), True
+    if dataset.name in DATASET_IMAGE_CROPS:
+        return DATASET_IMAGE_CROPS[dataset.name], True
+    if dataset.name.startswith(CANONICAL_FRAMING_PREFIXES):
+        return None, True
+    return None, False
+
+
 @dataclasses.dataclass
 class SteerVLARLDSDataset:
     name: str
     weight: float = 1.0
     version: str | None = None
+    # Normalized (x0, y0, x1, y1) crop applied to the stored image, then resized back to the stored
+    # resolution so every source in the mixture batches at the same shape. ``None`` falls back to
+    # ``DATASET_IMAGE_CROPS``; pass ``()`` to force no crop.
+    image_crop: tuple[float, float, float, float] | None = None
 
 
 class SteerVLARldsDataset:
@@ -384,10 +437,31 @@ class SteerVLARldsDataset:
 
             dataset = dataset.flatten(num_parallel_calls=num_parallel_calls)
 
-            def decode_images(frame):
-                frame["observation"]["image"] = tf.io.decode_image(
+            crop, _ = resolve_image_crop(dataset_cfg)
+
+            def decode_images(frame, crop=crop):
+                image = tf.io.decode_image(
                     frame["observation"]["image"], expand_animations=False, dtype=tf.uint8
                 )
+                if crop:
+                    x0, y0, x1, y1 = crop
+                    shape = tf.shape(image)
+                    h = tf.cast(shape[0], tf.float32)
+                    w = tf.cast(shape[1], tf.float32)
+                    top = tf.cast(tf.round(y0 * h), tf.int32)
+                    left = tf.cast(tf.round(x0 * w), tf.int32)
+                    image = tf.image.crop_to_bounding_box(
+                        image,
+                        top,
+                        left,
+                        tf.cast(tf.round(y1 * h), tf.int32) - top,
+                        tf.cast(tf.round(x1 * w), tf.int32) - left,
+                    )
+                    # Back to the stored resolution: sources in one mixture must batch at one shape.
+                    image = tf.cast(
+                        tf.round(tf.image.resize(image, [shape[0], shape[1]], antialias=True)), tf.uint8
+                    )
+                frame["observation"]["image"] = image
                 return frame
 
             return dataset.frame_map(decode_images, num_parallel_calls)
@@ -404,11 +478,21 @@ class SteerVLARldsDataset:
             source_specs, normalized_weights
         ):
             ver = ds.version or "default"
+            ds_crop, crop_known = resolve_image_crop(ds)
+            if not crop_known:
+                logging.warning(
+                    f"    {ds.name}: image framing has not been measured, so it is being fed to the model "
+                    f"uncropped. If it was not built with the same crop as the simlingo_dataset_* corpora "
+                    f"({tuple(round(v, 4) for v in SIMLINGO_FRAMING_CROP)} of the source frame), this mixes "
+                    f"two cameras in one batch. Add an entry to DATASET_IMAGE_CROPS or set image_crop=() "
+                    f"to confirm it needs no crop."
+                )
             logging.info(
                 f"    {ds.name} (v{ver}) format={ds_format.name} "
                 f"cot_reasoning_key={cot_reason_key} cot_subtask_key={cot_subtask_key} "
                 f"mode={_mode(action_sup=action_supervision, cot_sup=cot_supervision)} "
-                f"weight={ds.weight:.3f} (normalized={nw:.4f})"
+                f"weight={ds.weight:.3f} (normalized={nw:.4f}) "
+                f"image_crop={'none' if not ds_crop else tuple(round(v, 4) for v in ds_crop)}"
             )
         logging.info("-" * 50)
 

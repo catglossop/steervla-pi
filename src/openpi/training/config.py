@@ -2523,6 +2523,84 @@ _CONFIGS = [
         resume=False,
         skip_norm_stats=False,
     ),
+    #
+    # The 10/20/70 supervision mixture WITHOUT normalization -- i.e. ..._norm_ll_heavy with
+    # skip_norm_stats=True. Everything else (model, mixture, action format, token budgets,
+    # schedule) is identical to that config, so the pair isolates normalization as the single
+    # variable, and this one is directly comparable to the pre-normalization runs.
+    #
+    # CAVEAT, deliberate and worth knowing before reading results: skip_norm_stats disables the
+    # Normalize transform outright, so it unnormalizes STATE as well as actions. State then reaches
+    # ``CoTPaligemmaTokenizer.tokenize_prompt``, which discretizes against fixed [-1, 1] bins, in
+    # raw units -- every speed >= 1 m/s saturates to token 255 and every course <= -1 deg gives
+    # token -1, leaving the state channel with roughly two bits. Speed still reaches the model
+    # through the prompt text ("The current speed is X m/s."), but heading does not.
+    #
+    # To vary the actions alone and keep the state channel intact, set skip_norm_stats=False and
+    # ``unnormalized_action_dims=(0, 1, 2, 3)`` instead: that exempts every action dim from
+    # Normalize via identity stats while state stays quantile-normalized. That is the cleaner
+    # ablation of "do normalized actions help"; this config is the cleaner comparison against the
+    # older runs.
+    #
+    # No norm stats needed (nothing is normalized), so no compute_norm_stats run before training.
+    #
+    TrainConfig(
+        name="pi05_steervla_cot_simplified_reasoning_ll_heavy",
+        model=pi0_config.Pi0CoTConfig(
+            action_dim=32,
+            action_horizon=10,
+            max_token_len=72,
+            max_subtask_len=40,
+            max_reasoning_len=56,
+            # Held at 48 to match ..._norm_ll_heavy exactly, so the two configs have identical
+            # prefix lengths and per-step compute. Raw actions only need ~32 (their FAST encoding
+            # is shorter than the normalized one: max 26 vs 36), but matching matters more here.
+            max_fast_len=48,
+            cot_loss_weight=0.1,
+            knowledge_insulation=False,
+            use_fast_tokens=True,
+            image_keys=("base_0_rgb",),
+        ),
+        data=RLDSSteerVLACoTDataConfig(
+            repo_id="steervla_simlingo_cot",
+            rlds_data_dir="/raid/datasets/steervla",
+            dataset_format=steervla_rlds_dataset.DatasetFormat.SIMLINGO,
+            include_ego_history=False,
+            include_xy_action=False,
+            speed_in_prompt=True,
+            proprio_norm=False,
+            action_dim=4,
+            output_action_format=steervla_rlds_dataset.OutputActionFormat.DELTA_XY_T_DELTA_XY_SPACE,
+            lang_label_type=steervla_rlds_dataset.LangLabelType.ROUTING_COMMAND,
+            dataset_name_weight_mappings=_mixture_share(_SIMLINGO_SCENARIO_WEIGHTS, 0.20),
+            ll_dataset_name_weight_mappings=_mixture_share(_SIMLINGO_SCENARIO_WEIGHTS, 0.70),
+            hl_dataset_name_weight_mappings={"simplified_reasoning_dataset": 0.10},
+            hl_dataset_format=steervla_rlds_dataset.DatasetFormat.SIMLINGO,
+            hl_cot_reasoning_key="gemini_refined_label",
+            hl_cot_subtask_key="prompt",
+            max_subtask_len=40,
+            max_reasoning_len=56,
+            max_fast_len=48,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2e-5,
+            decay_steps=200_000,
+            decay_lr=1e-5,
+        ),
+        num_train_steps=200_000,
+        batch_size=1152,
+        fsdp_devices=6,
+        log_interval=1,
+        eval_interval=100,
+        save_interval=2000,
+        max_to_keep=10,
+        num_workers=0,
+        checkpoint_base_dir="gs://cat-logs",
+        resume=False,
+        skip_norm_stats=True,
+    ),
     TrainConfig(
         name="pi05_steervla_cot_simplified_reasoning_no_attention",
         model=pi0_config.Pi0CoTConfig(
@@ -2630,7 +2708,7 @@ _CONFIGS = [
             ),
         ),
     ),
-    
+
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
     #
     TrainConfig(
