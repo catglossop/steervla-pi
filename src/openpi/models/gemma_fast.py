@@ -17,8 +17,9 @@ Gemma model implementation from big_vision/models/ppp/gemma.py (with small modif
 Used for FAST autoregressive policies.
 """
 
+from collections.abc import Mapping
 import dataclasses
-from typing import Literal, TypeAlias
+from typing import Any, Literal, TypeAlias
 
 import einops
 import flax.linen as nn
@@ -29,11 +30,53 @@ import ml_collections
 import openpi.models.lora as lora
 import openpi.shared.array_typing as at
 
-Variant = Literal["gemma_2b", "gemma_2b_lora"]
+Variant = Literal["gemma_2b", "gemma_2b_lora", "gemma3_4b", "dummy_gemma3"]
+
+# Gemma 3 options; the defaults reproduce the Gemma (PaliGemma) architecture. See gemma.Config for their meaning.
+_GEMMA3_DEFAULTS = {
+    "qk_norm": False,
+    "post_norms": False,
+    "sliding_window_pattern": None,
+    "sliding_window": None,
+    "rope_local_base": 10_000.0,
+    "rope_global_base": 10_000.0,
+    "rope_global_scale": 1.0,
+    "query_pre_attn_scalar": None,
+}
+
+
+def _gemma3(width, depth, mlp_dim, head_dim):
+    return ml_collections.ConfigDict(
+        {
+            "variant": "gemma3",
+            "width": width,
+            "depth": depth,
+            "mlp_dim": mlp_dim,
+            "num_heads": 8,
+            "num_kv_heads": 4,
+            "head_dim": head_dim,
+            "norm_eps": 1e-6,
+            "vocab_size": 262_208,
+            "scan": True,
+            "remat_policy": "nothing_saveable",
+            "qk_norm": True,
+            "post_norms": True,
+            "sliding_window_pattern": 6,
+            "sliding_window": 1024,
+            "rope_local_base": 10_000.0,
+            "rope_global_base": 1_000_000.0,
+            "rope_global_scale": 8.0,
+            "query_pre_attn_scalar": float(head_dim),
+        }
+    )
 
 
 def get_config(variant):
     """Returns config for specified gemma variant."""
+    if variant == "gemma3_4b":
+        return _gemma3(width=2560, depth=34, mlp_dim=10_240, head_dim=256)
+    if variant == "dummy_gemma3":
+        return _gemma3(width=64, depth=6, mlp_dim=128, head_dim=16)
     if variant == "gemma_2b":
         return ml_collections.ConfigDict(
             {
@@ -134,7 +177,17 @@ class Attention(nn.Module):
 
     lora_config: lora.LoRAConfig | None = None
 
+    qk_norm: bool = False
+    sliding_window_pattern: int | None = None
+    rope_local_base: float = 10_000.0
+    rope_global_base: float = 10_000.0
+    rope_global_scale: float = 1.0
+    query_pre_attn_scalar: float | None = None
+
     def setup(self):
+        if self.qk_norm:
+            self.q_norm = RMSNorm()
+            self.k_norm = RMSNorm()
         if self.num_kv_heads == self.num_heads:
             self.qkv_einsum = lora.Einsum(
                 shape=(3, self.num_heads, self.features, self.head_dim),
@@ -183,7 +236,7 @@ class Attention(nn.Module):
         return idx_new, k_new, v_new
 
     @nn.compact
-    def __call__(self, x, positions, attn_mask, kv_cache, decode, deterministic=True):  # noqa: FBT002
+    def __call__(self, x, positions, attn_mask, kv_cache, decode, deterministic=True, layer_idx=None):  # noqa: FBT002
         dtype = x.dtype  # original dtype, could be half-precision
         if self.num_kv_heads == self.num_heads:
             q, k, v = self.qkv_einsum("BSD,3KDH->3BSKH", x)
@@ -191,10 +244,20 @@ class Attention(nn.Module):
             q = self.q_einsum("BTD,NDH->BTNH", x)
             k, v = self.kv_einsum("BSD,2KDH->2BSKH", x)
 
-        q = _apply_rope(q, positions=positions)  # promotes to float32
-        q *= self.head_dim**-0.5
+        if self.qk_norm:
+            q, k = self.q_norm(q), self.k_norm(k)
 
-        k = _apply_rope(k, positions=positions)  # promotes to float32
+        if self.sliding_window_pattern is None:
+            q = _apply_rope(q, positions=positions)  # promotes to float32
+            k = _apply_rope(k, positions=positions)  # promotes to float32
+        else:
+            # Gemma 3: global layers use a larger RoPE base with linear position scaling; local layers do not.
+            is_global = (layer_idx + 1) % self.sliding_window_pattern == 0
+            base = jnp.where(is_global, self.rope_global_base, self.rope_local_base)
+            rope_positions = positions / jnp.where(is_global, self.rope_global_scale, 1.0)
+            q = _apply_rope(q, positions=rope_positions, max_wavelength=base)
+            k = _apply_rope(k, positions=rope_positions, max_wavelength=base)
+        q *= (self.query_pre_attn_scalar or self.head_dim) ** -0.5
 
         if kv_cache is None:
             idx, k_cache, v_cache = self._init_cache(k, v, attn_mask.shape[-1])
@@ -238,6 +301,7 @@ class Block(nn.Module):
     dropout_bdims: tuple[int, ...] = ()
     cache_dtype: str | None = None
     lora_configs: ml_collections.ConfigDict = dataclasses.field(default_factory=ml_collections.ConfigDict)
+    gemma3: Mapping[str, Any] = dataclasses.field(default_factory=lambda: dict(_GEMMA3_DEFAULTS))
 
     def setup(self):
         self.pre_attention_norm = RMSNorm()
@@ -248,7 +312,11 @@ class Block(nn.Module):
             head_dim=self.head_dim,
             cache_dtype=self.cache_dtype,
             lora_config=self.lora_configs.get("attn"),
+            **{k: v for k, v in self.gemma3.items() if k not in ("post_norms", "sliding_window")},
         )
+        if self.gemma3["post_norms"]:
+            self.post_attention_norm = RMSNorm()
+            self.post_ffw_norm = RMSNorm()
         self.pre_ffw_norm = RMSNorm()
         self.mlp = lora.FeedForward(
             features=self.embed_dim, hidden_dim=self.hidden_dim, name="mlp", lora_config=self.lora_configs.get("ffn")
@@ -258,15 +326,21 @@ class Block(nn.Module):
         else:
             self.drop = lambda x, _: x
 
-    def __call__(self, x, kv_cache, positions, attn_mask, decode, deterministic=True):  # noqa: FBT002
+    def __call__(self, x, kv_cache, positions, attn_mask, decode, deterministic=True, layer_idx=None):  # noqa: FBT002
         x = nn.with_logical_constraint(x, ("act_batch", "act_len", "act_emb"))
         inputs_normalized = self.pre_attention_norm(x)
-        attn_output, kv_cache = self.attn(inputs_normalized, positions, attn_mask, kv_cache, decode, deterministic)
+        attn_output, kv_cache = self.attn(
+            inputs_normalized, positions, attn_mask, kv_cache, decode, deterministic, layer_idx
+        )
+        if self.gemma3["post_norms"]:
+            attn_output = self.post_attention_norm(attn_output)
         attn_output = self.drop(attn_output, deterministic)
         attn_output += x
         residual = attn_output
         attn_output = self.pre_ffw_norm(attn_output)
         outputs = self.mlp(attn_output)
+        if self.gemma3["post_norms"]:
+            outputs = self.post_ffw_norm(outputs)
         outputs = self.drop(outputs, deterministic)
         outputs = residual + outputs
         return outputs, kv_cache
@@ -298,6 +372,15 @@ class Module(nn.Module):
     scan: bool = False
     remat_policy: str = "none"
     lora_configs: ml_collections.ConfigDict = dataclasses.field(default_factory=ml_collections.ConfigDict)
+
+    qk_norm: bool = False
+    post_norms: bool = False
+    sliding_window_pattern: int | None = None
+    sliding_window: int | None = None
+    rope_local_base: float = 10_000.0
+    rope_global_base: float = 10_000.0
+    rope_global_scale: float = 1.0
+    query_pre_attn_scalar: float | None = None
 
     @nn.compact
     def __call__(
@@ -370,13 +453,18 @@ class Module(nn.Module):
         cache_size = max(seq_len, mask.shape[-1])
         assert mask.shape == (batch_size, 1, seq_len, cache_size), mask.shape
 
+        gemma3 = self.sliding_window_pattern is not None
+        if gemma3 and self.sliding_window is not None and cache_size > self.sliding_window:
+            # Within the window, local layers attend exactly like global ones; longer sequences need a band mask.
+            raise NotImplementedError(f"Sequence length {cache_size} exceeds the Gemma 3 sliding window.")
         if self.remat_policy == "none":
             block_cls = Block
         else:
             block_cls = nn.remat(
                 Block,
                 prevent_cse=not self.scan,
-                static_argnums=(5, 6),  # 0=self, 5=decode, 6=deterministic
+                # Gemma 3 scans in a traced layer index as argument 6, so it must not be static.
+                static_argnums=(5,) if gemma3 else (5, 6),  # 0=self, 5=decode, 6=deterministic
                 policy=getattr(jax.checkpoint_policies, self.remat_policy),
             )
 
@@ -391,18 +479,22 @@ class Module(nn.Module):
             "cache_dtype": self.cache_dtype,
             "lora_configs": self.lora_configs,
         }
+        if gemma3:
+            block_kw["gemma3"] = {k: getattr(self, k) for k in _GEMMA3_DEFAULTS}
         layers = self.scope.push("layers")
         blocks = [
             nn.scan(
                 block_cls,
                 variable_axes={"params": 0},
                 split_rngs={"params": True, "dropout": True},
-                in_axes=(0, nn.broadcast, nn.broadcast, nn.broadcast, nn.broadcast),  # 0=kv_cache, 1=positions, 2=mask
+                # 0=kv_cache, 1=positions, 2=mask, (5=layer_idx for Gemma 3)
+                in_axes=(0, nn.broadcast, nn.broadcast, nn.broadcast, nn.broadcast, *((0,) if gemma3 else ())),
                 length=self.depth,
             )(parent=layers, **block_kw)
         ]
+        layer_args = (jnp.arange(self.depth, dtype=jnp.int32),) if gemma3 else ()
         for block in blocks:
-            x, kv_cache = block(x, kv_cache, positions, mask, decode, deterministic)
+            x, kv_cache = block(x, kv_cache, positions, mask, decode, deterministic, *layer_args)
 
         assert x.dtype == jnp.dtype(self.embed_dtype)  # Sanity check.
         out["encoded"] = x

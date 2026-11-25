@@ -73,6 +73,36 @@ class PaliGemmaWeightLoader(WeightLoader):
         return _merge_params(loaded_params, params, missing_regex=".*")
 
 
+@dataclasses.dataclass(frozen=True)
+class Gemma3WeightLoader(WeightLoader):
+    """Loads the Gemma 3 VLM (language model + vision tower) from a Hugging Face checkpoint.
+
+    Like ``PaliGemmaWeightLoader``, every parameter the checkpoint lacks (the action expert, action/time
+    projections) keeps its fresh initialization. The vision position embedding is resized to the model's
+    configured image resolution; any other shape mismatch is an error.
+    """
+
+    # Hugging Face repo id (gated; needs HF_TOKEN) or a local directory holding the safetensors checkpoint.
+    repo_or_dir: str = "google/gemma-3-4b-pt"
+
+    def load(self, params: at.Params) -> at.Params:
+        import openpi.models.gemma3_weights as gemma3_weights
+
+        flat_ref = flax.traverse_util.flatten_dict(params, sep="/")
+        loaded = gemma3_weights.load_gemma3_params(self.repo_or_dir)
+        posemb_key = "PaliGemma/img/siglip/pos_embedding"
+        if posemb_key in loaded and posemb_key in flat_ref:
+            loaded[posemb_key] = gemma3_weights.resize_posemb(loaded[posemb_key], flat_ref[posemb_key].shape[1])
+        if missing := sorted(k for k in loaded if k not in flat_ref):
+            raise ValueError(f"Gemma 3 weights have no place in this model (wrong backbone?): {missing[:5]}")
+        if mismatched := [(k, v.shape, flat_ref[k].shape) for k, v in loaded.items() if v.shape != flat_ref[k].shape]:
+            raise ValueError(f"Gemma 3 weight shape mismatch: {mismatched[:5]}")
+        logger.info(
+            "Loaded %d Gemma 3 tensors; %d params keep their initialization.", len(loaded), len(flat_ref) - len(loaded)
+        )
+        return _merge_params(flax.traverse_util.unflatten_dict(loaded, sep="/"), params, missing_regex=".*")
+
+
 def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex: str) -> at.Params:
     """Merges the loaded parameters with the reference parameters.
 

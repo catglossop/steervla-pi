@@ -55,9 +55,53 @@ class Config:
     num_kv_heads: int
     head_dim: int
     lora_configs: dict[str, lora.LoRAConfig] = dataclasses.field(default_factory=dict)
+    # Gemma 3 options. The defaults reproduce the Gemma (PaliGemma) architecture exactly. Attention-wide settings
+    # (RoPE, sliding window, query scale) are read from the first expert's config, since all experts attend jointly.
+    vocab_size: int = PALIGEMMA_VOCAB_SIZE
+    qk_norm: bool = False  # RMSNorm on per-head queries and keys before RoPE.
+    post_norms: bool = False  # Extra RMSNorm on the attention / MLP outputs before the residual.
+    # Every `sliding_window_pattern`-th layer is global; the rest are local. None = all layers global.
+    sliding_window_pattern: int | None = None
+    sliding_window: int | None = None
+    rope_local_base: float = 10_000.0
+    rope_global_base: float = 10_000.0
+    rope_global_scale: float = 1.0  # Linear RoPE scaling on global layers (positions are divided by this).
+    query_pre_attn_scalar: float | None = None  # None = head_dim.
 
 
-Variant = Literal["dummy", "gemma_300m", "gemma_300m_lora", "gemma_2b", "gemma_2b_lora"]
+Variant = Literal[
+    "dummy",
+    "gemma_300m",
+    "gemma_300m_lora",
+    "gemma_2b",
+    "gemma_2b_lora",
+    "gemma3_4b",
+    "gemma3_expert_1024",
+    "dummy_gemma3",
+]
+
+GEMMA3_VOCAB_SIZE = 262_208  # Embedding rows in the gemma-3-4b checkpoint (262_144 text tokens + image/padding).
+
+
+def _gemma3(width: int, depth: int, mlp_dim: int, head_dim: int, *, vocab_size: int = GEMMA3_VOCAB_SIZE) -> Config:
+    """Gemma 3 4B attention geometry (8 heads, 4 KV heads) and layer style; width/depth/mlp set per variant."""
+    return Config(
+        width=width,
+        depth=depth,
+        mlp_dim=mlp_dim,
+        num_heads=8,
+        num_kv_heads=4,
+        head_dim=head_dim,
+        vocab_size=vocab_size,
+        qk_norm=True,
+        post_norms=True,
+        sliding_window_pattern=6,
+        sliding_window=1024,
+        rope_local_base=10_000.0,
+        rope_global_base=1_000_000.0,
+        rope_global_scale=8.0,
+        query_pre_attn_scalar=float(head_dim),
+    )
 
 
 def get_config(variant: Variant) -> Config:
@@ -71,6 +115,14 @@ def get_config(variant: Variant) -> Config:
             num_kv_heads=1,
             head_dim=16,
         )
+    if variant == "gemma3_4b":
+        return _gemma3(width=2560, depth=34, mlp_dim=10_240, head_dim=256)
+    if variant == "gemma3_expert_1024":
+        # Action expert matching gemma3_4b's attention geometry (depth 34, 8 heads, 4 KV heads, head_dim 256).
+        return _gemma3(width=1024, depth=34, mlp_dim=4096, head_dim=256)
+    if variant == "dummy_gemma3":
+        # Tiny Gemma 3-style model for tests; depth 6 so one layer is global.
+        return _gemma3(width=64, depth=6, mlp_dim=128, head_dim=16, vocab_size=GEMMA3_VOCAB_SIZE)
     if variant == "gemma_300m":
         # 311M params
         return Config(
@@ -216,7 +268,7 @@ class Attention(nn.Module):
     knowledge_insulation: bool = False
 
     @nn.compact
-    def __call__(self, xs, positions, attn_mask, kv_cache):
+    def __call__(self, xs, positions, attn_mask, kv_cache, layer_idx=None):
         # all experts must share the same head dim, num heads, and num kv heads for self-attention to work
         assert all(config.head_dim == self.configs[0].head_dim for config in self.configs)
         assert all(config.num_heads == self.configs[0].num_heads for config in self.configs)
@@ -252,13 +304,26 @@ class Attention(nn.Module):
                 )
                 k, v = kv_einsum("BSD,2KDH->2BSKH", x)
                 qkvs.append((q, k, v))
+            if config.qk_norm:
+                q, k, v = qkvs[-1]
+                q = RMSNorm(name=_name("q_norm", i))(q, None)[0]
+                k = RMSNorm(name=_name("k_norm", i))(k, None)[0]
+                qkvs[-1] = (q, k, v)
 
         q, k, v = (jnp.concatenate(y, axis=1) for y in zip(*qkvs, strict=True))
 
-        q = _apply_rope(q, positions=positions)
-        q *= self.configs[0].head_dim ** -0.5
-
-        k = _apply_rope(k, positions=positions)
+        cfg = self.configs[0]
+        if cfg.sliding_window_pattern is None:
+            q = _apply_rope(q, positions=positions)
+            k = _apply_rope(k, positions=positions)
+        else:
+            # Gemma 3: global layers use a larger RoPE base with linear position scaling; local layers do not.
+            is_global = (layer_idx + 1) % cfg.sliding_window_pattern == 0
+            base = jnp.where(is_global, cfg.rope_global_base, cfg.rope_local_base)
+            rope_positions = positions / jnp.where(is_global, cfg.rope_global_scale, 1.0)
+            q = _apply_rope(q, positions=rope_positions, max_wavelength=base)
+            k = _apply_rope(k, positions=rope_positions, max_wavelength=base)
+        q *= (cfg.query_pre_attn_scalar or cfg.head_dim) ** -0.5
 
         # should still be half-precision here (if input was half-precision)
         assert q.dtype == k.dtype == v.dtype == dtype
@@ -359,7 +424,7 @@ class Block(nn.Module):
     knowledge_insulation: bool = False
 
     @nn.compact
-    def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic=True):  # noqa: FBT002
+    def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic=True, layer_idx=None):  # noqa: FBT002
         xs = sharding.activation_sharding_constraint(xs)
         drop = nn.Dropout(self.dropout, self.dropout_bdims) if self.dropout else lambda x, _: x
 
@@ -374,7 +439,11 @@ class Block(nn.Module):
             gates.append(gate if x is not None else None)
 
         pre_attn = sharding.activation_sharding_constraint(pre_attn)
-        post_attn, kv_cache = attn(pre_attn, positions, attn_mask, kv_cache)
+        post_attn, kv_cache = attn(pre_attn, positions, attn_mask, kv_cache, layer_idx)
+        post_attn = [
+            RMSNorm(name=_name("post_attention_norm", i))(y, None)[0] if y is not None and config.post_norms else y
+            for i, (y, config) in enumerate(zip(post_attn, self.configs, strict=True))
+        ]
         post_attn = jax.tree.map(lambda x: drop(x, deterministic), post_attn)
         post_attn = sharding.activation_sharding_constraint(post_attn)
         xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, post_attn, gates, strict=True)]
@@ -391,6 +460,8 @@ class Block(nn.Module):
                     name=_name("mlp", i),
                     lora_config=config.lora_configs.get("ffn"),
                 )(x)
+                if config.post_norms:
+                    x = RMSNorm(name=_name("post_ffw_norm", i))(x, None)[0]  # noqa: PLW2901
             out.append(x)
             gates.append(gate if x is not None else None)
 
@@ -429,7 +500,7 @@ class Module(nn.Module):
         assert all(config.depth == self.configs[0].depth for config in self.configs)
 
         self.embedder = Embedder(
-            vocab_size=PALIGEMMA_VOCAB_SIZE,
+            vocab_size=self.configs[0].vocab_size,
             embed_dim=self.configs[0].width,  # embedder for first expert only
             name="embedder",
         )
@@ -439,6 +510,8 @@ class Module(nn.Module):
             static_argnums=(5,),  # 0=self, 6=deterministic
             policy=jax.checkpoint_policies.nothing_saveable,
         )
+        # Gemma 3 layers differ by position in the stack (local vs global attention), so the layer index is scanned in.
+        layer_idx_axes = (0,) if self.configs[0].sliding_window_pattern is not None else ()
         self.layers = nn.scan(
             block_cls,
             variable_axes={"params": 0},
@@ -449,7 +522,8 @@ class Module(nn.Module):
                 nn.broadcast,
                 nn.broadcast,
                 nn.broadcast,
-            ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=deterministic
+                *layer_idx_axes,
+            ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=deterministic, (5=layer_idx)
             length=self.configs[0].depth,
         )(
             configs=self.configs,
@@ -496,7 +570,18 @@ class Module(nn.Module):
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
 
-        embedded, kv_cache = self.layers(embedded, kv_cache, positions, mask, adarms_cond, deterministic)
+        cfg = self.configs[0]
+        if cfg.sliding_window_pattern is None:
+            embedded, kv_cache = self.layers(embedded, kv_cache, positions, mask, adarms_cond, deterministic)
+        else:
+            if cfg.sliding_window is not None and mask.shape[-1] > cfg.sliding_window:
+                # Within the window, Gemma 3's local layers attend exactly like global ones, so no band mask is
+                # needed. Longer sequences would need it; fail loudly rather than silently diverge.
+                raise NotImplementedError(
+                    f"Sequence length {mask.shape[-1]} exceeds the Gemma 3 sliding window ({cfg.sliding_window})."
+                )
+            layer_idx = jnp.arange(cfg.depth, dtype=jnp.int32)
+            embedded, kv_cache = self.layers(embedded, kv_cache, positions, mask, adarms_cond, deterministic, layer_idx)
 
         assert all(e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None)
 

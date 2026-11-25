@@ -7,8 +7,8 @@ import pytest
 from openpi.models import gemma
 
 
-def _run(*, knowledge_insulation: bool, module=gemma):
-    configs = [module.get_config("dummy"), module.get_config("dummy")]
+def _run(*, knowledge_insulation: bool, module=gemma, variant: str = "dummy"):
+    configs = [module.get_config(variant), module.get_config(variant)]
     llm = module.Module(configs=configs, embed_dtype="float32", knowledge_insulation=knowledge_insulation)
     b, n_backbone, n_action, width = 2, 5, 3, configs[0].width
     x_backbone = jax.random.normal(jax.random.key(1), (b, n_backbone, width))
@@ -31,9 +31,10 @@ def _run(*, knowledge_insulation: bool, module=gemma):
     return action_out(params, x_backbone, x_action), grads
 
 
-def test_knowledge_insulation_blocks_action_loss_into_backbone():
-    out_plain, (_, g_backbone_plain, g_action_plain) = _run(knowledge_insulation=False)
-    out_ki, (g_params_ki, g_backbone_ki, g_action_ki) = _run(knowledge_insulation=True)
+@pytest.mark.parametrize("variant", ["dummy", "dummy_gemma3"])
+def test_knowledge_insulation_blocks_action_loss_into_backbone(variant):
+    out_plain, (_, g_backbone_plain, g_action_plain) = _run(knowledge_insulation=False, variant=variant)
+    out_ki, (g_params_ki, g_backbone_ki, g_action_ki) = _run(knowledge_insulation=True, variant=variant)
 
     # Forward pass is unchanged: stop_gradient only affects the backward pass.
     np.testing.assert_allclose(out_ki, out_plain, rtol=1e-6, atol=1e-6)
@@ -47,10 +48,11 @@ def test_knowledge_insulation_blocks_action_loss_into_backbone():
     np.testing.assert_array_equal(backbone_qkv, 0.0)
 
 
+@pytest.mark.parametrize("variant", ["dummy", "dummy_gemma3"])
 @pytest.mark.parametrize("knowledge_insulation", [False, True])
-def test_kv_cache_paths_match_full_forward(knowledge_insulation):
+def test_kv_cache_paths_match_full_forward(knowledge_insulation, variant):
     """KI only applies without a KV cache; prefix-then-suffix decoding must match one full pass."""
-    configs = [gemma.get_config("dummy"), gemma.get_config("dummy")]
+    configs = [gemma.get_config(variant), gemma.get_config(variant)]
     llm = gemma.Module(configs=configs, embed_dtype="float32", knowledge_insulation=knowledge_insulation)
     b, n_prefix, n_suffix, width = 2, 4, 3, configs[0].width
     x_prefix = jax.random.normal(jax.random.key(1), (b, n_prefix, width))
