@@ -8,8 +8,11 @@ for larger datasets like DROID -- they are working on improving it though). Belo
 
 ## Install
 
-We need a few additional dependencies for RLDS data loading. Run:
+We need a few additional dependencies for RLDS data loading. The RLDS group depends on `tensorflow-cpu==2.15.0`, which only ships wheels for **Python 3.11**. Make sure you create your virtual environment with Python 3.11 before syncing:
+
 ```bash
+uv python install 3.11
+uv venv --python 3.11
 uv sync --group rlds
 ```
 
@@ -95,7 +98,7 @@ uv run examples/droid/convert_droid_data_to_lerobot.py --data_dir <your_target_p
 ## Step 2: Run fine-tuning with your custom dataset
 
 Now we can run fine-tuning with our converted custom dataset. We provide an example config for fine-tuning `pi05_droid` on the custom dataset we created. 
-You can modify the config easily to work with other base models, or use your custom DROID dataset in `config.py` (seach for `pi05_droid_finetune`).
+You can modify the config easily to work with other base models, or use your custom DROID dataset in `config.py` (search for `pi05_droid_finetune`).
 
 To launch training:
 ```
