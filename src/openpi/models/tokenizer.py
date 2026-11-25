@@ -10,11 +10,6 @@ from transformers import AutoProcessor
 import openpi.models.utils.fsq_tokenizer as fsq_tokenizer
 import openpi.shared.download as download
 
-# Last N token ids in the PaliGemma vocab are reserved (special tokens, FAST, CoT).
-PALIGEMMA_VOCAB_SKIP_TOKENS = 128
-# CoT delimiter ids occupy the first slots of that region (before FAST action codes).
-COT_DELIMITER_TOKEN_SLOTS = 4
-
 
 class PaligemmaTokenizer:
     def __init__(self, max_len: int = 48):
@@ -51,6 +46,173 @@ class PaligemmaTokenizer:
             mask = [True] * self._max_len
 
         return np.asarray(tokens), np.asarray(mask)
+
+
+class FASTTokenizer:
+    def __init__(self, max_len: int = 256, fast_tokenizer_path: str = "physical-intelligence/fast"):
+        self._max_len = max_len
+
+        # Download base PaliGemma tokenizer
+        path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
+        with path.open("rb") as f:
+            self._paligemma_tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
+
+        # Instantiate FAST tokenizer
+        self._fast_tokenizer = AutoProcessor.from_pretrained(fast_tokenizer_path, trust_remote_code=True)
+        self._fast_skip_tokens = 128  # Skip last 128 tokens in PaliGemma vocab since they are special tokens
+
+    def tokenize(
+        self, prompt: str, state: np.ndarray, actions: np.ndarray | None
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        cleaned_text = prompt.lower().strip().replace("_", " ")
+
+        # Convention: state gets discretized into 256 discrete bins (assumed range after normalization: [-1, 1])
+        discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+
+        # Convention: prefix includes prompt and string-representation of state, followed by ';'
+        state_str = " ".join(map(str, discretized_state))
+        prefix = f"Task: {cleaned_text}, State: {state_str};\n"
+        prefix_tokens = self._paligemma_tokenizer.encode(prefix, add_bos=True)
+
+        if actions is not None:
+            # Tokenize actions with FAST tokenizer --> map to last tokens in PaliGemma vocab
+            action_tokens = self._fast_tokenizer(actions[None])[0]
+            action_tokens_in_pg = self._act_tokens_to_paligemma_tokens(action_tokens)
+
+            # Convention: postfix contains 'Action:' followed by FAST tokens, followed by '|'
+            postfix_tokens = (
+                self._paligemma_tokenizer.encode("Action: ")
+                + action_tokens_in_pg.tolist()
+                + self._paligemma_tokenizer.encode("|", add_eos=True)
+            )
+        else:
+            postfix_tokens = []
+
+        # Create output token sequence & masks
+        # AR mask is 0 on prefix (bidirectional attention) and 1 on postfix (causal attention to all previous tokens)
+        tokens = prefix_tokens + postfix_tokens
+        token_mask = [True] * len(tokens)
+        ar_mask = [0] * len(prefix_tokens) + [1] * len(postfix_tokens)
+        loss_mask = [False] * len(prefix_tokens) + [True] * len(postfix_tokens)  # Loss on postfix only
+
+        # Pad tokens to max length
+        tokens_len = len(tokens)
+        if tokens_len < self._max_len:
+            padding = [False] * (self._max_len - tokens_len)
+            tokens = tokens + padding
+            token_mask = token_mask + padding
+            ar_mask = ar_mask + padding
+            loss_mask = loss_mask + padding
+        else:
+            if len(tokens) > self._max_len:
+                logging.warning(
+                    f"Token length ({len(tokens)}) exceeds max length ({self._max_len}), truncating. "
+                    "Consider increasing the `max_token_len` in your model config if this happens frequently."
+                )
+            tokens = tokens[: self._max_len]
+            token_mask = token_mask[: self._max_len]
+            ar_mask = ar_mask[: self._max_len]
+            loss_mask = loss_mask[: self._max_len]
+
+        return np.asarray(tokens), np.asarray(token_mask), np.asarray(ar_mask), np.asarray(loss_mask)
+
+    def extract_actions(self, tokens: np.ndarray, action_horizon: int, action_dim: int) -> np.ndarray:
+        # Decode predicted output tokens
+        decoded_tokens = self._paligemma_tokenizer.decode(tokens.tolist())
+
+        # Extract actions from FAST model outputs
+        if "Action: " not in decoded_tokens:
+            return np.zeros((action_horizon, action_dim), dtype=np.float32)
+
+        # Extract actions from decoded tokens
+        raw_action_tokens = np.array(
+            self._paligemma_tokenizer.encode(decoded_tokens.split("Action: ")[1].split("|")[0].strip())
+        )
+        action_tokens = self._act_tokens_to_paligemma_tokens(raw_action_tokens)
+        return self._fast_tokenizer.decode(
+            [action_tokens.tolist()], time_horizon=action_horizon, action_dim=action_dim
+        )[0]
+
+    def _act_tokens_to_paligemma_tokens(self, tokens: np.ndarray | list[int]) -> np.ndarray:
+        if isinstance(tokens, list):
+            tokens = np.array(tokens)
+        return self._paligemma_tokenizer.vocab_size() - 1 - self._fast_skip_tokens - tokens
+
+
+###########################################################################
+## Pi0CoT tokenizers (SteerVLA fork). Upstream classes above stay untouched.
+###########################################################################
+
+# Last N token ids in the PaliGemma vocab are reserved (special tokens, FAST, CoT). Matches
+# ``FASTTokenizer._fast_skip_tokens``.
+PALIGEMMA_VOCAB_SKIP_TOKENS = 128
+# CoT delimiter ids occupy the first slots of that region (before FAST action codes). Must stay in
+# sync with the delimiter ids hard-coded in ``pi0_cot.py``.
+COT_DELIMITER_TOKEN_SLOTS = 4
+
+
+class CoTFASTTokenizer(FASTTokenizer):
+    """``FASTTokenizer`` whose action codes are shifted down by ``COT_DELIMITER_TOKEN_SLOTS``.
+
+    The CoT delimiter tokens sit directly below the 128 skipped PaliGemma ids, which is exactly where
+    upstream FAST places its first codes. Shifting the codes keeps the two disjoint.
+
+    Decoding works on token ids directly (``Action: <codes> |``) instead of upstream's
+    decode-to-text / re-encode round trip, since the generated CoT prefix contains delimiter ids
+    that do not survive a sentencepiece round trip.
+    """
+
+    def __init__(self, max_len: int = 256, fast_tokenizer_path: str = "physical-intelligence/fast"):
+        super().__init__(max_len=max_len, fast_tokenizer_path=fast_tokenizer_path)
+        self._reserved_vocab_slots = COT_DELIMITER_TOKEN_SLOTS
+
+    def _act_tokens_to_paligemma_tokens(self, tokens: np.ndarray | list[int]) -> np.ndarray:
+        return super()._act_tokens_to_paligemma_tokens(tokens) - self._reserved_vocab_slots
+
+    def extract_actions(self, tokens: np.ndarray, action_horizon: int, action_dim: int) -> np.ndarray:
+        return self.extract_actions_from_fast_segment(tokens, action_horizon, action_dim)
+
+    def _pg_tokens_to_fast_token_ids(self, pg_tokens: np.ndarray) -> np.ndarray:
+        # Inverse of ``_act_tokens_to_paligemma_tokens``, dropping ids outside the FAST codebook.
+        anchor = self._paligemma_tokenizer.vocab_size() - 1 - self._fast_skip_tokens - self._reserved_vocab_slots
+        fast_ids = anchor - np.asarray(pg_tokens, dtype=np.int64)
+        return fast_ids[(fast_ids >= 0) & (fast_ids < 4096)]
+
+    def _pg_token_ids_between_action_and_pipe(self, token_ids: np.ndarray) -> np.ndarray:
+        """Return PaliGemma token ids for the FAST action body (between ``Action:`` and ``|``)."""
+        ids = np.asarray(token_ids, dtype=np.int32).reshape(-1)
+        if ids.size == 0:
+            return np.array([], dtype=np.int32)
+
+        action_prefix = self._paligemma_tokenizer.encode("Action: ")
+        pipe_token = self._paligemma_tokenizer.encode("|")[0]
+
+        start = None
+        for i in range(len(ids) - len(action_prefix) + 1):
+            if ids[i : i + len(action_prefix)].tolist() == action_prefix:
+                start = i + len(action_prefix)
+                break
+        if start is None:
+            return np.array([], dtype=np.int32)
+
+        end = len(ids)
+        for j in range(start, len(ids)):
+            if int(ids[j]) == pipe_token:
+                end = j
+                break
+        return ids[start:end]
+
+    def extract_actions_from_fast_segment(self, tokens: np.ndarray, action_horizon: int, action_dim: int) -> np.ndarray:
+        """Decode continuous actions from a ``Action: <FAST pg tokens> |`` segment."""
+        pg_body = self._pg_token_ids_between_action_and_pipe(tokens)
+        fast_ids = self._pg_tokens_to_fast_token_ids(pg_body)
+        if fast_ids.size == 0:
+            return np.zeros((action_horizon, action_dim), dtype=np.float32)
+        return self._fast_tokenizer.decode(
+            [fast_ids.astype(np.int32).tolist()],
+            time_horizon=action_horizon,
+            action_dim=action_dim,
+        )[0]
 
 
 class CoTPaligemmaTokenizer:
@@ -92,13 +254,9 @@ class CoTPaligemmaTokenizer:
         with path.open("rb") as f:
             self._tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
 
-        self._fast_tokenizer: FASTTokenizer | None = None
+        self._fast_tokenizer: CoTFASTTokenizer | None = None
         if use_fast_tokens:
-            self._fast_tokenizer = FASTTokenizer(
-                max_len=max_fast_len,
-                fast_tokenizer_path=fast_tokenizer_path,
-                reserved_vocab_slots=COT_DELIMITER_TOKEN_SLOTS,
-            )
+            self._fast_tokenizer = CoTFASTTokenizer(max_len=max_fast_len, fast_tokenizer_path=fast_tokenizer_path)
 
     def _pad_or_truncate(
         self,
@@ -208,7 +366,7 @@ class CoTPaligemmaTokenizer:
     @property
     def vocab_size(self) -> int:
         return self._tokenizer.vocab_size()
-    
+
     def _start_of_subtask(self) -> int:
         return self._cot_reserved_token_id(1)
 
@@ -226,150 +384,6 @@ class CoTPaligemmaTokenizer:
         if not 1 <= slot <= COT_DELIMITER_TOKEN_SLOTS:
             raise ValueError(f"CoT reserved slot must be in 1..{COT_DELIMITER_TOKEN_SLOTS}, got {slot}")
         return self.vocab_size - 1 - self._cot_skip_tokens - slot
-    
-    
-
-
-class FASTTokenizer:
-    def __init__(
-        self,
-        max_len: int = 256,
-        fast_tokenizer_path: str = "physical-intelligence/fast",
-        *,
-        reserved_vocab_slots: int = 0,
-    ):
-        self._max_len = max_len
-        self._fast_skip_tokens = PALIGEMMA_VOCAB_SKIP_TOKENS
-        # Extra ids reserved before FAST codes (e.g. CoT delimiter tokens in Pi0CoT).
-        self._reserved_vocab_slots = reserved_vocab_slots
-
-        # Download base PaliGemma tokenizer
-        path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
-        with path.open("rb") as f:
-            self._paligemma_tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
-
-        # Instantiate FAST tokenizer
-        self._fast_tokenizer = AutoProcessor.from_pretrained(fast_tokenizer_path, trust_remote_code=True)
-
-    def tokenize(
-        self, prompt: str, state: np.ndarray, actions: np.ndarray | None
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        cleaned_text = prompt.lower().strip().replace("_", " ")
-
-        # Convention: state gets discretized into 256 discrete bins (assumed range after normalization: [-1, 1])
-        discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
-
-        # Convention: prefix includes prompt and string-representation of state, followed by ';'
-        state_str = " ".join(map(str, discretized_state))
-        prefix = f"Task: {cleaned_text}, State: {state_str};\n"
-        prefix_tokens = self._paligemma_tokenizer.encode(prefix, add_bos=True)
-
-        if actions is not None:
-            # Tokenize actions with FAST tokenizer --> map to last tokens in PaliGemma vocab
-            action_tokens = self._fast_tokenizer(actions[None])[0]
-            action_tokens_in_pg = self._act_tokens_to_paligemma_tokens(action_tokens)
-
-            # Convention: postfix contains 'Action:' followed by FAST tokens, followed by '|'
-            postfix_tokens = (
-                self._paligemma_tokenizer.encode("Action: ")
-                + action_tokens_in_pg.tolist()
-                + self._paligemma_tokenizer.encode("|", add_eos=True)
-            )
-        else:
-            postfix_tokens = []
-
-        # Create output token sequence & masks
-        # AR mask is 0 on prefix (bidirectional attention) and 1 on postfix (causal attention to all previous tokens)
-        tokens = prefix_tokens + postfix_tokens
-        token_mask = [True] * len(tokens)
-        ar_mask = [0] * len(prefix_tokens) + [1] * len(postfix_tokens)
-        loss_mask = [False] * len(prefix_tokens) + [True] * len(postfix_tokens)  # Loss on postfix only
-
-        # Pad tokens to max length
-        tokens_len = len(tokens)
-        if tokens_len < self._max_len:
-            padding = [False] * (self._max_len - tokens_len)
-            tokens = tokens + padding
-            token_mask = token_mask + padding
-            ar_mask = ar_mask + padding
-            loss_mask = loss_mask + padding
-        else:
-            if len(tokens) > self._max_len:
-                logging.warning(
-                    f"Token length ({len(tokens)}) exceeds max length ({self._max_len}), truncating. "
-                    "Consider increasing the `max_token_len` in your model config if this happens frequently."
-                )
-            tokens = tokens[: self._max_len]
-            token_mask = token_mask[: self._max_len]
-            ar_mask = ar_mask[: self._max_len]
-            loss_mask = loss_mask[: self._max_len]
-
-        return np.asarray(tokens), np.asarray(token_mask), np.asarray(ar_mask), np.asarray(loss_mask)
-
-    def extract_actions(self, tokens: np.ndarray, action_horizon: int, action_dim: int) -> np.ndarray:
-        return self.extract_actions_from_fast_segment(tokens, action_horizon, action_dim)
-
-    def _fast_pg_anchor(self) -> int:
-        return (
-            self._paligemma_tokenizer.vocab_size()
-            - 1
-            - self._fast_skip_tokens
-            - self._reserved_vocab_slots
-        )
-
-    def _pg_tokens_to_fast_token_ids(self, pg_tokens: np.ndarray) -> np.ndarray:
-        anchor = self._fast_pg_anchor()
-        fast_ids = anchor - np.asarray(pg_tokens, dtype=np.int64)
-        return fast_ids[(fast_ids >= 0) & (fast_ids < 4096)]
-
-    def _pg_token_ids_between_action_and_pipe(self, token_ids: np.ndarray) -> np.ndarray:
-        """Return PaliGemma token ids for the FAST action body (between ``Action:`` and ``|``)."""
-        ids = np.asarray(token_ids, dtype=np.int32).reshape(-1)
-        if ids.size == 0:
-            return np.array([], dtype=np.int32)
-
-        action_prefix = self._paligemma_tokenizer.encode("Action: ")
-        pipe_token = self._paligemma_tokenizer.encode("|")[0]
-
-        start = None
-        for i in range(len(ids) - len(action_prefix) + 1):
-            if ids[i : i + len(action_prefix)].tolist() == action_prefix:
-                start = i + len(action_prefix)
-                break
-        if start is None:
-            return np.array([], dtype=np.int32)
-
-        end = len(ids)
-        for j in range(start, len(ids)):
-            if int(ids[j]) == pipe_token:
-                end = j
-                break
-        return ids[start:end]
-
-    def extract_actions_from_fast_segment(
-        self, tokens: np.ndarray, action_horizon: int, action_dim: int
-    ) -> np.ndarray:
-        """Decode continuous actions from a ``Action: <FAST pg tokens> |`` segment."""
-        pg_body = self._pg_token_ids_between_action_and_pipe(tokens)
-        fast_ids = self._pg_tokens_to_fast_token_ids(pg_body)
-        if fast_ids.size == 0:
-            return np.zeros((action_horizon, action_dim), dtype=np.float32)
-        return self._fast_tokenizer.decode(
-            [fast_ids.astype(np.int32).tolist()],
-            time_horizon=action_horizon,
-            action_dim=action_dim,
-        )[0]
-
-    def _act_tokens_to_paligemma_tokens(self, tokens: np.ndarray | list[int]) -> np.ndarray:
-        if isinstance(tokens, list):
-            tokens = np.array(tokens)
-        return (
-            self._paligemma_tokenizer.vocab_size()
-            - 1
-            - self._fast_skip_tokens
-            - self._reserved_vocab_slots
-            - tokens
-        )
 
 
 ###########################################################################
