@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 from typing_extensions import override
 
+from openpi.models import backbone as _backbone
 from openpi.models import model as _model
 import openpi.models.gemma as _gemma
 from openpi.shared import array_typing as at
@@ -34,6 +35,10 @@ class Pi0Config(_model.BaseModelConfig):
     discrete_state_input: bool = None  # type: ignore
     # Stop gradients from action expert → VLM backbone in attention (Driess et al., 2025).
     knowledge_insulation: bool = False
+    # VLM backbone ("paligemma" or "gemma3") and its input resolution (None = backbone default: 224 / 896).
+    # Gemma 3 also needs paligemma_variant="gemma3_4b" (and a gemma3_* action expert); see models/backbone.py.
+    backbone: _backbone.Backbone = "paligemma"
+    image_resolution: int | None = None
 
     pytorch_compile_mode: str | None = "max-autotune"
 
@@ -65,7 +70,7 @@ class Pi0Config(_model.BaseModelConfig):
 
     @override
     def inputs_spec(self, *, batch_size: int = 1) -> tuple[_model.Observation, _model.Actions]:
-        image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
+        image_spec = jax.ShapeDtypeStruct([batch_size, *_backbone.resolution(self), 3], jnp.float32)
         image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
 
         with at.disable_typechecking():
@@ -154,6 +159,11 @@ class Pi0CoTConfig(_model.BaseModelConfig):
     # transforms stay in agreement (see ``SteerVLAInputs.image_keys``).
     image_keys: tuple[str, ...] | None = None
 
+    # VLM backbone ("paligemma" or "gemma3") and its input resolution (None = backbone default: 224 / 896).
+    # Gemma 3 also needs paligemma_variant="gemma3_4b" (and a gemma3_* action expert); see models/backbone.py.
+    backbone: _backbone.Backbone = "paligemma"
+    image_resolution: int | None = None
+
     # Inference-only override of :attr:`image_keys`, applied by :meth:`Pi0CoT.sample_cot` /
     # :meth:`Pi0CoT.sample_actions` when the call does not pass ``image_keys`` explicitly. Use this
     # to serve a checkpoint trained on all three streams from a single-camera rig; prefer
@@ -189,7 +199,7 @@ class Pi0CoTConfig(_model.BaseModelConfig):
 
     @override
     def inputs_spec(self, *, batch_size: int = 1) -> tuple[_model.Observation, _model.Actions]:
-        image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
+        image_spec = jax.ShapeDtypeStruct([batch_size, *_backbone.resolution(self), 3], jnp.float32)
         image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
 
         fast_spec = {}

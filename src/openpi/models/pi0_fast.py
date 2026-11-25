@@ -9,9 +9,9 @@ import jax
 import jax.numpy as jnp
 from typing_extensions import override
 
+from openpi.models import backbone as _backbone
 from openpi.models import model as _model
 import openpi.models.gemma_fast as _gemma
-import openpi.models.siglip as _siglip
 from openpi.shared import array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
 
@@ -88,6 +88,11 @@ class Pi0FASTConfig(_model.BaseModelConfig):
     # Keyword arguments for the fast model tokenizer.
     fast_model_tokenizer_kwargs: dict[str, Any] | None = None
 
+    # VLM backbone ("paligemma" or "gemma3") and its input resolution (None = backbone default: 224 / 896).
+    # Gemma 3 also needs paligemma_variant="gemma3_4b" (and a gemma3_* action expert); see models/backbone.py.
+    backbone: _backbone.Backbone = "paligemma"
+    image_resolution: int | None = None
+
     @property
     @override
     def model_type(self) -> _model.ModelType:
@@ -99,7 +104,7 @@ class Pi0FASTConfig(_model.BaseModelConfig):
 
     @override
     def inputs_spec(self, *, batch_size: int = 1) -> tuple[_model.Observation, _model.Actions]:
-        image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
+        image_spec = jax.ShapeDtypeStruct([batch_size, *_backbone.resolution(self), 3], jnp.float32)
         image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
 
         with at.disable_typechecking():
@@ -134,6 +139,8 @@ class Pi0FASTConfig(_model.BaseModelConfig):
 class Pi0FAST(_model.BaseModel):
     def __init__(self, config: Pi0FASTConfig, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
+        _backbone.validate(config, vlm_variant=config.paligemma_variant)
+        self.image_resolution = _backbone.resolution(config)
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
         llm = nnx_bridge.ToNNX(
@@ -144,15 +151,7 @@ class Pi0FAST(_model.BaseModel):
             )
         )
         llm.lazy_init(rngs=rngs, method="init")
-        img = nnx_bridge.ToNNX(
-            _siglip.Module(
-                num_classes=paligemma_config.width,
-                variant="So400m/14",
-                pool_type="none",
-                scan=True,
-                dtype_mm=config.dtype,
-            )
-        )
+        img = nnx_bridge.ToNNX(_backbone.image_encoder(config, llm_width=paligemma_config.width))
         img.lazy_init(next(iter(config.fake_obs().images.values())), train=False, rngs=rngs)
         self.PaliGemma = nnx.Dict(llm=llm, img=img)
 
@@ -199,7 +198,11 @@ class Pi0FAST(_model.BaseModel):
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
         observation = _model.preprocess_observation(
-            rng, observation, train=train, image_keys=list(observation.images.keys())
+            rng,
+            observation,
+            train=train,
+            image_keys=list(observation.images.keys()),
+            image_resolution=self.image_resolution,
         )
 
         # Compute inputs: one big forward pass of prefix + suffix at once
@@ -243,7 +246,11 @@ class Pi0FAST(_model.BaseModel):
     ) -> _model.Actions:
         # TODO: this is a hack to get the image keys.
         observation = _model.preprocess_observation(
-            None, observation, train=False, image_keys=list(observation.images.keys())
+            None,
+            observation,
+            train=False,
+            image_keys=list(observation.images.keys()),
+            image_resolution=self.image_resolution,
         )
 
         # embed inputs

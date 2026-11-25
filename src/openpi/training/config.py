@@ -14,10 +14,10 @@ import numpy as np
 from typing_extensions import override
 import tyro
 
+import openpi.models.backbone as _backbone
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
-import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
@@ -123,9 +123,9 @@ class ModelTransformFactory(GroupFactory):
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
-                        _transforms.ResizeImages(224, 224),
+                        _transforms.ResizeImages(*_backbone.resolution(model_config)),
                         _transforms.TokenizePrompt(
-                            _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                            _backbone.prompt_tokenizer(model_config, model_config.max_token_len),
                         ),
                         _transforms.PadStatesAndActions(model_config.action_dim),
                     ],
@@ -135,9 +135,9 @@ class ModelTransformFactory(GroupFactory):
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
-                        _transforms.ResizeImages(224, 224),
+                        _transforms.ResizeImages(*_backbone.resolution(model_config)),
                         _transforms.TokenizePrompt(
-                            _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                            _backbone.prompt_tokenizer(model_config, model_config.max_token_len),
                             discrete_state_input=model_config.discrete_state_input,
                         ),
                         _transforms.PadStatesAndActions(model_config.action_dim),
@@ -145,7 +145,7 @@ class ModelTransformFactory(GroupFactory):
                 )
             case _model.ModelType.PI0_FAST:
                 tokenizer_cls = (
-                    _tokenizer.FASTTokenizer
+                    _backbone.fast_tokenizer_cls(model_config)
                     if model_config.fast_model_tokenizer is None
                     else model_config.fast_model_tokenizer
                 )
@@ -155,7 +155,7 @@ class ModelTransformFactory(GroupFactory):
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
-                        _transforms.ResizeImages(224, 224),
+                        _transforms.ResizeImages(*_backbone.resolution(model_config)),
                         _transforms.TokenizeFASTInputs(
                             tokenizer_cls(model_config.max_token_len, **tokenizer_kwargs),
                         ),
@@ -762,9 +762,10 @@ class RLDSSteerVLACoTDataConfig(RLDSSteerVLADataConfig):
             max_reasoning_len=self.max_reasoning_len,
             max_fast_len=self.max_fast_len,
             use_fast_tokens=use_fast_tokens,
+            backbone=getattr(model_config, "backbone", "paligemma"),
         )
         tokenize_inputs: list = [
-            _transforms.ResizeImages(224, 224),
+            _transforms.ResizeImages(*_backbone.resolution(model_config)),
             _transforms.PadStatesAndActions(model_config.action_dim),
             _transforms.TokenizeCoTPrompt(cot_tokenizer, prompt_state_dim=prompt_state_dim),
         ]

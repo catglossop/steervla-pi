@@ -68,7 +68,7 @@ def get_steervla_configs():
     from openpi.training.config import SimpleDataConfig
     from openpi.training.config import TrainConfig
 
-    return [
+    configs = [
         #
         # SteerVLA (nuScenes driving) configs.
         #
@@ -1145,3 +1145,37 @@ def get_steervla_configs():
             ),
         ),
     ]
+    configs.append(_gemma3_variant(configs, "pi05_steervla_cot_simplified_reasoning_norm", AssetsConfig))
+    return configs
+
+
+def _gemma3_variant(configs, parent_name: str, assets_config_cls):
+    """Same data, token budgets and schedule as ``parent_name``, on a Gemma 3 4B backbone.
+
+    The action expert matches Gemma 3's attention geometry and starts from scratch (no pi05_base
+    pretraining), so expect a slower start than the PaliGemma parent. Norm stats come from the parent:
+    they describe the data (state/actions), not the backbone.
+    """
+    import dataclasses
+
+    parent = next(c for c in configs if c.name == parent_name)
+    name = parent_name.replace("pi05_", "gemma3_", 1)
+    return dataclasses.replace(
+        parent,
+        name=name,
+        exp_name=name,
+        model=dataclasses.replace(
+            parent.model,
+            backbone="gemma3",
+            paligemma_variant="gemma3_4b",
+            action_expert_variant="gemma3_expert_1024",
+            # Native Gemma 3 resolution. The SimLingo frames are 512px, so 448 is a cheaper option that
+            # avoids upsampling (position embeddings are interpolated at load time).
+            image_resolution=896,
+        ),
+        data=dataclasses.replace(
+            parent.data,
+            assets=assets_config_cls(assets_dir=f"./assets/{parent_name}", asset_id=parent.data.repo_id),
+        ),
+        weight_loader=weight_loaders.Gemma3WeightLoader("google/gemma-3-4b-pt"),
+    )

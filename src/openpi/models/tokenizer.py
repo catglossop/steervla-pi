@@ -1,5 +1,7 @@
 import logging
 import os
+import pathlib
+from typing import Literal
 
 import jax
 import numpy as np
@@ -146,9 +148,61 @@ class FASTTokenizer:
 # Last N token ids in the PaliGemma vocab are reserved (special tokens, FAST, CoT). Matches
 # ``FASTTokenizer._fast_skip_tokens``.
 PALIGEMMA_VOCAB_SKIP_TOKENS = 128
-# CoT delimiter ids occupy the first slots of that region (before FAST action codes). Must stay in
-# sync with the delimiter ids hard-coded in ``pi0_cot.py``.
+# CoT delimiter ids occupy the first slots of that region (before FAST action codes). ``pi0_cot.py``
+# reads them from ``cot_delimiter_ids`` so the model and tokenizer cannot drift apart.
 COT_DELIMITER_TOKEN_SLOTS = 4
+
+# VLM backbone whose SentencePiece model tokenizes text. Gemma 3's top 6143 ids are all <unused>, so the
+# same "count down from the top" layout (128 skipped, 4 CoT delimiters, FAST codes) works for both.
+Backbone = Literal["paligemma", "gemma3"]
+GEMMA3_TOKENIZER_REPO = "google/gemma-3-4b-pt"
+# SentencePiece vocab sizes (not embedding-table sizes: Gemma 3's table has 64 extra image/padding rows).
+SP_VOCAB_SIZE = {"paligemma": 257_152, "gemma3": 262_144}
+
+
+def load_sentencepiece(backbone: Backbone = "paligemma") -> sentencepiece.SentencePieceProcessor:
+    if backbone == "paligemma":
+        path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
+        model_proto = path.read_bytes()
+    elif backbone == "gemma3":
+        import huggingface_hub
+
+        # Gated repo: needs HF_TOKEN with the Gemma license accepted.
+        model_proto = pathlib.Path(
+            huggingface_hub.hf_hub_download(GEMMA3_TOKENIZER_REPO, "tokenizer.model")
+        ).read_bytes()
+    else:
+        raise ValueError(f"Unknown backbone: {backbone}")
+    sp = sentencepiece.SentencePieceProcessor(model_proto=model_proto)
+    assert sp.vocab_size() == SP_VOCAB_SIZE[backbone], (backbone, sp.vocab_size())
+    return sp
+
+
+def cot_delimiter_ids(backbone: Backbone = "paligemma") -> dict[str, int]:
+    """Token ids of the CoT delimiters, shared by ``CoTPaligemmaTokenizer`` and ``Pi0CoT``."""
+    top = SP_VOCAB_SIZE[backbone] - 1 - PALIGEMMA_VOCAB_SKIP_TOKENS
+    return {
+        "start_of_subtask": top - 1,
+        "end_of_subtask": top - 2,
+        "start_of_reasoning": top - 3,
+        "end_of_reasoning": top - 4,
+    }
+
+
+class Gemma3Tokenizer(PaligemmaTokenizer):
+    """``PaligemmaTokenizer`` (same prompt format) on Gemma 3's SentencePiece model."""
+
+    def __init__(self, max_len: int = 48):
+        self._max_len = max_len
+        self._tokenizer = load_sentencepiece("gemma3")
+
+
+class Gemma3FASTTokenizer(FASTTokenizer):
+    """``FASTTokenizer`` on Gemma 3's SentencePiece model; FAST codes land in Gemma 3's <unused> ids."""
+
+    def __init__(self, max_len: int = 256, fast_tokenizer_path: str = "physical-intelligence/fast"):
+        super().__init__(max_len=max_len, fast_tokenizer_path=fast_tokenizer_path)
+        self._paligemma_tokenizer = load_sentencepiece("gemma3")
 
 
 class CoTFASTTokenizer(FASTTokenizer):
@@ -162,9 +216,17 @@ class CoTFASTTokenizer(FASTTokenizer):
     that do not survive a sentencepiece round trip.
     """
 
-    def __init__(self, max_len: int = 256, fast_tokenizer_path: str = "physical-intelligence/fast"):
+    def __init__(
+        self,
+        max_len: int = 256,
+        fast_tokenizer_path: str = "physical-intelligence/fast",
+        *,
+        backbone: Backbone = "paligemma",
+    ):
         super().__init__(max_len=max_len, fast_tokenizer_path=fast_tokenizer_path)
         self._reserved_vocab_slots = COT_DELIMITER_TOKEN_SLOTS
+        if backbone != "paligemma":
+            self._paligemma_tokenizer = load_sentencepiece(backbone)
 
     def _act_tokens_to_paligemma_tokens(self, tokens: np.ndarray | list[int]) -> np.ndarray:
         return super()._act_tokens_to_paligemma_tokens(tokens) - self._reserved_vocab_slots
@@ -239,6 +301,7 @@ class CoTPaligemmaTokenizer:
         max_fast_len: int = 64,
         use_fast_tokens: bool = False,
         fast_tokenizer_path: str = "physical-intelligence/fast",
+        backbone: Backbone = "paligemma",
     ):
         self._max_prompt_len = max_prompt_len
         self._max_subtask_len = max_subtask_len
@@ -247,14 +310,15 @@ class CoTPaligemmaTokenizer:
         self.use_fast_tokens = use_fast_tokens
 
         self._cot_skip_tokens = PALIGEMMA_VOCAB_SKIP_TOKENS
+        self.backbone = backbone
 
-        path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
-        with path.open("rb") as f:
-            self._tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
+        self._tokenizer = load_sentencepiece(backbone)
 
         self._fast_tokenizer: CoTFASTTokenizer | None = None
         if use_fast_tokens:
-            self._fast_tokenizer = CoTFASTTokenizer(max_len=max_fast_len, fast_tokenizer_path=fast_tokenizer_path)
+            self._fast_tokenizer = CoTFASTTokenizer(
+                max_len=max_fast_len, fast_tokenizer_path=fast_tokenizer_path, backbone=backbone
+            )
 
     def _pad_or_truncate(
         self,
@@ -375,7 +439,9 @@ class CoTPaligemmaTokenizer:
         """Map CoT delimiter slot (1..COT_DELIMITER_TOKEN_SLOTS) to a PaliGemma token id."""
         if not 1 <= slot <= COT_DELIMITER_TOKEN_SLOTS:
             raise ValueError(f"CoT reserved slot must be in 1..{COT_DELIMITER_TOKEN_SLOTS}, got {slot}")
-        return self.vocab_size - 1 - self._cot_skip_tokens - slot
+        token_id = self.vocab_size - 1 - self._cot_skip_tokens - slot
+        assert token_id == list(cot_delimiter_ids(self.backbone).values())[slot - 1]
+        return token_id
 
 
 ###########################################################################

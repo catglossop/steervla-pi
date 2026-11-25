@@ -41,36 +41,34 @@ import jax
 import jax.numpy as jnp
 from typing_extensions import override
 
+from openpi.models import backbone as _backbone
 from openpi.models import model as _model
 from openpi.models import pi0
 from openpi.models import pi0_config
 import openpi.models.gemma as _gemma
-import openpi.models.siglip as _siglip
-from openpi.models.tokenizer import PALIGEMMA_VOCAB_SKIP_TOKENS
+from openpi.models.tokenizer import cot_delimiter_ids
 from openpi.shared import array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
 
 logger = logging.getLogger("openpi")
 
-# Must match ``CoTPaligemmaTokenizer`` reserved-token layout.
-START_OF_SUBTASK_ID = _gemma.PALIGEMMA_VOCAB_SIZE - 1 - PALIGEMMA_VOCAB_SKIP_TOKENS - 1
-END_OF_SUBTASK_ID = _gemma.PALIGEMMA_VOCAB_SIZE - 1 - PALIGEMMA_VOCAB_SKIP_TOKENS - 2
-START_OF_REASONING_ID = _gemma.PALIGEMMA_VOCAB_SIZE - 1 - PALIGEMMA_VOCAB_SKIP_TOKENS - 3
-END_OF_REASONING_ID = _gemma.PALIGEMMA_VOCAB_SIZE - 1 - PALIGEMMA_VOCAB_SKIP_TOKENS - 4
+# CoT delimiter ids for the PaliGemma backbone. Models read the ids for their own backbone from
+# ``tokenizer.cot_delimiter_ids`` (shared with ``CoTPaligemmaTokenizer``), so these are informational.
+_PALIGEMMA_COT_IDS = cot_delimiter_ids("paligemma")
+START_OF_SUBTASK_ID = _PALIGEMMA_COT_IDS["start_of_subtask"]
+END_OF_SUBTASK_ID = _PALIGEMMA_COT_IDS["end_of_subtask"]
+START_OF_REASONING_ID = _PALIGEMMA_COT_IDS["start_of_reasoning"]
+END_OF_REASONING_ID = _PALIGEMMA_COT_IDS["end_of_reasoning"]
 
 _COT_MODULE_JIT_CACHE: dict[int, dict[str, object]] = {}
 
 
-@functools.lru_cache(maxsize=1)
-def _fast_segment_layout_token_ids() -> tuple[tuple[int, ...], int, int]:
+@functools.lru_cache(maxsize=2)
+def _fast_segment_layout_token_ids(backbone: str = "paligemma") -> tuple[tuple[int, ...], int, int]:
     """``Action:`` prefix, ``|`` delimiter, and EOS ids for FAST segment generation."""
-    import sentencepiece
+    from openpi.models.tokenizer import load_sentencepiece
 
-    from openpi.shared import download
-
-    path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
-    with path.open("rb") as f:
-        sp = sentencepiece.SentencePieceProcessor(model_proto=f.read())
+    sp = load_sentencepiece(backbone)
     return tuple(int(x) for x in sp.encode("Action: ")), int(sp.encode("|")[0]), int(sp.eos_id())
 
 
@@ -80,6 +78,15 @@ class Pi0CoT(_model.BaseModel):
     def __init__(self, config: "pi0_config.Pi0CoTConfig", rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.cot_loss_weight = config.cot_loss_weight
+
+        _backbone.validate(config, vlm_variant=config.paligemma_variant, expert_variant=config.action_expert_variant)
+        self._backbone = config.backbone
+        self.image_resolution = _backbone.resolution(config)
+        cot_ids = cot_delimiter_ids(config.backbone)
+        self._start_of_subtask_id = cot_ids["start_of_subtask"]
+        self._end_of_subtask_id = cot_ids["end_of_subtask"]
+        self._start_of_reasoning_id = cot_ids["start_of_reasoning"]
+        self._end_of_reasoning_id = cot_ids["end_of_reasoning"]
 
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
@@ -93,15 +100,7 @@ class Pi0CoT(_model.BaseModel):
             )
         )
         llm.lazy_init(rngs=rngs, method="init", use_adarms=[False, True])
-        img = nnx_bridge.ToNNX(
-            _siglip.Module(
-                num_classes=paligemma_config.width,
-                variant="So400m/14",
-                pool_type="none",
-                scan=True,
-                dtype_mm=config.dtype,
-            )
-        )
+        img = nnx_bridge.ToNNX(_backbone.image_encoder(config, llm_width=paligemma_config.width))
         img.lazy_init(next(iter(config.fake_obs().images.values())), train=False, rngs=rngs)
 
         self.PaliGemma = nnx.Dict(llm=llm, img=img)
@@ -273,7 +272,11 @@ class Pi0CoT(_model.BaseModel):
     ) -> tuple[jnp.ndarray, dict[str, jnp.ndarray]]:
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(
-            preprocess_rng, observation, train=train, image_keys=self._image_keys
+            preprocess_rng,
+            observation,
+            train=train,
+            image_keys=self._image_keys,
+            image_resolution=self.image_resolution,
         )
 
         batch_shape = actions.shape[:-2]
@@ -655,7 +658,7 @@ class Pi0CoT(_model.BaseModel):
         # below.
         if mr > 0:
             rng, sor_tok = self._cot_decode_token(h, rng, temperature)
-            sor_tok = jnp.where(sor_tok == START_OF_REASONING_ID, sor_tok, START_OF_REASONING_ID)
+            sor_tok = jnp.where(sor_tok == self._start_of_reasoning_id, sor_tok, self._start_of_reasoning_id)
             rea_buf = rea_buf.at[:, 0].set(sor_tok)
             rea_m = rea_m.at[:, 0].set(True)
             h, kv_cache, abs_pos, key_mask, cur_pos = self._cot_forward_fixed(
@@ -679,7 +682,7 @@ class Pi0CoT(_model.BaseModel):
             tok = jnp.where(active, tok, jnp.int32(0))
             rea_buf = rea_buf.at[:, j].set(tok)
             rea_m = rea_m.at[:, j].set(active)
-            done = done | (active & (tok == END_OF_REASONING_ID))
+            done = done | (active & (tok == self._end_of_reasoning_id))
             should_forward = (j < (mr - 1)) & jnp.any(~done)
 
             def do_forward(args):
@@ -717,7 +720,7 @@ class Pi0CoT(_model.BaseModel):
         rr = jnp.arange(mr, dtype=jnp.int32)[None, :]
         pos_r = rr
         generated_len_r = jnp.sum(rea_m, axis=-1, dtype=jnp.int32)
-        matches_end_r = (rea_buf == END_OF_REASONING_ID) & rea_m
+        matches_end_r = (rea_buf == self._end_of_reasoning_id) & rea_m
         has_end_r = jnp.any(matches_end_r, axis=-1)
         first_end_r = jnp.min(jnp.where(matches_end_r, pos_r, mr), axis=-1)
         # End marker position in the normalized reasoning segment.
@@ -732,16 +735,16 @@ class Pi0CoT(_model.BaseModel):
         if mr > 0:
             safe_end_pos = jnp.clip(end_pos_r, 0, mr - 1)
             write_end = (~overflow_end)[:, None] & (rr == safe_end_pos[:, None])
-            rea_buf = jnp.where(write_end, END_OF_REASONING_ID, rea_buf)
+            rea_buf = jnp.where(write_end, self._end_of_reasoning_id, rea_buf)
             rea_m = rea_m | write_end
 
         # If we ran out of reasoning budget, force end-of-reasoning at the tail slot.
         if mr == 1:
-            rea_buf = jnp.where(overflow_end[:, None], END_OF_REASONING_ID, rea_buf)
+            rea_buf = jnp.where(overflow_end[:, None], self._end_of_reasoning_id, rea_buf)
             rea_m = jnp.where(overflow_end[:, None], jnp.ones_like(rea_m), rea_m)
         elif mr > 1:
             tail_end = overflow_end[:, None] & (rr == (mr - 1))
-            rea_buf = jnp.where(tail_end, END_OF_REASONING_ID, rea_buf)
+            rea_buf = jnp.where(tail_end, self._end_of_reasoning_id, rea_buf)
             rea_m = jnp.where(overflow_end[:, None], rr < mr, rea_m)
 
         def catchup_cond(carry):
@@ -779,7 +782,7 @@ class Pi0CoT(_model.BaseModel):
         # Bootstrap subtask with <start_of_subtask> (sampled from h or appended).
         if ms > 0:
             rng, sos_tok = self._cot_decode_token(h, rng, temperature)
-            sos_tok = jnp.where(sos_tok == START_OF_SUBTASK_ID, sos_tok, START_OF_SUBTASK_ID)
+            sos_tok = jnp.where(sos_tok == self._start_of_subtask_id, sos_tok, self._start_of_subtask_id)
             sub_buf = sub_buf.at[:, 0].set(sos_tok)
             sub_m = sub_m.at[:, 0].set(True)
             h, kv_cache, abs_pos, key_mask, cur_pos = self._cot_forward_fixed(
@@ -803,7 +806,7 @@ class Pi0CoT(_model.BaseModel):
             tok = jnp.where(active, tok, jnp.int32(0))
             sub_buf = sub_buf.at[:, i].set(tok)
             sub_m = sub_m.at[:, i].set(active)
-            done = done | (active & (tok == END_OF_SUBTASK_ID))
+            done = done | (active & (tok == self._end_of_subtask_id))
             should_forward = (i < (ms - 1)) & jnp.any(~done)
 
             def do_forward(args):
@@ -827,7 +830,7 @@ class Pi0CoT(_model.BaseModel):
             (sub_start, rng, h, kv_cache, abs_pos, key_mask, cur_pos, sub_buf, sub_m, done_s),
         )
         pos_s = jnp.arange(ms, dtype=jnp.int32)[None, :]
-        matches_end_s = (sub_buf == END_OF_SUBTASK_ID) & sub_m
+        matches_end_s = (sub_buf == self._end_of_subtask_id) & sub_m
         has_end_s = jnp.any(matches_end_s, axis=-1)
         first_end_s = jnp.min(jnp.where(matches_end_s, pos_s, ms), axis=-1)
         total_len_s = jnp.where(has_end_s, first_end_s + 1, jnp.sum(sub_m, axis=-1))
@@ -837,7 +840,7 @@ class Pi0CoT(_model.BaseModel):
         fast_buf = jnp.zeros((batch_size, mf), dtype=jnp.int32)
         fast_m = jnp.zeros((batch_size, mf), dtype=jnp.bool_)
         if mf > 0:
-            action_prefix_ids, pipe_token_id, eos_token_id = _fast_segment_layout_token_ids()
+            action_prefix_ids, pipe_token_id, eos_token_id = _fast_segment_layout_token_ids(self._backbone)
             idx = 0
             for tok_id in action_prefix_ids:
                 if idx >= mf:
@@ -935,7 +938,9 @@ class Pi0CoT(_model.BaseModel):
     ) -> dict[str, jnp.ndarray]:
         """Autoregressively sample reasoning, subtask, and optional FAST tokens from images + prompt."""
         keys = tuple(image_keys) if image_keys is not None else self._preprocess_image_keys
-        observation = _model.preprocess_observation(None, observation, train=False, image_keys=keys)
+        observation = _model.preprocess_observation(
+            None, observation, train=False, image_keys=keys, image_resolution=self.image_resolution
+        )
         if observation.tokenized_prompt is None or observation.tokenized_prompt_mask is None:
             raise ValueError("sample_cot requires tokenized_prompt and tokenized_prompt_mask")
 
@@ -984,7 +989,9 @@ class Pi0CoT(_model.BaseModel):
     ) -> _model.Actions:
         """Flow-match denoise from prefix KV + action suffix."""
         keys = tuple(image_keys) if image_keys is not None else self._preprocess_image_keys
-        observation = _model.preprocess_observation(None, observation, train=False, image_keys=keys)
+        observation = _model.preprocess_observation(
+            None, observation, train=False, image_keys=keys, image_resolution=self.image_resolution
+        )
         batch_size = observation.state.shape[0]
 
         # --- Build prefix: images + prompt + reasoning + subtask ---

@@ -82,6 +82,16 @@ For large datasets you also add an RLDS dataset class (see `steervla_rlds_datase
 - The FAST tokens in the CoT prefix use `CoTFASTTokenizer`, which shifts FAST codes down by `COT_DELIMITER_TOKEN_SLOTS` so they don't collide with the delimiters. Upstream `FASTTokenizer` is untouched.
 - Knowledge insulation (`knowledge_insulation=True`, on `Pi0Config` and `Pi0CoTConfig`) lives in `gemma.Attention`: when both experts run without a KV cache (i.e. training), action-expert queries read the backbone's K/V through `stop_gradient`, so the flow loss never updates the VLM. It reuses upstream's attention math (`_attend`) on the two query groups; `models/gemma_test.py` pins the behavior.
 
+### VLM backbone: PaliGemma or Gemma 3 4B
+
+`Pi0Config`, `Pi0CoTConfig` and `Pi0FASTConfig` take `backbone="paligemma"` (default; unchanged upstream behavior) or `"gemma3"`, plus `image_resolution` (None = 224 / 896; Gemma 3 needs a multiple of 224). Everything backbone-specific is resolved in `models/backbone.py`. Gemma 3 also needs matching variants, which `backbone.validate` enforces at model creation: `paligemma_variant="gemma3_4b"` and, for the flow models, `action_expert_variant="gemma3_expert_1024"`. See `gemma3_steervla_cot_simplified_reasoning_norm` in `training/misc/steervla_config.py`.
+
+- The action expert shares every attention layer with the VLM, so it must match Gemma 3's geometry (34 layers, 8 heads, 4 KV heads, head_dim 256). No pretrained expert exists: it starts from scratch, and there is no π₀.₅ robot pretraining.
+- Gemma 3 layers are options on `gemma.Config` / `gemma_fast` (QK-norm, post norms, local/global RoPE); all default to PaliGemma. The 1024-token sliding window is not masked: sequences are asserted to fit inside it, where local == global attention.
+- Weights: `Gemma3WeightLoader` converts `google/gemma-3-4b-pt` safetensors in memory (gated: `HF_TOKEN` with the Gemma license accepted) and resizes the vision position embedding to `image_resolution`. The Gemma 3 tokenizer is also fetched from that repo.
+- Token ids: CoT delimiters and FAST codes are counted down from the top of the SentencePiece vocab (`tokenizer.SP_VOCAB_SIZE`), which for Gemma 3 is all `<unused>` tokens. Model and tokenizer both read `tokenizer.cot_delimiter_ids(backbone)`; note the SentencePiece size (262,144) differs from Gemma 3's embedding rows (262,208).
+- `gemma3_weights_test.py` checks the port against `transformers` (marked `manual`; set `OPENPI_GEMMA3_CKPT` to a local copy). No LoRA variants or PyTorch path for Gemma 3.
+
 ### Fork-specific gotchas
 
 - **`speed_in_prompt` double-injection.** `RLDSSteerVLADataConfig` injects the speed string in the *RLDS loader* and passes `speed_in_prompt=False` to `SteerVLAInputs`. `RLDSSteerVLACoTDataConfig` does the **opposite** (injects in the policy transform). Easy to get backwards and end up with the speed in the prompt twice, or not at all.
