@@ -47,8 +47,8 @@ def main(args: Args) -> None:
     if data_config.rlds_data_dir is None:
         raise ValueError(f"Config {args.config_name!r} does not define an RLDS data directory.")
 
-    subtask_key = data_config.steervla_cot_subtask_key
-    reasoning_key = data_config.steervla_cot_reasoning_key
+    subtask_key = data_config.steervla.cot_subtask_key
+    reasoning_key = data_config.steervla.cot_reasoning_key
     rng = random.Random(args.seed)
 
     splits = ["train", "val"] if args.split == "all" else [args.split]

@@ -98,7 +98,58 @@ class SteerVLARLDSDataset:
     image_crop: tuple[float, float, float, float] | None = None
 
 
+@dataclasses.dataclass(frozen=True)
+class SteerVLALoaderConfig:
+    """SteerVLA-specific loader options, carried on ``DataConfig.steervla``.
+
+    Field names mirror the keyword arguments of :class:`SteerVLARldsDataset`; the generic RLDS
+    fields (data dir, batch size, shuffle, action horizon, split) come from the data loader.
+    """
+
+    datasets: Sequence[SteerVLARLDSDataset] = ()
+    dataset_format: DatasetFormat = DatasetFormat.NUSCENES
+    # Action-only sources: flow expert supervised, CoT cross-entropy switched off.
+    ll_datasets: Sequence[SteerVLARLDSDataset] = ()
+    # High-level (reasoning/subtask-only) sources: CoT supervised, actions masked.
+    hl_datasets: Sequence[SteerVLARLDSDataset] = ()
+    hl_dataset_format: DatasetFormat = DatasetFormat.NUSCENES
+    cot_reasoning_key: str = "commentary"
+    cot_subtask_key: str = "gemini_refined_label"
+    hl_cot_reasoning_key: str = "gemini_refined_label"
+    hl_cot_subtask_key: str = "prompt"
+    include_ego_history: bool = True
+    include_xy_action: bool = False
+    speed_in_prompt: bool = True
+    proprio_norm: bool = True
+    output_action_format: OutputActionFormat = OutputActionFormat.DELTA_XY_T_DELTA_XY_SPACE
+    lang_label_type: LangLabelType = LangLabelType.ROUTING_COMMAND
+    routing_command_in_prompt: bool = False
+    add_suffix_to_prompt: bool = False
+    enable_cot: bool = False
+
+
 class SteerVLARldsDataset:
+    @classmethod
+    def from_config(
+        cls,
+        config: SteerVLALoaderConfig,
+        *,
+        data_dir: str,
+        batch_size: int,
+        shuffle: bool,
+        action_chunk_size: int,
+        split: str = "train",
+    ) -> "SteerVLARldsDataset":
+        options = {f.name: getattr(config, f.name) for f in dataclasses.fields(config)}
+        return cls(
+            data_dir=data_dir,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            action_chunk_size=action_chunk_size,
+            split=split,
+            **options,
+        )
+
     def __init__(
         self,
         data_dir: str,

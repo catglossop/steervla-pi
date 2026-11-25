@@ -29,8 +29,6 @@ import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
 
-from openpi.visualizing.steervla_visualization import run_cot_visualization, run_visualization_evaluation
-
 
 def init_logging():
     """Custom logging format for better readability."""
@@ -369,22 +367,7 @@ def main(config: _config.TrainConfig):
         skip_norm_stats=config.skip_norm_stats,
     )
     data_iter = iter(data_loader)
-    
-    # Eval data loader. The eval batch is sharded across the full mesh just like the train batch, so
-    # it must stay divisible by jax.device_count() -- round down rather than take the exact quotient,
-    # which is not a multiple of the device count for non-power-of-two meshes (e.g. 192 / 3 -> 64).
-    num_devices = jax.device_count()
-    eval_batch_size = max(num_devices, (config.batch_size // num_devices) // num_devices * num_devices)
-    eval_config = dataclasses.replace(config, batch_size=eval_batch_size)
-    eval_data_loader = _data_loader.create_data_loader(
-        eval_config,
-        sharding=data_sharding,
-        shuffle=False,
-        split="val",
-        skip_norm_stats=config.skip_norm_stats,
-    )
-    eval_data_iter = iter(eval_data_loader)
-    
+
     batch = next(data_iter)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
     _validate_batch_against_model_spec(config, batch, batch_idx=0)
@@ -413,28 +396,6 @@ def main(config: _config.TrainConfig):
         donate_argnums=(1,),
     )
 
-    # Resolve eval visualization settings from the data config.
-    data_config = data_loader.data_config()
-    eval_action_dim = data_config.steervla_action_dim
-    eval_output_format = data_config.steervla_output_action_format.value if data_config.steervla_rlds else None
-    eval_dataset_names: list[str] | None = None
-    if data_config.steervla_rlds:
-        # Order and mode-tagging must match SteerVLARldsDataset.dataset_names, which is what
-        # dataset_id indexes into: full-update sources, then action-only, then CoT-only. The tags
-        # keep per-dataset metric keys distinct when one corpus appears in several buckets.
-        eval_dataset_names = [
-            *(d.name for d in data_config.steervla_datasets),
-            *(f"{d.name}#flow_only" for d in data_config.steervla_ll_datasets),
-            *(f"{d.name}#cot_only" for d in data_config.steervla_hl_datasets),
-        ]
-    # The eval loader applies Normalize iff the run does, so the visualizer must apply the matching
-    # inverse before converting to physical units. None when the run trains in raw (unnormalized)
-    # action space, which makes every unnormalize_for_eval call a no-op.
-    eval_norm_stats = None if config.skip_norm_stats else data_config.norm_stats
-    eval_proprio_norm = bool(data_config.steervla_proprio_norm) if data_config.steervla_rlds else True
-    # Meaningful leading state dims; the rest is zero padding out to model.action_dim.
-    eval_state_dim = 8 if data_config.steervla_include_ego_history else 2
-
     start_step = int(train_state.step)
     pbar = tqdm.tqdm(
         range(start_step, config.num_train_steps),
@@ -444,7 +405,6 @@ def main(config: _config.TrainConfig):
         disable=jax.process_index() != 0,
     )
 
-    eval_rng = jax.random.key(config.seed + 1)
     infos = []
     validate_num_batches = 4
     for step in pbar:
@@ -461,45 +421,8 @@ def main(config: _config.TrainConfig):
                 pbar.write(f"Step {step}: {info_str}")
                 wandb.log(reduced_info, step=step)
             infos = []
-            
-        batch = next(data_iter)
 
-        if config.eval_interval > 0 and step > 0 and step % config.eval_interval == 0:
-            # change eval batch size 
-            eval_batch = next(eval_data_iter)
-            if jax.process_index() == 0:
-                pbar.write(f"Running eval visualization at step {step}...")
-            eval_rng, vis_rng = jax.random.split(eval_rng)
-            vis_rng, cot_rng = jax.random.split(vis_rng)
-            with sharding.set_mesh(mesh):
-                run_visualization_evaluation(
-                    state=train_state,
-                    rng=vis_rng,
-                    batch=eval_batch,
-                    step=step,
-                    action_dim=eval_action_dim,
-                    output_action_format=eval_output_format,
-                    dataset_names=eval_dataset_names,
-                    norm_stats=eval_norm_stats,
-                    use_quantile_norm=data_config.use_quantile_norm,
-                    proprio_norm=eval_proprio_norm,
-                    state_dim=eval_state_dim,
-                )
-                run_cot_visualization(
-                    state=train_state,
-                    rng=cot_rng,
-                    batch=eval_batch,
-                    step=step,
-                    use_fast_tokens=getattr(config.model, "use_fast_tokens", False),
-                    action_horizon=config.model.action_horizon,
-                    action_dim=eval_action_dim,
-                    model_action_dim=config.model.action_dim,
-                    output_action_format=eval_output_format,
-                    norm_stats=eval_norm_stats,
-                    use_quantile_norm=data_config.use_quantile_norm,
-                    proprio_norm=eval_proprio_norm,
-                    state_dim=eval_state_dim,
-                )
+        batch = next(data_iter)
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)

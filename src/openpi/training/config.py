@@ -101,29 +101,8 @@ class DataConfig:
     # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
     datasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
 
-    # SteerVLA RLDS-specific fields.
-    steervla_rlds: bool = False
-    steervla_datasets: Sequence[steervla_rlds_dataset.SteerVLARLDSDataset] = ()
-    steervla_dataset_format: steervla_rlds_dataset.DatasetFormat = steervla_rlds_dataset.DatasetFormat.NUSCENES
-    # Optional high-level (reasoning/subtask-only) datasets for CoT training.
-    steervla_hl_datasets: Sequence[steervla_rlds_dataset.SteerVLARLDSDataset] = ()
-    # Action-only sources: flow expert supervised, CoT cross-entropy switched off.
-    steervla_ll_datasets: Sequence[steervla_rlds_dataset.SteerVLARLDSDataset] = ()
-    steervla_hl_dataset_format: steervla_rlds_dataset.DatasetFormat = steervla_rlds_dataset.DatasetFormat.NUSCENES
-    steervla_cot_reasoning_key: str = "commentary"
-    steervla_cot_subtask_key: str = "gemini_refined_label"
-    steervla_hl_cot_reasoning_key: str = "gemini_refined_label"
-    steervla_hl_cot_subtask_key: str = "prompt"
-    steervla_include_ego_history: bool = True
-    steervla_include_xy_action: bool = False
-    steervla_speed_in_prompt: bool = True
-    steervla_proprio_norm: bool = True
-    steervla_output_action_format: steervla_rlds_dataset.OutputActionFormat = steervla_rlds_dataset.OutputActionFormat.DELTA_XY_T_DELTA_XY_SPACE
-    steervla_lang_label_type: steervla_rlds_dataset.LangLabelType = steervla_rlds_dataset.LangLabelType.ROUTING_COMMAND
-    steervla_routing_command_in_prompt: bool = False
-    steervla_add_suffix_to_prompt: bool = False
-    steervla_action_dim: int = 4
-    steervla_enable_cot: bool = False
+    # SteerVLA RLDS loader options; when set, the RLDS loader builds a SteerVLARldsDataset instead of DROID.
+    steervla: steervla_rlds_dataset.SteerVLALoaderConfig | None = None
 
 
 class GroupFactory(Protocol):
@@ -671,19 +650,19 @@ class RLDSSteerVLADataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
-            steervla_rlds=True,
             rlds_data_dir=self.rlds_data_dir,
-            steervla_datasets=tuple(resolved_datasets),
-            steervla_dataset_format=self.dataset_format,
-            steervla_include_ego_history=self.include_ego_history,
-            steervla_include_xy_action=self.include_xy_action,
-            steervla_speed_in_prompt=self.speed_in_prompt,
-            steervla_proprio_norm=self.proprio_norm,
-            steervla_output_action_format=self.output_action_format,
-            steervla_lang_label_type=self.lang_label_type,
-            steervla_routing_command_in_prompt=self.routing_command_in_prompt,
-            steervla_add_suffix_to_prompt=self.add_suffix_to_prompt,
-            steervla_action_dim=self.action_dim,
+            steervla=steervla_rlds_dataset.SteerVLALoaderConfig(
+                datasets=tuple(resolved_datasets),
+                dataset_format=self.dataset_format,
+                include_ego_history=self.include_ego_history,
+                include_xy_action=self.include_xy_action,
+                speed_in_prompt=self.speed_in_prompt,
+                proprio_norm=self.proprio_norm,
+                output_action_format=self.output_action_format,
+                lang_label_type=self.lang_label_type,
+                routing_command_in_prompt=self.routing_command_in_prompt,
+                add_suffix_to_prompt=self.add_suffix_to_prompt,
+            ),
         )
 
 
@@ -819,27 +798,27 @@ class RLDSSteerVLACoTDataConfig(RLDSSteerVLADataConfig):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
-            steervla_rlds=True,
             rlds_data_dir=self.rlds_data_dir,
-            steervla_datasets=tuple(resolved_datasets),
-            steervla_dataset_format=self.dataset_format,
-            steervla_ll_datasets=tuple(resolved_ll_datasets),
-            steervla_hl_datasets=tuple(resolved_hl_datasets),
-            steervla_hl_dataset_format=self.hl_dataset_format or self.dataset_format,
-            steervla_cot_reasoning_key=self.cot_reasoning_key,
-            steervla_cot_subtask_key=self.cot_subtask_key,
-            steervla_hl_cot_reasoning_key=self.hl_cot_reasoning_key or "gemini_refined_label",
-            steervla_hl_cot_subtask_key=self.hl_cot_subtask_key or "prompt",
-            steervla_include_ego_history=self.include_ego_history,
-            steervla_include_xy_action=self.include_xy_action,
-            steervla_speed_in_prompt=False,
-            steervla_proprio_norm=self.proprio_norm,
-            steervla_output_action_format=self.output_action_format,
-            steervla_lang_label_type=self.lang_label_type,
-            steervla_routing_command_in_prompt=False,
-            steervla_add_suffix_to_prompt=False,
-            steervla_action_dim=self.action_dim,
-            steervla_enable_cot=True,
+            steervla=steervla_rlds_dataset.SteerVLALoaderConfig(
+                datasets=tuple(resolved_datasets),
+                dataset_format=self.dataset_format,
+                ll_datasets=tuple(resolved_ll_datasets),
+                hl_datasets=tuple(resolved_hl_datasets),
+                hl_dataset_format=self.hl_dataset_format or self.dataset_format,
+                cot_reasoning_key=self.cot_reasoning_key,
+                cot_subtask_key=self.cot_subtask_key,
+                hl_cot_reasoning_key=self.hl_cot_reasoning_key or "gemini_refined_label",
+                hl_cot_subtask_key=self.hl_cot_subtask_key or "prompt",
+                include_ego_history=self.include_ego_history,
+                include_xy_action=self.include_xy_action,
+                speed_in_prompt=False,
+                proprio_norm=self.proprio_norm,
+                output_action_format=self.output_action_format,
+                lang_label_type=self.lang_label_type,
+                routing_command_in_prompt=False,
+                add_suffix_to_prompt=False,
+                enable_cot=True,
+            ),
         )
 
 
@@ -939,8 +918,6 @@ class TrainConfig:
 
     # How often (in steps) to log training metrics.
     log_interval: int = 100
-    # How often (in steps) to run eval visualization (0 = disabled).
-    eval_interval: int = 0
     # How often (in steps) to save checkpoints.
     save_interval: int = 1000
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
@@ -1502,7 +1479,6 @@ _CONFIGS = [
         batch_size=24,
         fsdp_devices=4,
         log_interval=1,
-        eval_interval=100,
         save_interval=5000,
         num_workers=0,
         checkpoint_base_dir="gs://cat-logs",
@@ -1554,7 +1530,6 @@ _CONFIGS = [
         batch_size=24,
         fsdp_devices=4,
         log_interval=1,
-        eval_interval=500,
         save_interval=5000,
         num_workers=0,
         checkpoint_base_dir="gs://cat-logs",
@@ -1613,7 +1588,6 @@ _CONFIGS = [
         batch_size=24,
         fsdp_devices=4,
         log_interval=1,
-        eval_interval=500,
         save_interval=5000,
         num_workers=0,
         checkpoint_base_dir="gs://cat-logs",
@@ -1674,7 +1648,6 @@ _CONFIGS = [
         batch_size=512,
         fsdp_devices=8,
         log_interval=1,
-        eval_interval=100,
         save_interval=5000,
         num_workers=0,
         checkpoint_base_dir="gs://cat-logs",
@@ -1745,7 +1718,6 @@ _CONFIGS = [
         batch_size=24,
         fsdp_devices=1,
         log_interval=1,
-        eval_interval=100,
         save_interval=5000,
         num_workers=0,
         checkpoint_base_dir="gs://cat-logs",
@@ -1812,7 +1784,6 @@ _CONFIGS = [
         batch_size=512,
         fsdp_devices=3,
         log_interval=1,
-        eval_interval=100,
         save_interval=2000,
         num_workers=0,
         checkpoint_base_dir="gs://cat-logs",
@@ -1883,7 +1854,6 @@ _CONFIGS = [
         batch_size=192,
         fsdp_devices=3,
         log_interval=1,
-        eval_interval=100,
         save_interval=2000,
         num_workers=0,
         checkpoint_base_dir="gs://cat-logs",
@@ -1951,7 +1921,6 @@ _CONFIGS = [
         batch_size=192,
         fsdp_devices=3,
         log_interval=1,
-        eval_interval=100,
         save_interval=2000,
         max_to_keep=10,
         num_workers=0,
@@ -2020,7 +1989,6 @@ _CONFIGS = [
         batch_size=192,
         fsdp_devices=3,
         log_interval=1,
-        eval_interval=100,
         save_interval=2000,
         max_to_keep=10,
         num_workers=0,
@@ -2168,7 +2136,6 @@ _CONFIGS = [
         batch_size=192,
         fsdp_devices=3,
         log_interval=1,
-        eval_interval=100,
         save_interval=2000,
         max_to_keep=10,
         num_workers=0,
@@ -2255,7 +2222,6 @@ _CONFIGS = [
         batch_size=384,
         fsdp_devices=4,
         log_interval=1,
-        eval_interval=100,
         save_interval=2000,
         max_to_keep=10,
         num_workers=0,
@@ -2333,7 +2299,6 @@ _CONFIGS = [
         batch_size=1152,
         fsdp_devices=6,
         log_interval=1,
-        eval_interval=100,
         save_interval=2000,
         max_to_keep=10,
         num_workers=0,
@@ -2403,7 +2368,6 @@ _CONFIGS = [
         batch_size=512,
         fsdp_devices=8,
         log_interval=1,
-        eval_interval=100,
         save_interval=1000,
         keep_period=1000,
         max_to_keep=10,
