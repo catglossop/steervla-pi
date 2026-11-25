@@ -32,7 +32,7 @@ XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run --group rlds scripts/train.py <config_
 uv run scripts/serve_policy.py policy:checkpoint --policy.config=<config_name> --policy.dir=<ckpt_dir>
 ```
 
-Norm stats are **mandatory** before training (enforced in `data_loader.py`) unless the config sets `skip_norm_stats=True`. They are keyed by config `name`, so renaming a config orphans its stats in `assets/<name>/` — point `AssetsConfig` at the old name instead (the CSP config at the bottom of `config.py` does exactly this).
+Norm stats are **mandatory** before training (enforced in `data_loader.py`) unless the config sets `skip_norm_stats=True`. They are keyed by config `name`, so renaming a config orphans its stats in `assets/<name>/` — point `AssetsConfig` at the old name instead.
 
 TPU runs: `./launch_tpu_job.sh <vm-name> <config-name>` rsyncs the repo to a TPU VM and runs `start_tpu_job.sh` there (needs `WANDB_API_KEY` and `HF_TOKEN` exported).
 
@@ -54,7 +54,7 @@ Inference (`policies/policy_config.py`) reuses that exact input list and applies
 
 ### Config-driven everything
 
-`TrainConfig` **is** the model factory: `config.model` is a `BaseModelConfig` whose `.create(rng)` returns the model. Configs are looked up by name from `_CONFIGS` in `src/openpi/training/config.py` (that list is the registry; names must be unique).
+`TrainConfig` **is** the model factory: `config.model` is a `BaseModelConfig` whose `.create(rng)` returns the model. Configs are looked up by name from `_CONFIGS` in `src/openpi/training/config.py` (that list is the registry; names must be unique). SteerVLA/SimLingo `TrainConfig`s live in `training/misc/steervla_config.py` and are spliced into `_CONFIGS` via `get_steervla_configs()` (same pattern as upstream's roboarena/polaris configs); their data-config factories stay in `config.py`.
 
 | Model config | `model_type` | Class |
 |---|---|---|
@@ -69,7 +69,7 @@ Inference (`policies/policy_config.py`) reuses that exact input list and applies
 
 1. `src/openpi/policies/<robot>_policy.py`: an `Inputs` transform (must branch on `model_type` to pick image keys/masks) and an `Outputs` transform that slices model actions back to the true action dim.
 2. A `DataConfigFactory` subclass in `training/config.py` wiring those into `data_transforms`. `LeRobotLiberoDataConfig` is the documented template; `LeRobotSteerVLADataConfig` is the driving analogue.
-3. A `TrainConfig` entry appended to `_CONFIGS`, then run `compute_norm_stats.py`.
+3. A `TrainConfig` entry appended to `_CONFIGS` (SteerVLA ones go in `training/misc/steervla_config.py`), then run `compute_norm_stats.py`.
 
 For large datasets you also add an RLDS dataset class (see `steervla_rlds_dataset.py`) and a branch in `create_rlds_dataset`. **RLDS requires `num_workers=0`** — it batches and shards internally. The loader path is chosen purely by whether `rlds_data_dir` is set.
 
@@ -78,14 +78,21 @@ For large datasets you also add an RLDS dataset class (see `steervla_rlds_datase
 `models/pi0_cot.py` has a detailed module docstring covering the prefix layout and every loss term — **read it before touching the model.** In short, the VLM prefix is `[prompt+state (bidirectional)] [reasoning (causal)] [subtask (causal)] [optional FAST action tokens]`, and the action expert attends to images + prompt + subtask but *not* reasoning.
 
 - CoT delimiter tokens (`<start_of_reasoning>` etc.) are carved out of the top of the PaliGemma vocab. The IDs in `pi0_cot.py` and the reserved-slot layout in `tokenizer.py` (`COT_DELIMITER_TOKEN_SLOTS`, `PALIGEMMA_VOCAB_SKIP_TOKENS`) **must stay in sync**.
-- Inference is `Policy.infer_with_cot`: autoregressively `sample_cot`, stuff the generated tokens back into the `Observation`, then `sample_actions`.
-- Context-Smoothed Pre-training (`models/context_smoothing.py`) noises the SigLIP image tokens in the prefix with a per-sample `t_context`, fed to the action expert via adaRMS alongside the flow timestep. `context_smoothing=None` disables it with zero param/behavior change. Its params (`ctx_time_mlp_*`) postdate `pi05_base`, so the weight loader needs `missing_regex=".*(lora|ctx_time_mlp).*"` for them to survive the checkpoint merge.
+- Inference is `CoTPolicy.infer_with_cot` (`policies/cot_policy.py`; `create_trained_policy` returns a `CoTPolicy` for any model with `sample_cot`): autoregressively `sample_cot`, stuff the generated tokens back into the `Observation`, then `sample_actions`. Upstream's `Policy` is untouched.
+- The FAST tokens in the CoT prefix use `CoTFASTTokenizer`, which shifts FAST codes down by `COT_DELIMITER_TOKEN_SLOTS` so they don't collide with the delimiters. Upstream `FASTTokenizer` is untouched.
+- Knowledge insulation (`knowledge_insulation=True`, on `Pi0Config` and `Pi0CoTConfig`) lives in `gemma.Attention`: when both experts run without a KV cache (i.e. training), action-expert queries read the backbone's K/V through `stop_gradient`, so the flow loss never updates the VLM. It reuses upstream's attention math (`_attend`) on the two query groups; `models/gemma_test.py` pins the behavior.
 
 ### Fork-specific gotchas
 
 - **`speed_in_prompt` double-injection.** `RLDSSteerVLADataConfig` injects the speed string in the *RLDS loader* and passes `speed_in_prompt=False` to `SteerVLAInputs`. `RLDSSteerVLACoTDataConfig` does the **opposite** (injects in the policy transform). Easy to get backwards and end up with the speed in the prompt twice, or not at all.
-- **High-level (reasoning-only) datasets.** `steervla_hl_datasets` are mixed in by weight with `action_supervision=False`, which becomes an all-False `action_loss_mask` — CoT loss applies, action loss doesn't.
-- **Batch size must be divisible by `jax.device_count()`** (asserted in `train.py`). This bites on non-power-of-two meshes: with `fsdp_devices=3`, a batch of 512 is invalid. Note the eval loader derives its own batch size from `config.batch_size` and must satisfy the same constraint.
+- **SteerVLA loader options** live on one field, `DataConfig.steervla: SteerVLALoaderConfig | None` (defined in `steervla_rlds_dataset.py`); when it is set, the RLDS loader builds a `SteerVLARldsDataset` instead of DROID.
+- **High-level (reasoning-only) datasets.** `steervla.hl_datasets` are mixed in by weight with `action_supervision=False`, which becomes an all-False `action_loss_mask` — CoT loss applies, action loss doesn't.
+- **Camera framing differs between RLDS builds.** All the SimLingo-derived datasets store 512x512 JPEGs, but they were built from the same 1024x512 CARLA front camera under two framings: `simlingo_dataset_*_img512_1116` crop `(170, 0, 852, 359)` first, `simplified_reasoning_dataset` does not crop at all. Mixing them raw trains on two different cameras. `DATASET_IMAGE_CROPS` in `steervla_rlds_dataset.py` re-crops the offenders at decode time, and `resolve_image_crop` logs a **warning** for any dataset whose framing has never been measured — register a new corpus there, or set `image_crop=()` to record that it needs no crop, rather than letting it default silently. Verify a new build by solving for the crop that reproduces a stored frame from its source under `simlingo_rgb_zips` — a correct match lands at <1/255 mean abs error.
+- **Batch size must be divisible by `jax.device_count()`** (asserted in `train.py`). This bites on non-power-of-two meshes: with `fsdp_devices=3`, a batch of 512 is invalid.
+
+### Staying close to upstream
+
+`steerpi` tracks openpi (`git remote add upstream https://github.com/Physical-Intelligence/openpi.git`, merge `upstream/main`). Keep fork logic out of upstream code paths: prefer new modules or subclasses (`cot_policy.py`, `CoTFASTTokenizer`, `misc/steervla_config.py`), additive optional fields, and flags that default to upstream behavior. Work kept off `steerpi` on purpose: full in-training eval/visualization (`steervla-cot-norm-compact-eval`), CSP (`tmrl`), yay-robot/CAST configs (`yay-robot-configs`), VLM-activation exposure (`surya/expose-vlm-activations`).
 
 ### PyTorch path
 

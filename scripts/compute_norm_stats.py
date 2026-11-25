@@ -20,6 +20,7 @@ class RemoveStrings(transforms.DataTransformFn):
     def __call__(self, x: dict) -> dict:
         return {k: v for k, v in x.items() if not np.issubdtype(np.asarray(v).dtype, np.str_)}
 
+
 def _action_supervised_keep_mask(batch: dict) -> np.ndarray | None:
     """Per-batch-row mask for action-supervised samples (exclude HL / CoT-only rows)."""
     mask = batch.get("action_loss_mask")
@@ -41,25 +42,6 @@ def _filter_for_norm_stats(batch: dict, key: str) -> np.ndarray | None:
     if not np.any(keep):
         return None
     return values[keep]
-
-
-
-def _actions_for_norm_stats(batch: dict) -> np.ndarray | None:
-    """Keep only action-supervised samples (exclude HL / CoT-only rows)."""
-    actions = np.asarray(batch["actions"])
-    mask = batch.get("action_loss_mask")
-    if mask is None:
-        return actions
-
-    mask = np.asarray(mask, dtype=bool)
-    if mask.ndim == 1:
-        keep = mask
-    else:
-        keep = np.any(mask.reshape(mask.shape[0], -1), axis=1)
-
-    if not np.any(keep):
-        return None
-    return actions[keep]
 
 
 def create_torch_dataloader(

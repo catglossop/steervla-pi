@@ -46,15 +46,12 @@ class CheckpointWeightLoader(WeightLoader):
     """
 
     params_path: str
-    # Params absent from the checkpoint are kept at their freshly-initialized values only if they
-    # match this pattern; anything else is dropped. Widen it when the model adds params the
-    # checkpoint predates (e.g. the CSP context-timestep MLPs, `ctx_time_mlp_*`).
-    missing_regex: str = ".*lora.*"
 
     def load(self, params: at.Params) -> at.Params:
         # We are loading np.ndarray and relying on the training code to properly convert and shard the params.
         loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
-        return _merge_params(loaded_params, params, missing_regex=self.missing_regex)
+        # Add all missing LoRA weights.
+        return _merge_params(loaded_params, params, missing_regex=".*lora.*")
 
 
 @dataclasses.dataclass(frozen=True)

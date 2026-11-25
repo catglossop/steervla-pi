@@ -10,15 +10,12 @@ Usage:
 """
 
 import dataclasses
-import datetime
-import io
 import os
 import time
 
 import numpy as np
 from openpi_client import image_tools
 from openpi_client import websocket_client_policy
-from PIL import Image
 import tyro
 
 
@@ -90,9 +87,7 @@ def denormalize_actions(actions: np.ndarray) -> np.ndarray:
 def main(args: Args):
     os.makedirs(args.output_dir, exist_ok=True)
 
-    policy_client = websocket_client_policy.WebsocketClientPolicy(
-        args.remote_host, args.remote_port
-    )
+    policy_client = websocket_client_policy.WebsocketClientPolicy(args.remote_host, args.remote_port)
 
     print("Connected to policy server. Starting inference loop.")
     print("This is a template -- integrate with your simulator or data replay.")

@@ -189,6 +189,25 @@ class Embedder(nn.Module):
         return jnp.reshape(best_idx, orig_shape[:-1])
 
 
+def _attend(q, k, v, attn_mask, num_kv_heads, dtype):
+    q = einops.rearrange(q, "B T (K G) H -> B T K G H", K=num_kv_heads)
+    logits = jnp.einsum("BTKGH,BSKH->BKGTS", q, k, preferred_element_type=jnp.float32)
+
+    if attn_mask.shape != (q.shape[0], 1, q.shape[1], k.shape[1]):
+        raise ValueError(
+            f"Attention mask with shape {attn_mask.shape} but shapes for q and k are: {q.shape} and {k.shape}"
+        )
+
+    # big_neg = jnp.finfo(logits.dtype).min
+    big_neg = -2.3819763e38  # See gemma/modules.py
+    masked_logits = jnp.where(attn_mask[:, :, None, :, :], logits, big_neg)
+
+    probs = jax.nn.softmax(masked_logits, axis=-1).astype(dtype)
+
+    encoded = jnp.einsum("BKGTS,BSKH->BTKGH", probs, v)
+    return einops.rearrange(encoded, "B T K G H -> B T (K G) H")
+
+
 @at.typecheck
 class Attention(nn.Module):
     """Attention module."""
@@ -234,11 +253,6 @@ class Attention(nn.Module):
                 k, v = kv_einsum("BSD,2KDH->2BSKH", x)
                 qkvs.append((q, k, v))
 
-        # Track per-expert sequence lengths before concatenation (needed for
-        # knowledge insulation to identify which token positions belong to the
-        # backbone vs. action expert).
-        segment_lengths = [x.shape[1] for x in xs if x is not None]
-
         q, k, v = (jnp.concatenate(y, axis=1) for y in zip(*qkvs, strict=True))
 
         q = _apply_rope(q, positions=positions)
@@ -249,101 +263,40 @@ class Attention(nn.Module):
         # should still be half-precision here (if input was half-precision)
         assert q.dtype == k.dtype == v.dtype == dtype
 
-        kv_cache_out = None
-        if kv_cache is not None:
-            if len(kv_cache) == 3:
-                cache_idx, cache_k, cache_v = kv_cache
-                cache_dtype = cache_k.dtype
-                update_idx = jnp.asarray(cache_idx, dtype=jnp.int32)
-                update_len = k.shape[1]
-                k = jax.lax.dynamic_update_slice(cache_k, k.astype(cache_dtype), (0, update_idx, 0, 0))
-                v = jax.lax.dynamic_update_slice(cache_v, v.astype(cache_v.dtype), (0, update_idx, 0, 0))
-                kv_cache_out = (cache_idx + update_len, k, v)
-            else:
+        if kv_cache is not None and len(kv_cache) == 3:
+            # Preallocated cache (Pi0CoT autoregressive decoding): write the new k/v at `cache_idx`.
+            cache_idx, cache_k, cache_v = kv_cache
+            update_idx = jnp.asarray(cache_idx, dtype=jnp.int32)
+            update_len = k.shape[1]
+            k = jax.lax.dynamic_update_slice(cache_k, k.astype(cache_k.dtype), (0, update_idx, 0, 0))
+            v = jax.lax.dynamic_update_slice(cache_v, v.astype(cache_v.dtype), (0, update_idx, 0, 0))
+            new_kv_cache = (cache_idx + update_len, k, v)
+        else:
+            if kv_cache is not None:
                 cache_k, cache_v = kv_cache
                 k = jnp.concatenate([cache_k, k], axis=1)
                 v = jnp.concatenate([cache_v, v], axis=1)
-        if kv_cache_out is None:
-            kv_cache_out = (k, v)
+            new_kv_cache = (k, v)
 
         num_kv_heads = self.configs[0].num_kv_heads
-
-        # ---- Knowledge insulation (Driess et al., 2025) ----
-        # Stop gradients from the action expert's flow-matching loss flowing
-        # back into the VLM backbone through attention cross-talk.  Only
-        # active during training (both experts present, no KV cache).
-        _use_insulation = (
-            self.knowledge_insulation
-            and kv_cache is None
-            and len(segment_lengths) > 1
-        )
-
-        if _use_insulation:
-            backbone_len = segment_lengths[0]
-
-            # Split along sequence axis at the backbone / action-expert boundary
-            q_b, q_a = q[:, :backbone_len], q[:, backbone_len:]
-            k_b, k_a = k[:, :backbone_len], k[:, backbone_len:]
-            v_b, v_a = v[:, :backbone_len], v[:, backbone_len:]
-
-            q_b = einops.rearrange(q_b, "B T (K G) H -> B T K G H", K=num_kv_heads)
-            q_a = einops.rearrange(q_a, "B T (K G) H -> B T K G H", K=num_kv_heads)
-
-            # Backbone queries attend to all keys normally.
-            logits_b = jnp.einsum(
-                "BTKGH,BSKH->BKGTS", q_b, k, preferred_element_type=jnp.float32
+        experts_present = [x.shape[1] for x in xs if x is not None]
+        if self.knowledge_insulation and kv_cache is None and len(experts_present) > 1:
+            # Knowledge insulation (Driess et al., 2025): the action expert reads the backbone's K/V
+            # through stop_gradient, so the flow-matching loss cannot update the VLM backbone via
+            # attention. Softmax is per query row, so attending backbone and action-expert queries
+            # separately is exact. Training only (both experts present, no KV cache).
+            n = experts_present[0]
+            k_sg = jnp.concatenate([jax.lax.stop_gradient(k[:, :n]), k[:, n:]], axis=1)
+            v_sg = jnp.concatenate([jax.lax.stop_gradient(v[:, :n]), v[:, n:]], axis=1)
+            encoded = jnp.concatenate(
+                [
+                    _attend(q[:, :n], k, v, attn_mask[:, :, :n], num_kv_heads, dtype),
+                    _attend(q[:, n:], k_sg, v_sg, attn_mask[:, :, n:], num_kv_heads, dtype),
+                ],
+                axis=1,
             )
-
-            # Action-expert queries attend to backbone K with stop_gradient,
-            # and to action-expert K normally.
-            k_for_action = jnp.concatenate(
-                [jax.lax.stop_gradient(k_b), k_a], axis=1
-            )
-            logits_a = jnp.einsum(
-                "BTKGH,BSKH->BKGTS", q_a, k_for_action, preferred_element_type=jnp.float32
-            )
-
-            logits = jnp.concatenate([logits_b, logits_a], axis=-2)  # concat along T (query) dim
-
-            if attn_mask.shape != (logits.shape[0], 1, logits.shape[-2], logits.shape[-1]):
-                raise ValueError(
-                    f"Attention mask with shape {attn_mask.shape} but "
-                    f"logits shape {logits.shape}"
-                )
-
-            big_neg = -2.3819763e38
-            masked_logits = jnp.where(attn_mask[:, :, None, :, :], logits, big_neg)
-            probs = jax.nn.softmax(masked_logits, axis=-1).astype(dtype)
-
-            # Value aggregation: action-expert reads backbone V with stop_gradient.
-            probs_b = probs[:, :, :, :backbone_len, :]      # backbone query probs
-            probs_a = probs[:, :, :, backbone_len:, :]       # action expert query probs
-
-            encoded_b = jnp.einsum("BKGTS,BSKH->BTKGH", probs_b, v)
-
-            v_for_action = jnp.concatenate(
-                [jax.lax.stop_gradient(v_b), v_a], axis=1
-            )
-            encoded_a = jnp.einsum("BKGTS,BSKH->BTKGH", probs_a, v_for_action)
-
-            encoded = jnp.concatenate([encoded_b, encoded_a], axis=1)
-            encoded = einops.rearrange(encoded, "B T K G H -> B T (K G) H")
         else:
-            q = einops.rearrange(q, "B T (K G) H -> B T K G H", K=num_kv_heads)
-            logits = jnp.einsum("BTKGH,BSKH->BKGTS", q, k, preferred_element_type=jnp.float32)
-
-            if attn_mask.shape != (q.shape[0], 1, q.shape[1], k.shape[1]):
-                raise ValueError(
-                    f"Attention mask with shape {attn_mask.shape} but shapes for q and k are: {q.shape} and {k.shape}"
-                )
-
-            big_neg = -2.3819763e38  # See gemma/modules.py
-            masked_logits = jnp.where(attn_mask[:, :, None, :, :], logits, big_neg)
-
-            probs = jax.nn.softmax(masked_logits, axis=-1).astype(dtype)
-
-            encoded = jnp.einsum("BKGTS,BSKH->BTKGH", probs, v)
-            encoded = einops.rearrange(encoded, "B T K G H -> B T (K G) H")
+            encoded = _attend(q, k, v, attn_mask, num_kv_heads, dtype)
 
         out = []
         start = 0
@@ -361,7 +314,7 @@ class Attention(nn.Module):
             else:
                 out.append(None)
 
-        return out, kv_cache_out
+        return out, new_kv_cache
 
 
 @at.typecheck
@@ -452,7 +405,7 @@ class Block(nn.Module):
 KVCache: TypeAlias = (
     tuple[at.Float[at.Array, "l b _t _k _h"], at.Float[at.Array, "l b _t _v _h"]]
     | tuple[
-        at.Int[at.Array, "l"],
+        at.Int[at.Array, " l"],
         at.Float[at.Array, "l b _t _k _h"],
         at.Float[at.Array, "l b _t _v _h"],
     ]

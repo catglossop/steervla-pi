@@ -297,9 +297,7 @@ class TokenizeCoTPrompt(DataTransformFn):
         if state is None:
             raise ValueError("State is required for CoT tokenization")
 
-        prompt_tok, prompt_mask = self.tokenizer.tokenize_prompt(
-            prompt, state, state_dim=self.prompt_state_dim
-        )
+        prompt_tok, prompt_mask = self.tokenizer.tokenize_prompt(prompt, state, state_dim=self.prompt_state_dim)
         reasoning_tok, reasoning_mask = self.tokenizer.tokenize_reasoning(reasoning)
         subtask_tok, subtask_mask = self.tokenizer.tokenize_subtask(subtask)
 

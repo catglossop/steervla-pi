@@ -8,7 +8,8 @@ and various language instruction modes.
 
 from collections.abc import Sequence
 import dataclasses
-from enum import Enum, auto
+from enum import Enum
+from enum import auto
 import logging
 
 from openpi.training.rlds_multihost import shard_dataset_then_batch
@@ -38,14 +39,118 @@ class LangLabelType(Enum):
     ROUTING_COMMAND = "routing_command"
 
 
+# Framing correction between SimLingo-derived RLDS builds.
+#
+# Every one of these datasets stores a 512x512 JPEG, but they were built from the same 1024x512
+# CARLA front camera under two *different* framings:
+#
+#   simlingo_dataset_*_img512_1116  crop (170, 0, 852, 359) of the 1024x512 source, then squash to 512x512
+#   simplified_reasoning_dataset    no crop -- the full 1024x512 frame squashed to 512x512
+#
+# So the high-level reasoning corpus shows a wider FOV and includes the ego hood, while the
+# low-level corpus is zoomed in on the road ahead with the bottom 30% cut off. Mixing them trains
+# the policy on two different cameras. Recovered by solving for the crop box that reproduces each
+# stored image from its source file under ``simlingo_rgb_zips`` (6/6 samples agree exactly;
+# mean abs residual 0.88/255, i.e. JPEG round-trip noise).
+#
+# Expressed normalized so it applies to the stored 512x512 image as well as the 1024x512 source:
+# on a 512x512 image it is the box (85, 0, 426, 359).
+SIMLINGO_FRAMING_CROP = (170 / 1024, 0.0, 852 / 1024, 359 / 512)
+
+# Datasets whose stored images need cropping to match ``SIMLINGO_FRAMING_CROP``. Consulted only when
+# a ``SteerVLARLDSDataset`` does not set ``image_crop`` itself. Datasets absent here are left alone,
+# which is correct for the simlingo_dataset_* builds (already in that framing) and for any corpus
+# whose framing has not been measured.
+DATASET_IMAGE_CROPS: dict[str, tuple[float, float, float, float]] = {
+    "simplified_reasoning_dataset": SIMLINGO_FRAMING_CROP,
+}
+
+# Datasets measured to already be in the canonical framing, so they need no correction. Kept
+# separate from "we have never looked" -- see ``resolve_image_crop``.
+CANONICAL_FRAMING_PREFIXES = ("simlingo_dataset_",)
+
+
+def resolve_image_crop(
+    dataset: "SteerVLARLDSDataset",
+) -> tuple[tuple[float, float, float, float] | None, bool]:
+    """Crop for a dataset, plus whether its framing is actually known.
+
+    Every source in a mixture must reach the model through the same camera framing, so a corpus
+    whose framing nobody has measured is a silent hazard rather than a safe default. Returning the
+    ``known`` flag lets the caller say so out loud instead of quietly assuming canonical.
+    """
+    if dataset.image_crop is not None:
+        return (dataset.image_crop or None), True
+    if dataset.name in DATASET_IMAGE_CROPS:
+        return DATASET_IMAGE_CROPS[dataset.name], True
+    if dataset.name.startswith(CANONICAL_FRAMING_PREFIXES):
+        return None, True
+    return None, False
+
+
 @dataclasses.dataclass
 class SteerVLARLDSDataset:
     name: str
     weight: float = 1.0
     version: str | None = None
+    # Normalized (x0, y0, x1, y1) crop applied to the stored image, then resized back to the stored
+    # resolution so every source in the mixture batches at the same shape. ``None`` falls back to
+    # ``DATASET_IMAGE_CROPS``; pass ``()`` to force no crop.
+    image_crop: tuple[float, float, float, float] | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class SteerVLALoaderConfig:
+    """SteerVLA-specific loader options, carried on ``DataConfig.steervla``.
+
+    Field names mirror the keyword arguments of :class:`SteerVLARldsDataset`; the generic RLDS
+    fields (data dir, batch size, shuffle, action horizon, split) come from the data loader.
+    """
+
+    datasets: Sequence[SteerVLARLDSDataset] = ()
+    dataset_format: DatasetFormat = DatasetFormat.NUSCENES
+    # Action-only sources: flow expert supervised, CoT cross-entropy switched off.
+    ll_datasets: Sequence[SteerVLARLDSDataset] = ()
+    # High-level (reasoning/subtask-only) sources: CoT supervised, actions masked.
+    hl_datasets: Sequence[SteerVLARLDSDataset] = ()
+    hl_dataset_format: DatasetFormat = DatasetFormat.NUSCENES
+    cot_reasoning_key: str = "commentary"
+    cot_subtask_key: str = "gemini_refined_label"
+    hl_cot_reasoning_key: str = "gemini_refined_label"
+    hl_cot_subtask_key: str = "prompt"
+    include_ego_history: bool = True
+    include_xy_action: bool = False
+    speed_in_prompt: bool = True
+    proprio_norm: bool = True
+    output_action_format: OutputActionFormat = OutputActionFormat.DELTA_XY_T_DELTA_XY_SPACE
+    lang_label_type: LangLabelType = LangLabelType.ROUTING_COMMAND
+    routing_command_in_prompt: bool = False
+    add_suffix_to_prompt: bool = False
+    enable_cot: bool = False
 
 
 class SteerVLARldsDataset:
+    @classmethod
+    def from_config(
+        cls,
+        config: SteerVLALoaderConfig,
+        *,
+        data_dir: str,
+        batch_size: int,
+        shuffle: bool,
+        action_chunk_size: int,
+        split: str = "train",
+    ) -> "SteerVLARldsDataset":
+        options = {f.name: getattr(config, f.name) for f in dataclasses.fields(config)}
+        return cls(
+            data_dir=data_dir,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            action_chunk_size=action_chunk_size,
+            split=split,
+            **options,
+        )
+
     def __init__(
         self,
         data_dir: str,
@@ -55,6 +160,9 @@ class SteerVLARldsDataset:
         dataset_format: DatasetFormat = DatasetFormat.NUSCENES,
         hl_datasets: Sequence[SteerVLARLDSDataset] = (),
         hl_dataset_format: DatasetFormat | None = None,
+        # Action-only sources: the flow expert is supervised, the CoT cross-entropy is not. The CoT
+        # segments are still built and fed as prefix context; only their loss is switched off.
+        ll_datasets: Sequence[SteerVLARLDSDataset] = (),
         cot_reasoning_key: str = "commentary",
         cot_subtask_key: str = "gemini_refined_label",
         hl_cot_reasoning_key: str = "gemini_refined_label",
@@ -86,18 +194,26 @@ class SteerVLARldsDataset:
         if hl_datasets and not enable_cot:
             raise ValueError("High-level datasets require enable_cot=True.")
 
-        source_specs: list[tuple[SteerVLARLDSDataset, DatasetFormat, bool, str, str]] = [
-            (d, dataset_format, True, cot_reasoning_key, cot_subtask_key) for d in datasets
+        # (dataset, format, action_supervision, cot_supervision, cot_reasoning_key, cot_subtask_key)
+        # The three buckets are the three supervision modes in use:
+        #   datasets    -> flow + CoT   (a full update)
+        #   ll_datasets -> flow only    (action expert; CoT text is context, not a target)
+        #   hl_datasets -> CoT only     (dummy actions, action_loss_mask all-False)
+        # The same dataset name may appear in more than one bucket; each occurrence becomes its own
+        # weighted source with its own dataset_id.
+        source_specs: list[tuple[SteerVLARLDSDataset, DatasetFormat, bool, bool, str, str]] = [
+            (d, dataset_format, True, True, cot_reasoning_key, cot_subtask_key) for d in datasets
         ]
+        source_specs += [(d, dataset_format, True, False, cot_reasoning_key, cot_subtask_key) for d in ll_datasets]
         source_specs += [
-            (d, hl_dataset_format or dataset_format, False, hl_cot_reasoning_key, hl_cot_subtask_key)
+            (d, hl_dataset_format or dataset_format, False, True, hl_cot_reasoning_key, hl_cot_subtask_key)
             for d in hl_datasets
         ]
 
         # Weights are normalized internally by sample_from_datasets; no need to sum to 1.0.
-        total_weight = sum(d.weight for d, _, _, _, _ in source_specs)
+        total_weight = sum(d.weight for d, *_ in source_specs)
         assert total_weight > 0, "Total dataset weight must be positive"
-        normalized_weights = [d.weight / total_weight for d, _, _, _, _ in source_specs]
+        normalized_weights = [d.weight / total_weight for d, *_ in source_specs]
 
         def _build_nuscenes_restructure(
             traj_map_tf=tf,
@@ -178,16 +294,16 @@ class SteerVLARldsDataset:
         def _build_simlingo_restructure(
             *,
             action_supervision: bool = True,
+            cot_supervision: bool = True,
             cot_reasoning_source_key: str = "commentary",
             cot_subtask_source_key: str = "gemini_refined_label",
         ):
             """Build the SimLingo restructure function."""
 
             def restructure(traj):
-
                 traj_len = tf.shape(traj["speed"])[0]
                 current_speed_og = traj["speed"]
-                
+
                 state_speeds = traj["observation"]["ego_hist"][:, :, 0]
                 state_local_courses = traj["observation"]["ego_hist"][:, :, 1]
 
@@ -220,7 +336,9 @@ class SteerVLARldsDataset:
                 delta_course_t = (delta_course_t % 360.0 + 360.0) % 360.0
                 delta_course_t = tf.where(delta_course_t > 180.0, delta_course_t - 360.0, delta_course_t)
                 delta_course_space = (delta_course_space % 360.0 + 360.0) % 360.0
-                delta_course_space = tf.where(delta_course_space > 180.0, delta_course_space - 360.0, delta_course_space)
+                delta_course_space = tf.where(
+                    delta_course_space > 180.0, delta_course_space - 360.0, delta_course_space
+                )
 
                 delta_speed_t_norm = 10.0
                 delta_xy_t_norm = 7.0
@@ -232,7 +350,9 @@ class SteerVLARldsDataset:
 
                 oaf = output_action_format
                 if oaf == OutputActionFormat.DELTA_SPEED_T_DELTA_COURSE_T_DELTA_COURSE_SPACE:
-                    actions = tf.concat([delta_speed_t[..., None], delta_course_t[..., None], delta_course_space[..., None]], axis=-1)
+                    actions = tf.concat(
+                        [delta_speed_t[..., None], delta_course_t[..., None], delta_course_space[..., None]], axis=-1
+                    )
                 elif oaf == OutputActionFormat.DELTA_XY_T_DELTA_XY_SPACE:
                     actions = tf.concat([delta_xy_t, delta_xy_space], axis=-1)
                 elif oaf == OutputActionFormat.DELTA_XY_T_DELTA_COURSE_SPACE:
@@ -241,11 +361,9 @@ class SteerVLARldsDataset:
                     raise ValueError(f"Unknown output_action_format: {oaf}")
 
                 actions = actions[:, :action_chunk_size, :]
-                action_loss_mask = tf.fill(
-                    [traj_len, action_chunk_size], tf.cast(action_supervision, tf.bool)
-                )
+                action_loss_mask = tf.fill([traj_len, action_chunk_size], tf.cast(action_supervision, tf.bool))
 
-                # Select language label 
+                # Select language label
                 llt = lang_label_type
                 if llt == LangLabelType.COMMENTARY:
                     instruction = traj["commentary"]
@@ -292,6 +410,9 @@ class SteerVLARldsDataset:
                 if enable_cot:
                     result["subtask"] = traj[cot_subtask_source_key]
                     result["reasoning"] = traj[cot_reasoning_source_key]
+                    # Per-frame gate on the CoT cross-entropy. The text above is still emitted and
+                    # still becomes prefix context; this only decides whether it is a target.
+                    result["cot_loss_mask"] = tf.fill([traj_len], tf.cast(cot_supervision, tf.bool))
 
                 return result
 
@@ -313,6 +434,7 @@ class SteerVLARldsDataset:
             source_dataset_format: DatasetFormat,
             *,
             action_supervision: bool,
+            cot_supervision: bool,
             cot_reasoning_source_key: str,
             cot_subtask_source_key: str,
             dataset_id: int,
@@ -332,6 +454,7 @@ class SteerVLARldsDataset:
             elif source_dataset_format == DatasetFormat.SIMLINGO:
                 restructure_fn = _build_simlingo_restructure(
                     action_supervision=action_supervision,
+                    cot_supervision=cot_supervision,
                     cot_reasoning_source_key=cot_reasoning_source_key,
                     cot_subtask_source_key=cot_subtask_source_key,
                 )
@@ -365,41 +488,88 @@ class SteerVLARldsDataset:
 
             dataset = dataset.flatten(num_parallel_calls=num_parallel_calls)
 
-            def decode_images(frame):
-                frame["observation"]["image"] = tf.io.decode_image(
-                    frame["observation"]["image"], expand_animations=False, dtype=tf.uint8
-                )
+            crop, _ = resolve_image_crop(dataset_cfg)
+
+            def decode_images(frame, crop=crop):
+                image = tf.io.decode_image(frame["observation"]["image"], expand_animations=False, dtype=tf.uint8)
+                if crop:
+                    x0, y0, x1, y1 = crop
+                    shape = tf.shape(image)
+                    h = tf.cast(shape[0], tf.float32)
+                    w = tf.cast(shape[1], tf.float32)
+                    top = tf.cast(tf.round(y0 * h), tf.int32)
+                    left = tf.cast(tf.round(x0 * w), tf.int32)
+                    image = tf.image.crop_to_bounding_box(
+                        image,
+                        top,
+                        left,
+                        tf.cast(tf.round(y1 * h), tf.int32) - top,
+                        tf.cast(tf.round(x1 * w), tf.int32) - left,
+                    )
+                    # Back to the stored resolution: sources in one mixture must batch at one shape.
+                    image = tf.cast(tf.round(tf.image.resize(image, [shape[0], shape[1]], antialias=True)), tf.uint8)
+                frame["observation"]["image"] = image
                 return frame
 
             return dataset.frame_map(decode_images, num_parallel_calls)
 
         logging.info(f"Preparing {len(source_specs)} SteerVLA datasets...")
         logging.info("-" * 50)
-        for (ds, ds_format, action_supervision, cot_reason_key, cot_subtask_key), nw in zip(source_specs, normalized_weights):
+
+        def _mode(*, action_sup: bool, cot_sup: bool) -> str:
+            """Human-readable name for a (flow, CoT) supervision pair."""
+            return {(True, True): "flow+cot", (True, False): "flow_only", (False, True): "cot_only"}.get(
+                (action_sup, cot_sup), "unsupervised"
+            )
+
+        for (ds, ds_format, action_supervision, cot_supervision, cot_reason_key, cot_subtask_key), nw in zip(
+            source_specs, normalized_weights
+        ):
             ver = ds.version or "default"
+            ds_crop, crop_known = resolve_image_crop(ds)
+            if not crop_known:
+                logging.warning(
+                    f"    {ds.name}: image framing has not been measured, so it is being fed to the model "
+                    f"uncropped. If it was not built with the same crop as the simlingo_dataset_* corpora "
+                    f"({tuple(round(v, 4) for v in SIMLINGO_FRAMING_CROP)} of the source frame), this mixes "
+                    f"two cameras in one batch. Add an entry to DATASET_IMAGE_CROPS or set image_crop=() "
+                    f"to confirm it needs no crop."
+                )
             logging.info(
                 f"    {ds.name} (v{ver}) format={ds_format.name} "
                 f"cot_reasoning_key={cot_reason_key} cot_subtask_key={cot_subtask_key} "
-                f"action_supervision={action_supervision} "
-                f"weight={ds.weight:.3f} (normalized={nw:.4f})"
+                f"mode={_mode(action_sup=action_supervision, cot_sup=cot_supervision)} "
+                f"weight={ds.weight:.3f} (normalized={nw:.4f}) "
+                f"image_crop={'none' if not ds_crop else tuple(round(v, 4) for v in ds_crop)}"
             )
         logging.info("-" * 50)
 
-        self.dataset_names = [ds.name for ds, _, _, _, _ in source_specs]
+        # A dataset can appear in several buckets, so tag the mode to keep per-dataset eval metric
+        # keys distinct (see _short_dataset_name / _compute_per_dataset_loss_metrics).
+        self.dataset_names = [
+            ds.name if _mode(action_sup=a, cot_sup=c) == "flow+cot" else f"{ds.name}#{_mode(action_sup=a, cot_sup=c)}"
+            for ds, _, a, c, _, _ in source_specs
+        ]
 
         all_datasets = [
             prepare_single_dataset(
                 ds,
                 ds_format,
                 action_supervision=action_supervision,
+                cot_supervision=cot_supervision,
                 cot_reasoning_source_key=cot_reason_key,
                 cot_subtask_source_key=cot_subtask_key,
                 dataset_id=dataset_id,
                 split=split,
             )
-            for dataset_id, (ds, ds_format, action_supervision, cot_reason_key, cot_subtask_key) in enumerate(
-                source_specs
-            )
+            for dataset_id, (
+                ds,
+                ds_format,
+                action_supervision,
+                cot_supervision,
+                cot_reason_key,
+                cot_subtask_key,
+            ) in enumerate(source_specs)
         ]
 
         final_dataset = dl.DLataset.sample_from_datasets(all_datasets, weights=normalized_weights)

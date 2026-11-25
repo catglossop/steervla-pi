@@ -4,8 +4,8 @@
 from __future__ import annotations
 
 import argparse
-import zipfile
 from pathlib import Path
+import zipfile
 
 
 def extract_rgb_archives(root: Path, overwrite: bool) -> tuple[int, int]:
@@ -48,11 +48,7 @@ def extract_rgb_archives(root: Path, overwrite: bool) -> tuple[int, int]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Find and extract all rgb.zip archives under simlingo_rgb_zips."
-        )
-    )
+    parser = argparse.ArgumentParser(description=("Find and extract all rgb.zip archives under simlingo_rgb_zips."))
     parser.add_argument(
         "root",
         nargs="?",

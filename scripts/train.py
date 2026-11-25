@@ -1,9 +1,9 @@
 import dataclasses
+import datetime
 import functools
 import logging
 import platform
 from typing import Any
-import datetime
 
 import etils.epath as epath
 import flax.nnx as nnx
@@ -28,8 +28,6 @@ import openpi.training.optimizer as _optimizer
 import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
-
-from openpi.visualizing.steervla_visualization import run_cot_visualization, run_visualization_evaluation
 
 
 def init_logging():
@@ -335,9 +333,7 @@ def main(config: _config.TrainConfig):
         run_dir = epath.Path(config.resume_dir)
         resume_flag = True
     else:
-        run_dir = config.checkpoint_dir / (
-            config.exp_name + "_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        )
+        run_dir = config.checkpoint_dir / (config.exp_name + "_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
         resume_flag = config.resume
 
     checkpoint_manager, resuming = _checkpoints.initialize_checkpoint_dir(
@@ -369,22 +365,7 @@ def main(config: _config.TrainConfig):
         skip_norm_stats=config.skip_norm_stats,
     )
     data_iter = iter(data_loader)
-    
-    # Eval data loader. The eval batch is sharded across the full mesh just like the train batch, so
-    # it must stay divisible by jax.device_count() -- round down rather than take the exact quotient,
-    # which is not a multiple of the device count for non-power-of-two meshes (e.g. 192 / 3 -> 64).
-    num_devices = jax.device_count()
-    eval_batch_size = max(num_devices, (config.batch_size // num_devices) // num_devices * num_devices)
-    eval_config = dataclasses.replace(config, batch_size=eval_batch_size)
-    eval_data_loader = _data_loader.create_data_loader(
-        eval_config,
-        sharding=data_sharding,
-        shuffle=False,
-        split="val",
-        skip_norm_stats=config.skip_norm_stats,
-    )
-    eval_data_iter = iter(eval_data_loader)
-    
+
     batch = next(data_iter)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
     _validate_batch_against_model_spec(config, batch, batch_idx=0)
@@ -402,9 +383,7 @@ def main(config: _config.TrainConfig):
     logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
 
     if resuming:
-        train_state = _checkpoints.restore_state(
-            checkpoint_manager, train_state, data_loader, step=config.resume_step
-        )
+        train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader, step=config.resume_step)
 
     ptrain_step = jax.jit(
         functools.partial(train_step, config),
@@ -412,17 +391,6 @@ def main(config: _config.TrainConfig):
         out_shardings=(train_state_sharding, replicated_sharding),
         donate_argnums=(1,),
     )
-
-    # Resolve eval visualization settings from the data config.
-    data_config = data_loader.data_config()
-    eval_action_dim = data_config.steervla_action_dim
-    eval_output_format = data_config.steervla_output_action_format.value if data_config.steervla_rlds else None
-    eval_dataset_names: list[str] | None = None
-    if data_config.steervla_rlds:
-        eval_dataset_names = [
-            *(d.name for d in data_config.steervla_datasets),
-            *(d.name for d in data_config.steervla_hl_datasets),
-        ]
 
     start_step = int(train_state.step)
     pbar = tqdm.tqdm(
@@ -433,7 +401,6 @@ def main(config: _config.TrainConfig):
         disable=jax.process_index() != 0,
     )
 
-    eval_rng = jax.random.key(config.seed + 1)
     infos = []
     validate_num_batches = 4
     for step in pbar:
@@ -450,37 +417,8 @@ def main(config: _config.TrainConfig):
                 pbar.write(f"Step {step}: {info_str}")
                 wandb.log(reduced_info, step=step)
             infos = []
-            
-        batch = next(data_iter)
 
-        if config.eval_interval > 0 and step > 0 and step % config.eval_interval == 0:
-            # change eval batch size 
-            eval_batch = next(eval_data_iter)
-            if jax.process_index() == 0:
-                pbar.write(f"Running eval visualization at step {step}...")
-            eval_rng, vis_rng = jax.random.split(eval_rng)
-            vis_rng, cot_rng = jax.random.split(vis_rng)
-            with sharding.set_mesh(mesh):
-                run_visualization_evaluation(
-                    state=train_state,
-                    rng=vis_rng,
-                    batch=eval_batch,
-                    step=step,
-                    action_dim=eval_action_dim,
-                    output_action_format=eval_output_format,
-                    dataset_names=eval_dataset_names,
-                )
-                run_cot_visualization(
-                    state=train_state,
-                    rng=cot_rng,
-                    batch=eval_batch,
-                    step=step,
-                    use_fast_tokens=getattr(config.model, "use_fast_tokens", False),
-                    action_horizon=config.model.action_horizon,
-                    action_dim=eval_action_dim,
-                    model_action_dim=config.model.action_dim,
-                    output_action_format=eval_output_format,
-                )
+        batch = next(data_iter)
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)

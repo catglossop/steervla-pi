@@ -16,8 +16,7 @@ def shard_dataset_then_batch(dataset, batch_size: int):
         return dataset.batch(batch_size)
     if batch_size % n != 0:
         raise ValueError(
-            f"batch_size ({batch_size}) must be divisible by jax.process_count() ({n}) "
-            "for multi-host RLDS training."
+            f"batch_size ({batch_size}) must be divisible by jax.process_count() ({n}) for multi-host RLDS training."
         )
     per_host = batch_size // n
     return dataset.shard(n, jax.process_index()).batch(per_host)

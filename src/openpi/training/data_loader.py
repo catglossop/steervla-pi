@@ -160,29 +160,13 @@ def create_rlds_dataset(
     shuffle: bool = False,
     split: str = "train",
 ) -> Dataset:
-    if data_config.steervla_rlds:
-        return SteerVLARldsDataset(
+    if data_config.steervla is not None:
+        return SteerVLARldsDataset.from_config(
+            data_config.steervla,
             data_dir=data_config.rlds_data_dir,
             batch_size=batch_size,
-            datasets=data_config.steervla_datasets,
-            dataset_format=data_config.steervla_dataset_format,
-            hl_datasets=data_config.steervla_hl_datasets,
-            hl_dataset_format=data_config.steervla_hl_dataset_format,
-            cot_reasoning_key=data_config.steervla_cot_reasoning_key,
-            cot_subtask_key=data_config.steervla_cot_subtask_key,
-            hl_cot_reasoning_key=data_config.steervla_hl_cot_reasoning_key,
-            hl_cot_subtask_key=data_config.steervla_hl_cot_subtask_key,
             shuffle=shuffle,
             action_chunk_size=action_horizon,
-            include_ego_history=data_config.steervla_include_ego_history,
-            include_xy_action=data_config.steervla_include_xy_action,
-            speed_in_prompt=data_config.steervla_speed_in_prompt,
-            proprio_norm=data_config.steervla_proprio_norm,
-            output_action_format=data_config.steervla_output_action_format,
-            lang_label_type=data_config.steervla_lang_label_type,
-            routing_command_in_prompt=data_config.steervla_routing_command_in_prompt,
-            add_suffix_to_prompt=data_config.steervla_add_suffix_to_prompt,
-            enable_cot=data_config.steervla_enable_cot,
             split=split,
         )
     return DroidRldsDataset(

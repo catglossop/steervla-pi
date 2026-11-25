@@ -6,6 +6,7 @@ from typing import Any
 import jax.numpy as jnp
 
 import openpi.models.model as _model
+import openpi.policies.cot_policy as _cot_policy
 import openpi.policies.policy as _policy
 import openpi.shared.download as download
 from openpi.training import checkpoints as _checkpoints
@@ -32,9 +33,9 @@ def create_trained_policy(
         repack_transforms: Optional transforms that will be applied before any other transforms.
         sample_kwargs: The kwargs to pass to the `sample_actions` method. If not provided, the default
             kwargs will be used.
-        cot_sample_kwargs: Kwargs for :meth:`openpi.policies.policy.Policy.infer_with_cot` (passed to
-            ``model.sample_cot``), e.g. ``temperature``, ``image_keys``, ``timing=True`` for phase logs,
-            or ``replay_reasoning=False`` for faster batch-1 online inference.
+        cot_sample_kwargs: Only for chain-of-thought models (those with ``sample_cot``, e.g. Pi0CoT), which get a
+            :class:`openpi.policies.cot_policy.CoTPolicy`. Passed to ``model.sample_cot`` by ``infer_with_cot``,
+            e.g. ``temperature`` or ``image_keys``.
         default_prompt: The default prompt to use for the policy. Will inject the prompt into the input
             data if it doesn't already exist.
         norm_stats: The norm stats to use for the policy. If not provided, the norm stats will be loaded
@@ -76,7 +77,11 @@ def create_trained_policy(
         except ImportError:
             pytorch_device = "cpu"
 
-    return _policy.Policy(
+    # Chain-of-thought models get a Policy subclass that adds `infer_with_cot`.
+    policy_cls, extra_kwargs = _policy.Policy, {}
+    if hasattr(model, "sample_cot"):
+        policy_cls, extra_kwargs = _cot_policy.CoTPolicy, {"cot_sample_kwargs": cot_sample_kwargs}
+    return policy_cls(
         model,
         transforms=[
             *repack_transforms.inputs,
@@ -92,8 +97,8 @@ def create_trained_policy(
             *repack_transforms.outputs,
         ],
         sample_kwargs=sample_kwargs,
-        cot_sample_kwargs=cot_sample_kwargs,
         metadata=train_config.policy_metadata,
         is_pytorch=is_pytorch,
         pytorch_device=pytorch_device if is_pytorch else None,
+        **extra_kwargs,
     )

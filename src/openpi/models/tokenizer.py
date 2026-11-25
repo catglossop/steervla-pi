@@ -10,11 +10,6 @@ from transformers import AutoProcessor
 import openpi.models.utils.fsq_tokenizer as fsq_tokenizer
 import openpi.shared.download as download
 
-# Last N token ids in the PaliGemma vocab are reserved (special tokens, FAST, CoT).
-PALIGEMMA_VOCAB_SKIP_TOKENS = 128
-# CoT delimiter ids occupy the first slots of that region (before FAST action codes).
-COT_DELIMITER_TOKEN_SLOTS = 4
-
 
 class PaligemmaTokenizer:
     def __init__(self, max_len: int = 48):
@@ -53,195 +48,9 @@ class PaligemmaTokenizer:
         return np.asarray(tokens), np.asarray(mask)
 
 
-class CoTPaligemmaTokenizer:
-    """Tokenizer for Chain-of-Thought Pi0.5 that produces three separate token
-    sequences: prompt (input), reasoning (generated), and subtask (generated).
-
-    Full logical layout (concatenated at train/inference time):
-
-        Prompt:"task";State:"state";
-        <start_of_reasoning>"reasoning"<end_of_reasoning>;
-        <start_of_subtask>"subtask"<end_of_subtask>
-
-    Attention (see ``Pi0CoT``): images + prompt segment bidirectional; reasoning and
-    subtask segments causal; optional FAST action tokens are causal and attend to
-    images + prompt + subtask (not reasoning); the action expert does not attend to
-    reasoning.
-    """
-
-    def __init__(
-        self,
-        max_prompt_len: int = 64,
-        max_subtask_len: int = 48,
-        max_reasoning_len: int = 96,
-        max_fast_len: int = 64,
-        use_fast_tokens: bool = False,
-        fast_tokenizer_path: str = "physical-intelligence/fast",
-    ):
-        self._max_prompt_len = max_prompt_len
-        self._max_subtask_len = max_subtask_len
-        self._max_reasoning_len = max_reasoning_len
-        self._max_fast_len = max_fast_len
-        self.use_fast_tokens = use_fast_tokens
-
-        self._cot_skip_tokens = PALIGEMMA_VOCAB_SKIP_TOKENS
-
-        path = download.maybe_download(
-            "gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"}
-        )
-        with path.open("rb") as f:
-            self._tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
-
-        self._fast_tokenizer: FASTTokenizer | None = None
-        if use_fast_tokens:
-            self._fast_tokenizer = FASTTokenizer(
-                max_len=max_fast_len,
-                fast_tokenizer_path=fast_tokenizer_path,
-                reserved_vocab_slots=COT_DELIMITER_TOKEN_SLOTS,
-            )
-
-    def _pad_or_truncate(
-        self,
-        tokens: list[int],
-        mask: list[bool],
-        max_len: int,
-        *,
-        segment_name: str,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        if len(tokens) < max_len:
-            pad = [False] * (max_len - len(tokens))
-            tokens = tokens + pad
-            mask = mask + pad
-        elif len(tokens) > max_len:
-            logging.warning(
-                f"{segment_name} token length ({len(tokens)}) exceeds max ({max_len}), truncating."
-            )
-            tokens = tokens[:max_len]
-            mask = mask[:max_len]
-        return np.asarray(tokens, dtype=np.int32), np.asarray(mask, dtype=bool)
-
-    def tokenize_prompt(
-        self,
-        prompt: str,
-        state: np.ndarray,
-        *,
-        state_dim: int | None = None,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Tokenize the bidirectional prefix (prompt + state; no CoT delimiters).
-
-        ``state_dim`` limits how many proprio dimensions are embedded in the prompt.
-        Use this when ``state`` has been zero-padded to ``model.action_dim`` but only
-        the leading values are meaningful (e.g. SteerVLA speed/course).
-        """
-        cleaned = prompt.strip().replace("_", " ").replace("\n", " ")
-        state = np.asarray(state)
-        if state_dim is not None:
-            state = state[..., :state_dim]
-        discretized = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
-        state_str = " ".join(map(str, discretized))
-        text = (
-            f"Prompt:{cleaned};State:{state_str};"
-        )
-        tokens = self._tokenizer.encode(text, add_bos=True)
-        mask = [True] * len(tokens)
-        return self._pad_or_truncate(tokens, mask, self._max_prompt_len, segment_name="prompt")
-
-    def tokenize_subtask(self, subtask: str) -> tuple[np.ndarray, np.ndarray]:
-        """Tokenize subtask segment (causal; follows reasoning in the prefix)."""
-        cleaned = subtask.strip().replace("_", " ").replace("\n", " ")
-        text = f"{cleaned};"
-        tokens = (
-            [self._start_of_subtask()]
-            + self._tokenizer.encode(text)
-            + [self._end_of_subtask()]
-            + [self._tokenizer.eos_id()]
-        )
-        mask = [True] * len(tokens)
-        return self._pad_or_truncate(tokens, mask, self._max_subtask_len, segment_name="subtask")
-
-    def tokenize_reasoning(self, reasoning: str) -> tuple[np.ndarray, np.ndarray]:
-        """Tokenize reasoning segment (causal; first generated segment after the prompt)."""
-        cleaned = reasoning.strip().replace("_", " ").replace("\n", " ")
-        text = f"{cleaned};"
-        tokens = [self._start_of_reasoning()] + self._tokenizer.encode(text) + [self._end_of_reasoning()]
-        mask = [True] * len(tokens)
-        return self._pad_or_truncate(tokens, mask, self._max_reasoning_len, segment_name="reasoning")
-
-    def tokenize_fast_actions(self, actions: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Tokenize FAST-discretized actions for VLM supervision (after subtask in the prefix).
-
-        Layout matches ``FASTTokenizer``: ``Action: <fast tokens> |`` with EOS.
-        """
-        if self._fast_tokenizer is None:
-            raise RuntimeError("FAST tokenizer is disabled; set use_fast_tokens=True on CoTPaligemmaTokenizer.")
-        action_tokens = self._fast_tokenizer._fast_tokenizer(actions[None])[0]
-        action_tokens_in_pg = self._fast_tokenizer._act_tokens_to_paligemma_tokens(action_tokens)
-        tokens = (
-            self._tokenizer.encode("Action: ")
-            + action_tokens_in_pg.tolist()
-            + self._tokenizer.encode("|", add_eos=True)
-        )
-        mask = [True] * len(tokens)
-        return self._pad_or_truncate(tokens, mask, self._max_fast_len, segment_name="fast")
-
-    def extract_fast_actions(
-        self,
-        tokens: np.ndarray,
-        action_horizon: int,
-        action_dim: int,
-        *,
-        mask: np.ndarray | None = None,
-    ) -> np.ndarray:
-        """Decode FAST actions from a tokenized fast segment (for eval / visualization)."""
-        if self._fast_tokenizer is None:
-            raise RuntimeError("FAST tokenizer is disabled; set use_fast_tokens=True on CoTPaligemmaTokenizer.")
-        if mask is not None:
-            tokens = tokens[mask.astype(bool)]
-        return self._fast_tokenizer.extract_actions_from_fast_segment(
-            tokens, action_horizon, action_dim
-        )
-
-    @property
-    def max_fast_len(self) -> int:
-        return self._max_fast_len
-
-    @property
-    def vocab_size(self) -> int:
-        return self._tokenizer.vocab_size()
-    
-    def _start_of_subtask(self) -> int:
-        return self._cot_reserved_token_id(1)
-
-    def _end_of_subtask(self) -> int:
-        return self._cot_reserved_token_id(2)
-
-    def _start_of_reasoning(self) -> int:
-        return self._cot_reserved_token_id(3)
-
-    def _end_of_reasoning(self) -> int:
-        return self._cot_reserved_token_id(4)
-
-    def _cot_reserved_token_id(self, slot: int) -> int:
-        """Map CoT delimiter slot (1..COT_DELIMITER_TOKEN_SLOTS) to a PaliGemma token id."""
-        if not 1 <= slot <= COT_DELIMITER_TOKEN_SLOTS:
-            raise ValueError(f"CoT reserved slot must be in 1..{COT_DELIMITER_TOKEN_SLOTS}, got {slot}")
-        return self.vocab_size - 1 - self._cot_skip_tokens - slot
-    
-    
-
-
 class FASTTokenizer:
-    def __init__(
-        self,
-        max_len: int = 256,
-        fast_tokenizer_path: str = "physical-intelligence/fast",
-        *,
-        reserved_vocab_slots: int = 0,
-    ):
+    def __init__(self, max_len: int = 256, fast_tokenizer_path: str = "physical-intelligence/fast"):
         self._max_len = max_len
-        self._fast_skip_tokens = PALIGEMMA_VOCAB_SKIP_TOKENS
-        # Extra ids reserved before FAST codes (e.g. CoT delimiter tokens in Pi0CoT).
-        self._reserved_vocab_slots = reserved_vocab_slots
 
         # Download base PaliGemma tokenizer
         path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
@@ -250,6 +59,7 @@ class FASTTokenizer:
 
         # Instantiate FAST tokenizer
         self._fast_tokenizer = AutoProcessor.from_pretrained(fast_tokenizer_path, trust_remote_code=True)
+        self._fast_skip_tokens = 128  # Skip last 128 tokens in PaliGemma vocab since they are special tokens
 
     def tokenize(
         self, prompt: str, state: np.ndarray, actions: np.ndarray | None
@@ -307,18 +117,64 @@ class FASTTokenizer:
         return np.asarray(tokens), np.asarray(token_mask), np.asarray(ar_mask), np.asarray(loss_mask)
 
     def extract_actions(self, tokens: np.ndarray, action_horizon: int, action_dim: int) -> np.ndarray:
+        # Decode predicted output tokens
+        decoded_tokens = self._paligemma_tokenizer.decode(tokens.tolist())
+
+        # Extract actions from FAST model outputs
+        if "Action: " not in decoded_tokens:
+            return np.zeros((action_horizon, action_dim), dtype=np.float32)
+
+        # Extract actions from decoded tokens
+        raw_action_tokens = np.array(
+            self._paligemma_tokenizer.encode(decoded_tokens.split("Action: ")[1].split("|")[0].strip())
+        )
+        action_tokens = self._act_tokens_to_paligemma_tokens(raw_action_tokens)
+        return self._fast_tokenizer.decode(
+            [action_tokens.tolist()], time_horizon=action_horizon, action_dim=action_dim
+        )[0]
+
+    def _act_tokens_to_paligemma_tokens(self, tokens: np.ndarray | list[int]) -> np.ndarray:
+        if isinstance(tokens, list):
+            tokens = np.array(tokens)
+        return self._paligemma_tokenizer.vocab_size() - 1 - self._fast_skip_tokens - tokens
+
+
+###########################################################################
+## Pi0CoT tokenizers (SteerVLA fork). Upstream classes above stay untouched.
+###########################################################################
+
+# Last N token ids in the PaliGemma vocab are reserved (special tokens, FAST, CoT). Matches
+# ``FASTTokenizer._fast_skip_tokens``.
+PALIGEMMA_VOCAB_SKIP_TOKENS = 128
+# CoT delimiter ids occupy the first slots of that region (before FAST action codes). Must stay in
+# sync with the delimiter ids hard-coded in ``pi0_cot.py``.
+COT_DELIMITER_TOKEN_SLOTS = 4
+
+
+class CoTFASTTokenizer(FASTTokenizer):
+    """``FASTTokenizer`` whose action codes are shifted down by ``COT_DELIMITER_TOKEN_SLOTS``.
+
+    The CoT delimiter tokens sit directly below the 128 skipped PaliGemma ids, which is exactly where
+    upstream FAST places its first codes. Shifting the codes keeps the two disjoint.
+
+    Decoding works on token ids directly (``Action: <codes> |``) instead of upstream's
+    decode-to-text / re-encode round trip, since the generated CoT prefix contains delimiter ids
+    that do not survive a sentencepiece round trip.
+    """
+
+    def __init__(self, max_len: int = 256, fast_tokenizer_path: str = "physical-intelligence/fast"):
+        super().__init__(max_len=max_len, fast_tokenizer_path=fast_tokenizer_path)
+        self._reserved_vocab_slots = COT_DELIMITER_TOKEN_SLOTS
+
+    def _act_tokens_to_paligemma_tokens(self, tokens: np.ndarray | list[int]) -> np.ndarray:
+        return super()._act_tokens_to_paligemma_tokens(tokens) - self._reserved_vocab_slots
+
+    def extract_actions(self, tokens: np.ndarray, action_horizon: int, action_dim: int) -> np.ndarray:
         return self.extract_actions_from_fast_segment(tokens, action_horizon, action_dim)
 
-    def _fast_pg_anchor(self) -> int:
-        return (
-            self._paligemma_tokenizer.vocab_size()
-            - 1
-            - self._fast_skip_tokens
-            - self._reserved_vocab_slots
-        )
-
     def _pg_tokens_to_fast_token_ids(self, pg_tokens: np.ndarray) -> np.ndarray:
-        anchor = self._fast_pg_anchor()
+        # Inverse of ``_act_tokens_to_paligemma_tokens``, dropping ids outside the FAST codebook.
+        anchor = self._paligemma_tokenizer.vocab_size() - 1 - self._fast_skip_tokens - self._reserved_vocab_slots
         fast_ids = anchor - np.asarray(pg_tokens, dtype=np.int64)
         return fast_ids[(fast_ids >= 0) & (fast_ids < 4096)]
 
@@ -346,9 +202,7 @@ class FASTTokenizer:
                 break
         return ids[start:end]
 
-    def extract_actions_from_fast_segment(
-        self, tokens: np.ndarray, action_horizon: int, action_dim: int
-    ) -> np.ndarray:
+    def extract_actions_from_fast_segment(self, tokens: np.ndarray, action_horizon: int, action_dim: int) -> np.ndarray:
         """Decode continuous actions from a ``Action: <FAST pg tokens> |`` segment."""
         pg_body = self._pg_token_ids_between_action_and_pipe(tokens)
         fast_ids = self._pg_tokens_to_fast_token_ids(pg_body)
@@ -360,16 +214,168 @@ class FASTTokenizer:
             action_dim=action_dim,
         )[0]
 
-    def _act_tokens_to_paligemma_tokens(self, tokens: np.ndarray | list[int]) -> np.ndarray:
-        if isinstance(tokens, list):
-            tokens = np.array(tokens)
-        return (
-            self._paligemma_tokenizer.vocab_size()
-            - 1
-            - self._fast_skip_tokens
-            - self._reserved_vocab_slots
-            - tokens
+
+class CoTPaligemmaTokenizer:
+    """Tokenizer for Chain-of-Thought Pi0.5 that produces three separate token
+    sequences: prompt (input), reasoning (generated), and subtask (generated).
+
+    Full logical layout (concatenated at train/inference time):
+
+        Prompt:"task";State:"state";
+        <start_of_reasoning>"reasoning"<end_of_reasoning>;
+        <start_of_subtask>"subtask"<end_of_subtask>
+
+    Attention (see ``Pi0CoT``): images + prompt segment bidirectional; reasoning and
+    subtask segments causal; optional FAST action tokens are causal and attend to
+    images + prompt + subtask (not reasoning); the action expert does not attend to
+    reasoning.
+    """
+
+    def __init__(
+        self,
+        max_prompt_len: int = 64,
+        max_subtask_len: int = 48,
+        max_reasoning_len: int = 96,
+        max_fast_len: int = 64,
+        use_fast_tokens: bool = False,
+        fast_tokenizer_path: str = "physical-intelligence/fast",
+    ):
+        self._max_prompt_len = max_prompt_len
+        self._max_subtask_len = max_subtask_len
+        self._max_reasoning_len = max_reasoning_len
+        self._max_fast_len = max_fast_len
+        self.use_fast_tokens = use_fast_tokens
+
+        self._cot_skip_tokens = PALIGEMMA_VOCAB_SKIP_TOKENS
+
+        path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
+        with path.open("rb") as f:
+            self._tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
+
+        self._fast_tokenizer: CoTFASTTokenizer | None = None
+        if use_fast_tokens:
+            self._fast_tokenizer = CoTFASTTokenizer(max_len=max_fast_len, fast_tokenizer_path=fast_tokenizer_path)
+
+    def _pad_or_truncate(
+        self,
+        tokens: list[int],
+        mask: list[bool],
+        max_len: int,
+        *,
+        segment_name: str,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if len(tokens) < max_len:
+            pad = [False] * (max_len - len(tokens))
+            tokens = tokens + pad
+            mask = mask + pad
+        elif len(tokens) > max_len:
+            logging.warning(f"{segment_name} token length ({len(tokens)}) exceeds max ({max_len}), truncating.")
+            tokens = tokens[:max_len]
+            mask = mask[:max_len]
+        return np.asarray(tokens, dtype=np.int32), np.asarray(mask, dtype=bool)
+
+    def tokenize_prompt(
+        self,
+        prompt: str,
+        state: np.ndarray,
+        *,
+        state_dim: int | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Tokenize the bidirectional prefix (prompt + state; no CoT delimiters).
+
+        ``state_dim`` limits how many proprio dimensions are embedded in the prompt.
+        Use this when ``state`` has been zero-padded to ``model.action_dim`` but only
+        the leading values are meaningful (e.g. SteerVLA speed/course).
+        """
+        cleaned = prompt.strip().replace("_", " ").replace("\n", " ")
+        state = np.asarray(state)
+        if state_dim is not None:
+            state = state[..., :state_dim]
+        discretized = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+        state_str = " ".join(map(str, discretized))
+        text = f"Prompt:{cleaned};State:{state_str};"
+        tokens = self._tokenizer.encode(text, add_bos=True)
+        mask = [True] * len(tokens)
+        return self._pad_or_truncate(tokens, mask, self._max_prompt_len, segment_name="prompt")
+
+    def tokenize_subtask(self, subtask: str) -> tuple[np.ndarray, np.ndarray]:
+        """Tokenize subtask segment (causal; follows reasoning in the prefix)."""
+        cleaned = subtask.strip().replace("_", " ").replace("\n", " ")
+        text = f"{cleaned};"
+        tokens = (
+            [self._start_of_subtask()]
+            + self._tokenizer.encode(text)
+            + [self._end_of_subtask()]
+            + [self._tokenizer.eos_id()]
         )
+        mask = [True] * len(tokens)
+        return self._pad_or_truncate(tokens, mask, self._max_subtask_len, segment_name="subtask")
+
+    def tokenize_reasoning(self, reasoning: str) -> tuple[np.ndarray, np.ndarray]:
+        """Tokenize reasoning segment (causal; first generated segment after the prompt)."""
+        cleaned = reasoning.strip().replace("_", " ").replace("\n", " ")
+        text = f"{cleaned};"
+        tokens = [self._start_of_reasoning()] + self._tokenizer.encode(text) + [self._end_of_reasoning()]
+        mask = [True] * len(tokens)
+        return self._pad_or_truncate(tokens, mask, self._max_reasoning_len, segment_name="reasoning")
+
+    def tokenize_fast_actions(self, actions: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Tokenize FAST-discretized actions for VLM supervision (after subtask in the prefix).
+
+        Layout matches ``FASTTokenizer``: ``Action: <fast tokens> |`` with EOS.
+        """
+        if self._fast_tokenizer is None:
+            raise RuntimeError("FAST tokenizer is disabled; set use_fast_tokens=True on CoTPaligemmaTokenizer.")
+        action_tokens = self._fast_tokenizer._fast_tokenizer(actions[None])[0]
+        action_tokens_in_pg = self._fast_tokenizer._act_tokens_to_paligemma_tokens(action_tokens)
+        tokens = (
+            self._tokenizer.encode("Action: ")
+            + action_tokens_in_pg.tolist()
+            + self._tokenizer.encode("|", add_eos=True)
+        )
+        mask = [True] * len(tokens)
+        return self._pad_or_truncate(tokens, mask, self._max_fast_len, segment_name="fast")
+
+    def extract_fast_actions(
+        self,
+        tokens: np.ndarray,
+        action_horizon: int,
+        action_dim: int,
+        *,
+        mask: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Decode FAST actions from a tokenized fast segment (for eval / visualization)."""
+        if self._fast_tokenizer is None:
+            raise RuntimeError("FAST tokenizer is disabled; set use_fast_tokens=True on CoTPaligemmaTokenizer.")
+        if mask is not None:
+            tokens = tokens[mask.astype(bool)]
+        return self._fast_tokenizer.extract_actions_from_fast_segment(tokens, action_horizon, action_dim)
+
+    @property
+    def max_fast_len(self) -> int:
+        return self._max_fast_len
+
+    @property
+    def vocab_size(self) -> int:
+        return self._tokenizer.vocab_size()
+
+    def _start_of_subtask(self) -> int:
+        return self._cot_reserved_token_id(1)
+
+    def _end_of_subtask(self) -> int:
+        return self._cot_reserved_token_id(2)
+
+    def _start_of_reasoning(self) -> int:
+        return self._cot_reserved_token_id(3)
+
+    def _end_of_reasoning(self) -> int:
+        return self._cot_reserved_token_id(4)
+
+    def _cot_reserved_token_id(self, slot: int) -> int:
+        """Map CoT delimiter slot (1..COT_DELIMITER_TOKEN_SLOTS) to a PaliGemma token id."""
+        if not 1 <= slot <= COT_DELIMITER_TOKEN_SLOTS:
+            raise ValueError(f"CoT reserved slot must be in 1..{COT_DELIMITER_TOKEN_SLOTS}, got {slot}")
+        return self.vocab_size - 1 - self._cot_skip_tokens - slot
 
 
 ###########################################################################
