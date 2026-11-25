@@ -41,7 +41,6 @@ import jax
 import jax.numpy as jnp
 from typing_extensions import override
 
-from openpi.models import context_smoothing as _context_smoothing
 from openpi.models import model as _model
 from openpi.models import pi0
 from openpi.models import pi0_config
@@ -111,20 +110,6 @@ class Pi0CoT(_model.BaseModel):
         self.time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
 
-        # Context-Smoothed Pre-training: a second adaRMS timestep branch for t_context, mirroring
-        # the flow-timestep branch above. The output layer is zero-initialized so that adarms_cond
-        # is bit-identical to a stock pi0.5 checkpoint at step 0 -- the model warm-starts cleanly
-        # and learns to use t_context from there.
-        self.context_smoothing = config.context_smoothing
-        if self.context_smoothing is not None:
-            self.ctx_time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
-            self.ctx_time_mlp_out = nnx.Linear(
-                action_expert_config.width,
-                action_expert_config.width,
-                kernel_init=nnx.initializers.zeros_init(),
-                bias_init=nnx.initializers.zeros_init(),
-                rngs=rngs,
-            )
 
         self.max_subtask_len = config.max_subtask_len
         self.max_reasoning_len = config.max_reasoning_len
@@ -161,14 +146,6 @@ class Pi0CoT(_model.BaseModel):
         """Embed integer token IDs through the PaliGemma embedder."""
         return self.PaliGemma.llm(token_ids, method="embed")
 
-    def _smooth_image_tokens(self, img_tokens, t_context, rng):
-        """Apply the CSP forward schedule to each camera's image tokens."""
-        rngs = jax.random.split(rng, len(img_tokens))
-        return [
-            _context_smoothing.noise_context(tok, t_context, r, self.context_smoothing)
-            for tok, r in zip(img_tokens, rngs, strict=True)
-        ]
-
     @staticmethod
     def _gather_last_valid_hidden(
         prefix_out: jnp.ndarray, prefix_mask: jnp.ndarray
@@ -188,27 +165,14 @@ class Pi0CoT(_model.BaseModel):
         batch_i = jnp.arange(b)
         return prefix_out[batch_i, idx, :][:, None, :]
 
-    def _embed_action_suffix(self, obs, noisy_actions, timestep, t_context=None):
-        """Embed action tokens for the action expert (same as Pi0.5 suffix).
-
-        When ``t_context`` is given, its embedding is summed into the adaRMS conditioning so the
-        action expert sees both the flow timestep and the context noise level.
-        """
+    def _embed_action_suffix(self, obs, noisy_actions, timestep):
+        """Embed action tokens for the action expert (same as Pi0.5 suffix)."""
         action_tokens = self.action_in_proj(noisy_actions)
         time_emb = pi0.posemb_sincos(timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0)
         time_emb = self.time_mlp_in(time_emb)
         time_emb = nnx.swish(time_emb)
         time_emb = self.time_mlp_out(time_emb)
         time_emb = nnx.swish(time_emb)
-        if t_context is not None:
-            ctx_emb = pi0.posemb_sincos(
-                t_context, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0
-            )
-            ctx_emb = self.ctx_time_mlp_in(ctx_emb)
-            ctx_emb = nnx.swish(ctx_emb)
-            ctx_emb = self.ctx_time_mlp_out(ctx_emb)
-            ctx_emb = nnx.swish(ctx_emb)
-            time_emb = time_emb + ctx_emb
         mask = jnp.ones(action_tokens.shape[:2], dtype=jnp.bool_)
         ar = [True] + [False] * (self.action_horizon - 1)
         return action_tokens, mask, ar, time_emb
@@ -312,7 +276,7 @@ class Pi0CoT(_model.BaseModel):
     def _compute_loss_and_metrics(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> tuple[jnp.ndarray, dict[str, jnp.ndarray]]:
-        preprocess_rng, noise_rng, time_rng, ctx_time_rng, ctx_noise_rng = jax.random.split(rng, 5)
+        preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(
             preprocess_rng, observation, train=train, image_keys=self._image_keys
         )
@@ -324,16 +288,8 @@ class Pi0CoT(_model.BaseModel):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        # Context noise level, sampled independently of the flow timestep so the policy is trained
-        # across the whole spectrum from precise imitation (t=0) to broad coverage (t=1).
-        t_context = None
-        if self.context_smoothing is not None:
-            t_context = _context_smoothing.sample_t_context(ctx_time_rng, batch_shape, self.context_smoothing)
-
         # --- Build prefix tokens ---
         img_tokens, img_masks, img_ar = self._embed_images(observation)
-        if t_context is not None:
-            img_tokens = self._smooth_image_tokens(img_tokens, t_context, ctx_noise_rng)
         n_img = sum(t.shape[1] for t in img_tokens)
 
         prompt_emb = self._embed_text_tokens(observation.tokenized_prompt)
@@ -368,7 +324,7 @@ class Pi0CoT(_model.BaseModel):
 
         # --- Build suffix tokens (action expert) ---
         suffix_tokens, suffix_mask, suffix_ar_list, adarms_cond = self._embed_action_suffix(
-            observation, x_t, time, t_context
+            observation, x_t, time
         )
         suffix_ar = jnp.array(suffix_ar_list)
         n_action = suffix_tokens.shape[1]
@@ -511,14 +467,6 @@ class Pi0CoT(_model.BaseModel):
             metrics["action_supervised_frac"] = jnp.mean(
                 jnp.any(observation.action_loss_mask, axis=-1).astype(jnp.float32)
             )
-        if t_context is not None:
-            metrics["t_context"] = t_context
-            # Flow loss on the cleanest and noisiest halves of the batch, to see the imitation and
-            # coverage ends of the spectrum separate during CSP.
-            clean = t_context < 0.5
-            per_sample_flow = jnp.mean(flow_loss, axis=-1)
-            metrics["flow_loss_clean_ctx"] = jnp.sum(per_sample_flow * clean) / jnp.clip(jnp.sum(clean), 1.0)
-            metrics["flow_loss_noisy_ctx"] = jnp.sum(per_sample_flow * ~clean) / jnp.clip(jnp.sum(~clean), 1.0)
         return combined, metrics
 
     @override
@@ -1033,41 +981,6 @@ class Pi0CoT(_model.BaseModel):
             out["tokenized_fast_mask"] = fast_m
         return out
 
-    @nnx.jit
-    def _denoise_flow_step(
-        self,
-        observation: _model.Observation,
-        kv_cache,
-        prefix_mask: jnp.ndarray,
-        prefix_mask_for_action: jnp.ndarray,
-        dt: jnp.ndarray,
-        x_t: jnp.ndarray,
-        t: jnp.ndarray,
-        t_context: jnp.ndarray | None = None,
-    ) -> tuple[jnp.ndarray, jnp.ndarray]:
-        """Single flow-matching step (suffix forward under frozen prefix ``kv_cache``)."""
-        b = observation.state.shape[0]
-        t_b = jnp.broadcast_to(t, (b,))
-        suffix_tokens, suffix_mask, suffix_ar_list, adarms_cond = self._embed_action_suffix(
-            observation, x_t, t_b, t_context
-        )
-        suffix_ar = jnp.array(suffix_ar_list)
-        suffix_attn_mask = pi0.make_attn_mask(suffix_mask, suffix_ar)
-        action_to_prefix = einops.repeat(
-            prefix_mask_for_action, "b p -> b s p", s=suffix_tokens.shape[1]
-        )
-        full_attn_mask = jnp.concatenate([action_to_prefix, suffix_attn_mask], axis=-1)
-        positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
-        (_, suffix_out), _ = self.PaliGemma.llm(
-            [None, suffix_tokens],
-            mask=full_attn_mask,
-            positions=positions,
-            kv_cache=kv_cache,
-            adarms_cond=[None, adarms_cond],
-        )
-        v_t = self.action_out_proj(suffix_out[:, -self.action_horizon:])
-        return x_t + dt * v_t, t + dt
-
     @override
     def sample_actions(
         self,
@@ -1077,35 +990,14 @@ class Pi0CoT(_model.BaseModel):
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
         image_keys: Sequence[str] | None = None,
-        t_context: float | at.Float[at.Array, " b"] | None = None,
     ) -> _model.Actions:
-        """Flow-match denoise from prefix KV + action suffix.
-
-        ``t_context``: context noise level in [0, 1] for a CSP-trained model. ``None`` (the default)
-        means no context smoothing -- the clean, precise-imitation regime, identical to a model
-        trained without CSP. A TMRL high-level policy selects this per action chunk.
-
-        ``jit_denoise_steps``: Python loop over ``num_steps``, each iteration calling this
-        module's jitted :meth:`_denoise_flow_step` (separate XLA program per step; usually
-        between fused ``while_loop`` and fully eager in peak VRAM and speed).
-
-        ``low_memory_denoise``: fully eager Python loop (no per-step ``nnx.jit``). Do not wrap
-        the whole :meth:`sample_actions` in ``nnx.jit`` when using either loop mode.
-        """
+        """Flow-match denoise from prefix KV + action suffix."""
         keys = tuple(image_keys) if image_keys is not None else self._preprocess_image_keys
         observation = _model.preprocess_observation(None, observation, train=False, image_keys=keys)
         batch_size = observation.state.shape[0]
 
-        if t_context is not None:
-            if self.context_smoothing is None:
-                raise ValueError("t_context requires a model trained with context_smoothing enabled")
-            t_context = jnp.broadcast_to(jnp.asarray(t_context, dtype=jnp.float32), (batch_size,))
-
         # --- Build prefix: images + prompt + reasoning + subtask ---
         img_tokens, img_masks, img_ar = self._embed_images(observation)
-        if t_context is not None:
-            rng, ctx_noise_rng = jax.random.split(rng)
-            img_tokens = self._smooth_image_tokens(img_tokens, t_context, ctx_noise_rng)
         n_img = sum(t.shape[1] for t in img_tokens)
 
         prompt_emb = self._embed_text_tokens(observation.tokenized_prompt)
@@ -1179,7 +1071,7 @@ class Pi0CoT(_model.BaseModel):
         def step(carry):
             x_t, t = carry
             suffix_tokens, suffix_mask, suffix_ar_list, adarms_cond = self._embed_action_suffix(
-                observation, x_t, jnp.broadcast_to(t, (batch_size,)), t_context
+                observation, x_t, jnp.broadcast_to(t, (batch_size,))
             )
             suffix_ar = jnp.array(suffix_ar_list)
             suffix_attn_mask = pi0.make_attn_mask(suffix_mask, suffix_ar)

@@ -33,7 +33,7 @@ import sys
 import textwrap
 
 DEFAULT_DATA_DIR = "/raid/datasets/steervla"
-DEFAULT_BATCH_CONFIG = "pi05_steervla_cot_simplified_reasoning_csp"
+DEFAULT_BATCH_CONFIG = "pi05_steervla_cot_simplified_reasoning"
 
 # ---------------------------------------------------------------------------- helpers
 
