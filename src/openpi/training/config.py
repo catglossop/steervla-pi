@@ -527,7 +527,9 @@ class RLDSSteerVLADataConfig(DataConfigFactory):
     """
 
     rlds_data_dir: str | None = None
-    dataset_format: tyro.conf.Suppress[steervla_rlds_dataset.DatasetFormat] = steervla_rlds_dataset.DatasetFormat.NUSCENES
+    dataset_format: tyro.conf.Suppress[steervla_rlds_dataset.DatasetFormat] = (
+        steervla_rlds_dataset.DatasetFormat.NUSCENES
+    )
     include_ego_history: bool = True
     include_xy_action: bool = False
     speed_in_prompt: bool = True
@@ -547,8 +549,12 @@ class RLDSSteerVLADataConfig(DataConfigFactory):
     dataset_version: tyro.conf.Suppress[str | None] = None
 
     # SimLingo-specific options.
-    output_action_format: tyro.conf.Suppress[steervla_rlds_dataset.OutputActionFormat] = steervla_rlds_dataset.OutputActionFormat.DELTA_XY_T_DELTA_XY_SPACE
-    lang_label_type: tyro.conf.Suppress[steervla_rlds_dataset.LangLabelType] = steervla_rlds_dataset.LangLabelType.ROUTING_COMMAND
+    output_action_format: tyro.conf.Suppress[steervla_rlds_dataset.OutputActionFormat] = (
+        steervla_rlds_dataset.OutputActionFormat.DELTA_XY_T_DELTA_XY_SPACE
+    )
+    lang_label_type: tyro.conf.Suppress[steervla_rlds_dataset.LangLabelType] = (
+        steervla_rlds_dataset.LangLabelType.ROUTING_COMMAND
+    )
     routing_command_in_prompt: bool = False
     add_suffix_to_prompt: bool = False
 
@@ -559,9 +565,7 @@ class RLDSSteerVLADataConfig(DataConfigFactory):
             return base
         return dataclasses.replace(
             base,
-            norm_stats=_exempt_dims_from_normalization(
-                base.norm_stats, "actions", self.unnormalized_action_dims
-            ),
+            norm_stats=_exempt_dims_from_normalization(base.norm_stats, "actions", self.unnormalized_action_dims),
         )
 
     @override
@@ -572,11 +576,15 @@ class RLDSSteerVLADataConfig(DataConfigFactory):
             for name, weight in self.dataset_name_weight_mappings.items():
                 resolved_datasets.append(
                     steervla_rlds_dataset.SteerVLARLDSDataset(
-                        name=name, weight=weight, version=self.dataset_version,
+                        name=name,
+                        weight=weight,
+                        version=self.dataset_version,
                     )
                 )
 
-        assert len(resolved_datasets) > 0, "Must specify at least one dataset via `datasets` or `dataset_name_weight_mappings`."
+        assert len(resolved_datasets) > 0, (
+            "Must specify at least one dataset via `datasets` or `dataset_name_weight_mappings`."
+        )
 
         repack_transform = _transforms.Group(
             inputs=[
@@ -596,12 +604,14 @@ class RLDSSteerVLADataConfig(DataConfigFactory):
         # For RLDS data, the speed_in_prompt injection already happens in the RLDS loader,
         # so we disable it in the policy transform to avoid double-injection.
         data_transforms = _transforms.Group(
-            inputs=[steervla_policy.SteerVLAInputs(
-                model_type=model_config.model_type,
-                speed_in_prompt=False,
-                include_ego_history=False,
-                proprio_norm=False,
-            )],
+            inputs=[
+                steervla_policy.SteerVLAInputs(
+                    model_type=model_config.model_type,
+                    speed_in_prompt=False,
+                    include_ego_history=False,
+                    proprio_norm=False,
+                )
+            ],
             outputs=[steervla_policy.SteerVLAOutputs(action_dim=self.action_dim)],
         )
 
@@ -664,7 +674,9 @@ class RLDSSteerVLACoTDataConfig(RLDSSteerVLADataConfig):
             for name, weight in self.dataset_name_weight_mappings.items():
                 resolved_datasets.append(
                     steervla_rlds_dataset.SteerVLARLDSDataset(
-                        name=name, weight=weight, version=self.dataset_version,
+                        name=name,
+                        weight=weight,
+                        version=self.dataset_version,
                     )
                 )
 
@@ -673,7 +685,9 @@ class RLDSSteerVLACoTDataConfig(RLDSSteerVLADataConfig):
             for name, weight in self.ll_dataset_name_weight_mappings.items():
                 resolved_ll_datasets.append(
                     steervla_rlds_dataset.SteerVLARLDSDataset(
-                        name=name, weight=weight, version=self.dataset_version,
+                        name=name,
+                        weight=weight,
+                        version=self.dataset_version,
                     )
                 )
 
@@ -718,22 +732,23 @@ class RLDSSteerVLACoTDataConfig(RLDSSteerVLADataConfig):
             ]
         )
 
-
         # Derived from the model config so the emitted cameras and ``inputs_spec`` cannot disagree
         # (``scripts/train.py`` validates the batch against the spec).
         image_keys = getattr(model_config, "image_keys", None)
 
         data_transforms = _transforms.Group(
-            inputs=[steervla_policy.SteerVLAInputs(
-                model_type=model_config.model_type,
-                # CoT injects the speed string here rather than in the RLDS loader; see
-                # ``steervla_speed_in_prompt=False`` below. Injecting in both places would put the
-                # speed in the prompt twice.
-                speed_in_prompt=self.speed_in_prompt,
-                include_ego_history=self.include_ego_history,
-                proprio_norm=False,
-                image_keys=image_keys,
-            )],
+            inputs=[
+                steervla_policy.SteerVLAInputs(
+                    model_type=model_config.model_type,
+                    # CoT injects the speed string here rather than in the RLDS loader; see
+                    # ``steervla_speed_in_prompt=False`` below. Injecting in both places would put the
+                    # speed in the prompt twice.
+                    speed_in_prompt=self.speed_in_prompt,
+                    include_ego_history=self.include_ego_history,
+                    proprio_norm=False,
+                    image_keys=image_keys,
+                )
+            ],
             outputs=[steervla_policy.SteerVLAOutputs(action_dim=self.action_dim)],
         )
 
@@ -813,12 +828,14 @@ class LeRobotSteerVLADataConfig(DataConfigFactory):
         )
 
         data_transforms = _transforms.Group(
-            inputs=[steervla_policy.SteerVLAInputs(
-                model_type=model_config.model_type,
-                speed_in_prompt=self.speed_in_prompt,
-                include_ego_history=self.include_ego_history,
-                proprio_norm=self.proprio_norm,
-            )],
+            inputs=[
+                steervla_policy.SteerVLAInputs(
+                    model_type=model_config.model_type,
+                    speed_in_prompt=self.speed_in_prompt,
+                    include_ego_history=self.include_ego_history,
+                    proprio_norm=self.proprio_norm,
+                )
+            ],
             outputs=[steervla_policy.SteerVLAOutputs(action_dim=self.action_dim)],
         )
 

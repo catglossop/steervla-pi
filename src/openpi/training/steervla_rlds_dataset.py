@@ -8,7 +8,8 @@ and various language instruction modes.
 
 from collections.abc import Sequence
 import dataclasses
-from enum import Enum, auto
+from enum import Enum
+from enum import auto
 import logging
 
 from openpi.training.rlds_multihost import shard_dataset_then_batch
@@ -203,9 +204,7 @@ class SteerVLARldsDataset:
         source_specs: list[tuple[SteerVLARLDSDataset, DatasetFormat, bool, bool, str, str]] = [
             (d, dataset_format, True, True, cot_reasoning_key, cot_subtask_key) for d in datasets
         ]
-        source_specs += [
-            (d, dataset_format, True, False, cot_reasoning_key, cot_subtask_key) for d in ll_datasets
-        ]
+        source_specs += [(d, dataset_format, True, False, cot_reasoning_key, cot_subtask_key) for d in ll_datasets]
         source_specs += [
             (d, hl_dataset_format or dataset_format, False, True, hl_cot_reasoning_key, hl_cot_subtask_key)
             for d in hl_datasets
@@ -302,10 +301,9 @@ class SteerVLARldsDataset:
             """Build the SimLingo restructure function."""
 
             def restructure(traj):
-
                 traj_len = tf.shape(traj["speed"])[0]
                 current_speed_og = traj["speed"]
-                
+
                 state_speeds = traj["observation"]["ego_hist"][:, :, 0]
                 state_local_courses = traj["observation"]["ego_hist"][:, :, 1]
 
@@ -338,7 +336,9 @@ class SteerVLARldsDataset:
                 delta_course_t = (delta_course_t % 360.0 + 360.0) % 360.0
                 delta_course_t = tf.where(delta_course_t > 180.0, delta_course_t - 360.0, delta_course_t)
                 delta_course_space = (delta_course_space % 360.0 + 360.0) % 360.0
-                delta_course_space = tf.where(delta_course_space > 180.0, delta_course_space - 360.0, delta_course_space)
+                delta_course_space = tf.where(
+                    delta_course_space > 180.0, delta_course_space - 360.0, delta_course_space
+                )
 
                 delta_speed_t_norm = 10.0
                 delta_xy_t_norm = 7.0
@@ -350,7 +350,9 @@ class SteerVLARldsDataset:
 
                 oaf = output_action_format
                 if oaf == OutputActionFormat.DELTA_SPEED_T_DELTA_COURSE_T_DELTA_COURSE_SPACE:
-                    actions = tf.concat([delta_speed_t[..., None], delta_course_t[..., None], delta_course_space[..., None]], axis=-1)
+                    actions = tf.concat(
+                        [delta_speed_t[..., None], delta_course_t[..., None], delta_course_space[..., None]], axis=-1
+                    )
                 elif oaf == OutputActionFormat.DELTA_XY_T_DELTA_XY_SPACE:
                     actions = tf.concat([delta_xy_t, delta_xy_space], axis=-1)
                 elif oaf == OutputActionFormat.DELTA_XY_T_DELTA_COURSE_SPACE:
@@ -359,11 +361,9 @@ class SteerVLARldsDataset:
                     raise ValueError(f"Unknown output_action_format: {oaf}")
 
                 actions = actions[:, :action_chunk_size, :]
-                action_loss_mask = tf.fill(
-                    [traj_len, action_chunk_size], tf.cast(action_supervision, tf.bool)
-                )
+                action_loss_mask = tf.fill([traj_len, action_chunk_size], tf.cast(action_supervision, tf.bool))
 
-                # Select language label 
+                # Select language label
                 llt = lang_label_type
                 if llt == LangLabelType.COMMENTARY:
                     instruction = traj["commentary"]
@@ -491,9 +491,7 @@ class SteerVLARldsDataset:
             crop, _ = resolve_image_crop(dataset_cfg)
 
             def decode_images(frame, crop=crop):
-                image = tf.io.decode_image(
-                    frame["observation"]["image"], expand_animations=False, dtype=tf.uint8
-                )
+                image = tf.io.decode_image(frame["observation"]["image"], expand_animations=False, dtype=tf.uint8)
                 if crop:
                     x0, y0, x1, y1 = crop
                     shape = tf.shape(image)
@@ -509,9 +507,7 @@ class SteerVLARldsDataset:
                         tf.cast(tf.round(x1 * w), tf.int32) - left,
                     )
                     # Back to the stored resolution: sources in one mixture must batch at one shape.
-                    image = tf.cast(
-                        tf.round(tf.image.resize(image, [shape[0], shape[1]], antialias=True)), tf.uint8
-                    )
+                    image = tf.cast(tf.round(tf.image.resize(image, [shape[0], shape[1]], antialias=True)), tf.uint8)
                 frame["observation"]["image"] = image
                 return frame
 
@@ -519,6 +515,7 @@ class SteerVLARldsDataset:
 
         logging.info(f"Preparing {len(source_specs)} SteerVLA datasets...")
         logging.info("-" * 50)
+
         def _mode(*, action_sup: bool, cot_sup: bool) -> str:
             """Human-readable name for a (flow, CoT) supervision pair."""
             return {(True, True): "flow+cot", (True, False): "flow_only", (False, True): "cot_only"}.get(

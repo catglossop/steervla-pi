@@ -7,7 +7,7 @@ import pytest
 from openpi.models import gemma
 
 
-def _run(knowledge_insulation: bool, *, module=gemma):
+def _run(*, knowledge_insulation: bool, module=gemma):
     configs = [module.get_config("dummy"), module.get_config("dummy")]
     llm = module.Module(configs=configs, embed_dtype="float32", knowledge_insulation=knowledge_insulation)
     b, n_backbone, n_action, width = 2, 5, 3, configs[0].width

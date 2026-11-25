@@ -15,12 +15,10 @@ uv run --group rlds examples/steervla/convert_nuscenes_to_lerobot.py \
 """
 
 import shutil
-from pathlib import Path
 
 import numpy as np
 from tqdm import tqdm
 import tyro
-
 
 REPO_NAME = "your_hf_username/my_steervla_dataset"
 
@@ -69,9 +67,10 @@ def main(
     *,
     push_to_hub: bool = False,
 ):
+    from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME
+    from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
     import tensorflow as tf
     import tensorflow_datasets as tfds
-    from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME, LeRobotDataset
 
     tf.config.set_visible_devices([], "GPU")
 

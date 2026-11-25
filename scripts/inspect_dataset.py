@@ -1,6 +1,6 @@
-import tensorflow_datasets as tfds
 import matplotlib.pyplot as plt
 import numpy as np
+import tensorflow_datasets as tfds
 
 # builder = tfds.builder(name="simplified_reasoning_dataset", data_dir="/raid/datasets/steervla")
 builder = tfds.builder(name="simlingo_dataset_acceleration_negative1_img512_1116", data_dir="/raid/datasets/steervla")
@@ -25,8 +25,7 @@ for example in ds:
         plt.plot(waypoints_space[:, 0], waypoints_space[:, 1], label="Waypoints Space")
         plt.legend()
         plt.savefig(f"waypoints_{step['gemini_refined_label']}.png")
-        
-        
+
     break
 
 builder = tfds.builder(name="simplified_reasoning_dataset", data_dir="/raid/datasets/steervla")
@@ -44,8 +43,3 @@ for example in ds:
         breakpoint()
         break
     break
-
-
-
-
-

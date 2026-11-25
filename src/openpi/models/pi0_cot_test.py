@@ -157,9 +157,7 @@ def test_image_keys_drives_inputs_spec():
 
 
 def test_inference_image_keys_overrides_image_keys_at_sampling_only():
-    config = dataclasses.replace(
-        _tiny_config(None), inference_image_keys=("base_0_rgb",)
-    )
+    config = dataclasses.replace(_tiny_config(None), inference_image_keys=("base_0_rgb",))
     model = config.create(jax.random.key(0))
     # Training consumes every declared stream; sampling honours the inference override.
     assert model._image_keys == tuple(_model.IMAGE_KEYS)  # noqa: SLF001
@@ -196,9 +194,7 @@ def test_exempted_dim_is_identity_and_round_trips():
         np.testing.assert_allclose(normed[:, 2], raw[:, 2], atol=1e-5)
         # Round trip through the 32-dim padded vector the policy actually returns.
         padded = np.concatenate([normed, np.zeros((64, 28))], axis=-1)
-        back = _transforms.Unnormalize({"actions": exempt}, use_quantiles=use_quantiles)({"actions": padded})[
-            "actions"
-        ]
+        back = _transforms.Unnormalize({"actions": exempt}, use_quantiles=use_quantiles)({"actions": padded})["actions"]
         np.testing.assert_allclose(back[:, :4], raw, atol=1e-5)
 
 
@@ -214,9 +210,7 @@ def _supervision_losses(model, config, obs, actions, rng, *, cot_mask, action_ma
     b = obs.state.shape[0]
     o = obs.replace(
         cot_loss_mask=jnp.array(cot_mask, dtype=bool),
-        action_loss_mask=jnp.broadcast_to(
-            jnp.array(action_mask, dtype=bool)[:, None], (b, config.action_horizon)
-        ),
+        action_loss_mask=jnp.broadcast_to(jnp.array(action_mask, dtype=bool)[:, None], (b, config.action_horizon)),
     )
     _, metrics = model.compute_loss_with_aux(rng, o, actions, train=False)
     return np.asarray(metrics["cot_loss"]), np.asarray(metrics["flow_loss"]), metrics
@@ -274,8 +268,13 @@ def test_per_term_ce_metrics_stay_unmasked():
     actions = jax.random.uniform(jax.random.key(3), (b, config.action_horizon, config.action_dim))
 
     cot_loss, _, metrics = _supervision_losses(
-        model, config, obs, actions, jax.random.key(7),
-        cot_mask=[False] * b, action_mask=[True] * b,
+        model,
+        config,
+        obs,
+        actions,
+        jax.random.key(7),
+        cot_mask=[False] * b,
+        action_mask=[True] * b,
     )
     assert float(jnp.mean(cot_loss)) == 0.0
     assert float(jnp.mean(metrics["cot_subtask_ce"])) > 0.0

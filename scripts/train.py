@@ -1,9 +1,9 @@
 import dataclasses
+import datetime
 import functools
 import logging
 import platform
 from typing import Any
-import datetime
 
 import etils.epath as epath
 import flax.nnx as nnx
@@ -333,9 +333,7 @@ def main(config: _config.TrainConfig):
         run_dir = epath.Path(config.resume_dir)
         resume_flag = True
     else:
-        run_dir = config.checkpoint_dir / (
-            config.exp_name + "_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        )
+        run_dir = config.checkpoint_dir / (config.exp_name + "_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
         resume_flag = config.resume
 
     checkpoint_manager, resuming = _checkpoints.initialize_checkpoint_dir(
@@ -385,9 +383,7 @@ def main(config: _config.TrainConfig):
     logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
 
     if resuming:
-        train_state = _checkpoints.restore_state(
-            checkpoint_manager, train_state, data_loader, step=config.resume_step
-        )
+        train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader, step=config.resume_step)
 
     ptrain_step = jax.jit(
         functools.partial(train_step, config),

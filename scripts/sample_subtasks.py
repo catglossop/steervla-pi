@@ -95,8 +95,7 @@ def main(args: Args) -> None:
 
     if len(reservoir) < args.num_samples:
         raise ValueError(
-            f"Collected {len(reservoir)} subtasks from {steps_seen} steps, "
-            f"fewer than requested {args.num_samples}."
+            f"Collected {len(reservoir)} subtasks from {steps_seen} steps, fewer than requested {args.num_samples}."
         )
 
     output_path = args.output.expanduser().resolve()

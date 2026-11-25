@@ -176,6 +176,7 @@ class SteerVLAInputs(transforms.DataTransformFn):
 class SteerVLAOutputs(transforms.DataTransformFn):
     action_dim: int = 2
     enable_cot: bool = False
+
     def __call__(self, data: dict) -> dict:
         # if self.enable_cot:
         #     return {
@@ -184,4 +185,4 @@ class SteerVLAOutputs(transforms.DataTransformFn):
         #         "reasoning": data["reasoning"],
         #     }
         # else:
-        return {"actions": np.asarray(data["actions"][:, :self.action_dim])}
+        return {"actions": np.asarray(data["actions"][:, : self.action_dim])}

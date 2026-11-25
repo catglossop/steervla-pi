@@ -30,9 +30,9 @@ Suffix (Action expert, adaRMS):
 Losses: CE on reasoning + subtask (+ FAST when enabled), flow-matching on actions.
 """
 
+from collections.abc import Sequence
 import functools
 import logging
-from collections.abc import Sequence
 
 import einops
 import flax.nnx as nnx
@@ -46,7 +46,7 @@ from openpi.models import pi0
 from openpi.models import pi0_config
 import openpi.models.gemma as _gemma
 import openpi.models.siglip as _siglip
-from openpi.models.tokenizer import COT_DELIMITER_TOKEN_SLOTS, PALIGEMMA_VOCAB_SKIP_TOKENS
+from openpi.models.tokenizer import PALIGEMMA_VOCAB_SKIP_TOKENS
 from openpi.shared import array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
 
@@ -110,7 +110,6 @@ class Pi0CoT(_model.BaseModel):
         self.time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
 
-
         self.max_subtask_len = config.max_subtask_len
         self.max_reasoning_len = config.max_reasoning_len
         self.max_fast_len = config.max_fast_len
@@ -118,9 +117,7 @@ class Pi0CoT(_model.BaseModel):
         # Camera streams consumed during training (and the default at inference).
         self._image_keys: tuple[str, ...] = config.resolved_image_keys
         self._preprocess_image_keys: tuple[str, ...] = (
-            tuple(config.inference_image_keys)
-            if config.inference_image_keys is not None
-            else self._image_keys
+            tuple(config.inference_image_keys) if config.inference_image_keys is not None else self._image_keys
         )
         self._cot_jit_decode = bool(config.cot_jit_decode)
         self._cot_jit_transformer_forward = bool(config.cot_jit_transformer_forward)
@@ -147,9 +144,7 @@ class Pi0CoT(_model.BaseModel):
         return self.PaliGemma.llm(token_ids, method="embed")
 
     @staticmethod
-    def _gather_last_valid_hidden(
-        prefix_out: jnp.ndarray, prefix_mask: jnp.ndarray
-    ) -> jnp.ndarray:
+    def _gather_last_valid_hidden(prefix_out: jnp.ndarray, prefix_mask: jnp.ndarray) -> jnp.ndarray:
         """Last valid timestep hidden state (b, 1, d) for next-token prediction.
 
         Uses the index of the last ``True`` in ``prefix_mask``, NOT ``num_valid - 1``: valid
@@ -306,9 +301,7 @@ class Pi0CoT(_model.BaseModel):
 
         prefix_parts = img_tokens + [prompt_emb, reasoning_emb, subtask_emb]
         prefix_mask_parts = img_masks + [prompt_mask, reasoning_mask, subtask_mask]
-        prefix_ar_list = (
-            img_ar + [False] * n_prompt + [True] * n_reasoning + [True] * n_subtask
-        )
+        prefix_ar_list = img_ar + [False] * n_prompt + [True] * n_reasoning + [True] * n_subtask
         n_fast = 0
         if self._use_fast_tokens and observation.tokenized_fast is not None:
             fast_emb = self._embed_text_tokens(observation.tokenized_fast)
@@ -323,16 +316,22 @@ class Pi0CoT(_model.BaseModel):
         prefix_ar = jnp.array(prefix_ar_list)
 
         # --- Build suffix tokens (action expert) ---
-        suffix_tokens, suffix_mask, suffix_ar_list, adarms_cond = self._embed_action_suffix(
-            observation, x_t, time
-        )
+        suffix_tokens, suffix_mask, suffix_ar_list, adarms_cond = self._embed_action_suffix(observation, x_t, time)
         suffix_ar = jnp.array(suffix_ar_list)
         n_action = suffix_tokens.shape[1]
 
         # --- Custom attention mask ---
         attn_mask = self._build_attention_mask(
-            prefix_mask, prefix_ar, suffix_mask, suffix_ar,
-            n_img, n_prompt, n_subtask, n_reasoning, n_fast, n_action,
+            prefix_mask,
+            prefix_ar,
+            suffix_mask,
+            suffix_ar,
+            n_img,
+            n_prompt,
+            n_subtask,
+            n_reasoning,
+            n_fast,
+            n_action,
             action_attend_subtask=self._action_attend_subtask,
         )
 
@@ -348,7 +347,7 @@ class Pi0CoT(_model.BaseModel):
         )
 
         # --- Action flow-matching loss ---
-        v_t = self.action_out_proj(suffix_out[:, -self.action_horizon:])
+        v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
         flow_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)  # (batch, horizon)
         if observation.action_loss_mask is not None:
             # Allow disabling action-head supervision for selected samples/timesteps
@@ -358,11 +357,11 @@ class Pi0CoT(_model.BaseModel):
         # --- VLM cross-entropy loss on reasoning and subtask ---
         # Project VLM outputs back to vocab logits via the shared embedder
         reasoning_start = n_img + n_prompt
-        reasoning_out = prefix_out[:, reasoning_start:reasoning_start + n_reasoning]
+        reasoning_out = prefix_out[:, reasoning_start : reasoning_start + n_reasoning]
         subtask_start = reasoning_start + n_reasoning
-        subtask_out = prefix_out[:, subtask_start:subtask_start + n_subtask]
+        subtask_out = prefix_out[:, subtask_start : subtask_start + n_subtask]
         fast_start = subtask_start + n_subtask
-        fast_out = prefix_out[:, fast_start:fast_start + n_fast] if n_fast > 0 else None
+        fast_out = prefix_out[:, fast_start : fast_start + n_fast] if n_fast > 0 else None
         # Logits via embedder (shared embedding weights)
         reasoning_logits = self.PaliGemma.llm(reasoning_out, method="decode_logits")
         subtask_logits = self.PaliGemma.llm(subtask_out, method="decode_logits")
@@ -375,9 +374,7 @@ class Pi0CoT(_model.BaseModel):
         reasoning_ce = self._token_cross_entropy(
             reasoning_logits[:, :-1], reasoning_targets[:, 1:], reasoning_mask[:, 1:]
         )
-        subtask_ce = self._token_cross_entropy(
-            subtask_logits[:, :-1], subtask_targets[:, 1:], subtask_mask[:, 1:]
-        )
+        subtask_ce = self._token_cross_entropy(subtask_logits[:, :-1], subtask_targets[:, 1:], subtask_mask[:, 1:])
 
         # Boundary terms omitted by the shifted slices above (same layout as ``sample_cot``):
         # - ``<start_of_reasoning>`` is predicted from the last valid image+prompt hidden;
@@ -400,9 +397,7 @@ class Pi0CoT(_model.BaseModel):
             bridge_h = jnp.take_along_axis(reasoning_out, last_rea_idx[:, :, None], axis=1)
             first_subtask_logits = self.PaliGemma.llm(bridge_h, method="decode_logits")
             bridge_ok = reasoning_mask.any(axis=1, keepdims=True) & subtask_mask[:, :1]
-            first_subtask_ce = self._token_cross_entropy(
-                first_subtask_logits, subtask_targets[:, :1], bridge_ok
-            )
+            first_subtask_ce = self._token_cross_entropy(first_subtask_logits, subtask_targets[:, :1], bridge_ok)
 
         fast_ce = jnp.zeros_like(reasoning_ce)
         first_fast_ce = jnp.zeros_like(reasoning_ce)
@@ -410,9 +405,7 @@ class Pi0CoT(_model.BaseModel):
             fast_mask = observation.tokenized_fast_mask
             fast_targets = observation.tokenized_fast
             fast_logits = self.PaliGemma.llm(fast_out, method="decode_logits")
-            fast_ce = self._token_cross_entropy(
-                fast_logits[:, :-1], fast_targets[:, 1:], fast_mask[:, 1:]
-            )
+            fast_ce = self._token_cross_entropy(fast_logits[:, :-1], fast_targets[:, 1:], fast_mask[:, 1:])
             n_subtask_cols = subtask_out.shape[1]
             if n_subtask_cols == 0:
                 first_fast_ce = jnp.zeros_like(fast_ce)
@@ -422,9 +415,7 @@ class Pi0CoT(_model.BaseModel):
                 bridge_h_fast = jnp.take_along_axis(subtask_out, last_sub_idx[:, :, None], axis=1)
                 first_fast_logits = self.PaliGemma.llm(bridge_h_fast, method="decode_logits")
                 bridge_fast_ok = subtask_mask.any(axis=1, keepdims=True) & fast_mask[:, :1]
-                first_fast_ce = self._token_cross_entropy(
-                    first_fast_logits, fast_targets[:, :1], bridge_fast_ok
-                )
+                first_fast_ce = self._token_cross_entropy(first_fast_logits, fast_targets[:, :1], bridge_fast_ok)
 
             # High-level (reasoning-only) examples have no ground-truth actions, so their
             # FAST action tokens are meaningless targets (derived from dummy/zero actions).
@@ -1077,9 +1068,7 @@ class Pi0CoT(_model.BaseModel):
             suffix_attn_mask = pi0.make_attn_mask(suffix_mask, suffix_ar)
 
             # (b, suffix_len, prefix_len): each action token sees images + prompt + subtask
-            action_to_prefix = einops.repeat(
-                prefix_mask_for_action, "b p -> b s p", s=suffix_tokens.shape[1]
-            )
+            action_to_prefix = einops.repeat(prefix_mask_for_action, "b p -> b s p", s=suffix_tokens.shape[1])
             full_attn_mask = jnp.concatenate([action_to_prefix, suffix_attn_mask], axis=-1)
 
             positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
@@ -1091,9 +1080,8 @@ class Pi0CoT(_model.BaseModel):
                 kv_cache=kv_cache,
                 adarms_cond=[None, adarms_cond],
             )
-            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon:])
+            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
             return x_t + dt * v_t, t + dt
-
 
         t0 = jnp.asarray(1.0, dtype=noise.dtype)
 

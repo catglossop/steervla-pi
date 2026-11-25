@@ -248,9 +248,7 @@ class CoTPaligemmaTokenizer:
 
         self._cot_skip_tokens = PALIGEMMA_VOCAB_SKIP_TOKENS
 
-        path = download.maybe_download(
-            "gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"}
-        )
+        path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
         with path.open("rb") as f:
             self._tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
 
@@ -271,9 +269,7 @@ class CoTPaligemmaTokenizer:
             tokens = tokens + pad
             mask = mask + pad
         elif len(tokens) > max_len:
-            logging.warning(
-                f"{segment_name} token length ({len(tokens)}) exceeds max ({max_len}), truncating."
-            )
+            logging.warning(f"{segment_name} token length ({len(tokens)}) exceeds max ({max_len}), truncating.")
             tokens = tokens[:max_len]
             mask = mask[:max_len]
         return np.asarray(tokens, dtype=np.int32), np.asarray(mask, dtype=bool)
@@ -297,9 +293,7 @@ class CoTPaligemmaTokenizer:
             state = state[..., :state_dim]
         discretized = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
         state_str = " ".join(map(str, discretized))
-        text = (
-            f"Prompt:{cleaned};State:{state_str};"
-        )
+        text = f"Prompt:{cleaned};State:{state_str};"
         tokens = self._tokenizer.encode(text, add_bos=True)
         mask = [True] * len(tokens)
         return self._pad_or_truncate(tokens, mask, self._max_prompt_len, segment_name="prompt")
@@ -355,9 +349,7 @@ class CoTPaligemmaTokenizer:
             raise RuntimeError("FAST tokenizer is disabled; set use_fast_tokens=True on CoTPaligemmaTokenizer.")
         if mask is not None:
             tokens = tokens[mask.astype(bool)]
-        return self._fast_tokenizer.extract_actions_from_fast_segment(
-            tokens, action_horizon, action_dim
-        )
+        return self._fast_tokenizer.extract_actions_from_fast_segment(tokens, action_horizon, action_dim)
 
     @property
     def max_fast_len(self) -> int:
