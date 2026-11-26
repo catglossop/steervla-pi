@@ -61,6 +61,10 @@ rlds = [
     "tensorflow-cpu==2.15.0",
     "tensorflow-datasets==4.9.9",
 ]
+# Reading raw ABC sim episodes (MCAP) for scripts/convert_abc_sim_to_lerobot.py.
+abc = [
+    "mcap",
+]
 
 [tool.uv]
 override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74"]

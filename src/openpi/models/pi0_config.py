@@ -35,6 +35,10 @@ class Pi0Config(_model.BaseModelConfig):
     discrete_state_input: bool = None  # type: ignore
     # Stop gradients from action expert → VLM backbone in attention (Driess et al., 2025).
     knowledge_insulation: bool = False
+    # Action-prefix conditioning for real-time chunking (pi05 only; 0 = off). Training feeds a clean prefix of
+    # U[0, action_prefix_max) ground-truth actions (flow time 0, excluded from the loss); sample_actions can then
+    # hold a given prefix fixed. Mirrors ABC's prefix-conditioned training.
+    action_prefix_max: int = 0
     # VLM backbone ("paligemma" or "gemma3") and its input resolution (None = backbone default: 224 / 896).
     # Gemma 3 also needs paligemma_variant="gemma3_4b" (and a gemma3_* action expert); see models/backbone.py.
     backbone: _backbone.Backbone = "paligemma"

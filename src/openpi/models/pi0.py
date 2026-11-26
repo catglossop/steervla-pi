@@ -67,6 +67,9 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        self.action_prefix_max = config.action_prefix_max
+        if self.action_prefix_max and not self.pi05:
+            raise ValueError("action_prefix_max (RTC prefix conditioning) needs pi05=True (per-token adaRMS time).")
         _backbone.validate(config, vlm_variant=config.paligemma_variant, expert_variant=config.action_expert_variant)
         self.image_resolution = _backbone.resolution(config)
         paligemma_config = _gemma.get_config(config.paligemma_variant)
@@ -133,13 +136,14 @@ class Pi0(_model.BaseModel):
 
     @at.typecheck
     def embed_suffix(
-        self, obs: _model.Observation, noisy_actions: _model.Actions, timestep: at.Float[at.Array, " b"]
+        self, obs: _model.Observation, noisy_actions: _model.Actions, timestep: at.Float[at.Array, "b ..."]
     ) -> tuple[
         at.Float[at.Array, "b s emb"],
         at.Bool[at.Array, "b s"],
         at.Bool[at.Array, " s"],
-        at.Float[at.Array, "b emb"] | None,
+        at.Float[at.Array, "b ... emb"] | None,
     ]:
+        # `timestep` is per sample (b,) or, for action-prefix conditioning, per action token (b, ah).
         input_mask = []
         ar_mask = []
         tokens = []
@@ -153,7 +157,13 @@ class Pi0(_model.BaseModel):
 
         action_tokens = self.action_in_proj(noisy_actions)
         # embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
-        time_emb = posemb_sincos(timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0)
+        if timestep.ndim == 2:
+            assert self.pi05, "per-token timesteps need pi05 (adaRMS)"
+            time_emb = posemb_sincos(
+                timestep.reshape(-1), self.action_in_proj.out_features, min_period=4e-3, max_period=4.0
+            ).reshape(*timestep.shape, -1)
+        else:
+            time_emb = posemb_sincos(timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0)
         if self.pi05:
             # time MLP (for adaRMS)
             time_emb = self.time_mlp_in(time_emb)
@@ -193,6 +203,13 @@ class Pi0(_model.BaseModel):
         noise = jax.random.normal(noise_rng, actions.shape)
         time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
         time_expanded = time[..., None, None]
+        is_action_prefix = None
+        if self.action_prefix_max:
+            # RTC prefix conditioning: the first `prefix_len` actions are given clean (flow time 0).
+            prefix_len = jax.random.randint(jax.random.fold_in(rng, 1), batch_shape, 0, self.action_prefix_max)
+            is_action_prefix = jnp.arange(self.action_horizon) < prefix_len[..., None]
+            time = jnp.where(is_action_prefix, 0.0, time[..., None])
+            time_expanded = time[..., None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
@@ -208,7 +225,10 @@ class Pi0(_model.BaseModel):
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        if is_action_prefix is not None:
+            loss = jnp.where(is_action_prefix, 0.0, loss)  # given actions carry no loss
+        return loss
 
     @override
     def sample_actions(
@@ -218,7 +238,12 @@ class Pi0(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
+        action_prefix: at.Float[at.Array, "b ah ad"] | None = None,
+        action_prefix_len: at.Int[at.Array, " b"] | None = None,
     ) -> _model.Actions:
+        """Flow-matching sampling. With ``action_prefix``/``action_prefix_len`` (RTC, needs a model trained with
+        ``action_prefix_max``), the first ``action_prefix_len`` actions are held fixed at the given (normalized)
+        values and only the rest of the chunk is denoised."""
         observation = _model.preprocess_observation(
             None, observation, train=False, image_resolution=self.image_resolution
         )
@@ -235,11 +260,17 @@ class Pi0(_model.BaseModel):
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
+        is_action_prefix = None
+        if action_prefix is not None:
+            is_action_prefix = jnp.arange(self.action_horizon) < action_prefix_len[:, None]
+            noise = jnp.where(is_action_prefix[..., None], action_prefix, noise)
+
         def step(carry):
             x_t, time = carry
-            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
-                observation, x_t, jnp.broadcast_to(time, batch_size)
-            )
+            token_time = jnp.broadcast_to(time, batch_size)
+            if is_action_prefix is not None:
+                token_time = jnp.where(is_action_prefix, 0.0, token_time[:, None])
+            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, token_time)
             # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
             # other
             suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
@@ -266,6 +297,8 @@ class Pi0(_model.BaseModel):
             )
             assert prefix_out is None
             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+            if is_action_prefix is not None:
+                v_t = jnp.where(is_action_prefix[..., None], 0.0, v_t)  # keep the given prefix fixed
 
             return x_t + dt * v_t, time + dt
 

@@ -25,6 +25,7 @@ import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
 import openpi.training.jax_distributed as jax_distributed
 import openpi.training.optimizer as _optimizer
+import openpi.training.periodic_eval as _periodic_eval
 import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
@@ -422,6 +423,23 @@ def main(config: _config.TrainConfig):
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+
+        for periodic_eval in config.periodic_evals:
+            if step > start_step and step % periodic_eval.interval == 0:
+                ctx = _periodic_eval.EvalContext(
+                    step=step,
+                    train_state=train_state,
+                    train_state_sharding=train_state_sharding,
+                    data_sharding=data_sharding,
+                    replicated_sharding=replicated_sharding,
+                    mesh=mesh,
+                    config=config,
+                    run_dir=run_dir,
+                )
+                eval_metrics = periodic_eval.run(ctx)
+                if eval_metrics and jax.process_index() == 0:
+                    pbar.write(f"Step {step} eval ({type(periodic_eval).__name__}): {len(eval_metrics)} metrics")
+                    wandb.log(eval_metrics, step=step)
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()

@@ -92,6 +92,17 @@ For large datasets you also add an RLDS dataset class (see `steervla_rlds_datase
 - Token ids: CoT delimiters and FAST codes are counted down from the top of the SentencePiece vocab (`tokenizer.SP_VOCAB_SIZE`), which for Gemma 3 is all `<unused>` tokens. Model and tokenizer both read `tokenizer.cot_delimiter_ids(backbone)`; note the SentencePiece size (262,144) differs from Gemma 3's embedding rows (262,208).
 - `gemma3_weights_test.py` checks the port against `transformers` (marked `manual`; set `OPENPI_GEMMA3_CKPT` to a local copy). No LoRA variants or PyTorch path for Gemma 3.
 
+### ABC bimanual sim (`pi05_gemma3_abc_sim`)
+
+Policy for the ABC simulator (https://github.com/amazon-far/abc): task prompt + current observation (scene camera, 2 wrist cameras, 14-D joint state), 30-step absolute-joint chunks at 30 Hz. Config in `training/misc/abc_sim_config.py`.
+
+- **Data:** raw MCAP episodes (`/raid/datasets/data/sim/<task>/episode_*`) are converted once into LeRobot shards (`uv run --group abc examples/abc_sim/convert_abc_sim_to_lerobot.py`), resampled onto ABC's 30 Hz grid exactly like ABC's exporter. A deterministic uuid-hash split gives `train_*` / `val_*` shards, and `AbcSimDataset` stitches them. Prompts are the task name, or the per-episode directive from `randomization.json` for put_relative / grab_clutter / count_into_opaque_box / multi_drawer_search.
+- **Dropout** (`AbcSimDataConfig`): independent training-only probabilities for the prompt and each camera. It runs in `repack_transforms`, so never at inference. A dropped camera is zeroed and its image mask set False; a dropped prompt is `""`, which is how the unconditional policy is evaluated.
+- **Periodic evals:** `TrainConfig.periodic_evals` hooks (`training/periodic_eval.py`), called by train.py right after any checkpoint save.
+  - `AbcActionMseEval`: held-out MSE in raw joint space at 1 s / 0.5 s, per task, task mean, worst-k, with and without the prompt.
+  - `AbcSimEval`: asynchronous. It launches `scripts/abc_sim_eval_worker.py` on its own GPU, which serves the checkpoint over websocket and runs `examples/abc_sim/sim_client.py` in ABC's separate venv (Python 3.12, mujoco 3.8, torch 2.11; incompatible with openpi's env) with the OpenGL renderer (`camera_backend="mujoco"`, `MUJOCO_GL=egl`). Results are logged on a later eval step under `sim_eval/*` together with `sim_eval/checkpoint_step`. Leave memory headroom on that GPU (e.g. train with `XLA_PYTHON_CLIENT_MEM_FRACTION=0.75`).
+- **RTC** (ABC's default eval) is available but off by default. It needs `Pi0Config.action_prefix_max > 0`: training feeds a clean action prefix at flow time 0 with no loss on it, using per-token adaRMS time, and `ActionPrefixPolicy` holds a given prefix fixed while sampling. Enable it in eval with `AbcSimEval(rtc=True)`. With RTC off, eval is ABC's `--no-rtc` loop (execute 15 of 30, replan).
+
 ### Fork-specific gotchas
 
 - **`speed_in_prompt` double-injection.** `RLDSSteerVLADataConfig` injects the speed string in the *RLDS loader* and passes `speed_in_prompt=False` to `SteerVLAInputs`. `RLDSSteerVLACoTDataConfig` does the **opposite** (injects in the policy transform). Easy to get backwards and end up with the speed in the prompt twice, or not at all.

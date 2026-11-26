@@ -18,13 +18,16 @@ import openpi.models.backbone as _backbone
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
+import openpi.policies.abc_policy as abc_policy
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.policies.steervla_policy as steervla_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
+import openpi.training.abc_sim_dataset as abc_sim_dataset
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
+import openpi.training.misc.abc_sim_config as abc_sim_config
 import openpi.training.misc.polaris_config as polaris_config
 import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.misc.steervla_config as steervla_config
@@ -103,6 +106,8 @@ class DataConfig:
 
     # SteerVLA RLDS loader options; when set, the RLDS loader builds a SteerVLARldsDataset instead of DROID.
     steervla: steervla_rlds_dataset.SteerVLALoaderConfig | None = None
+    # ABC sim LeRobot shards; when set, the torch loader builds an AbcSimDataset.
+    abc_sim: abc_sim_dataset.AbcSimLoaderConfig | None = None
 
 
 class GroupFactory(Protocol):
@@ -803,6 +808,53 @@ class RLDSSteerVLACoTDataConfig(RLDSSteerVLADataConfig):
 
 
 @dataclasses.dataclass(frozen=True)
+class AbcSimDataConfig(DataConfigFactory):
+    """ABC bimanual sim (https://github.com/amazon-far/abc): scene + 2 wrist cameras, 14-D joint state/actions.
+
+    Reads the LeRobot shards written by ``examples/abc_sim/convert_abc_sim_to_lerobot.py``. Actions are absolute
+    joint/gripper targets in 30-step (1 s at 30 Hz) chunks, as in ABC. Conditioning dropout is training-only and
+    independent per input: the task prompt and each camera.
+    """
+
+    repo_id: str = "abc_sim"
+    loader: abc_sim_dataset.AbcSimLoaderConfig = dataclasses.field(default_factory=abc_sim_dataset.AbcSimLoaderConfig)
+    prompt_dropout: float = 0.0
+    top_camera_dropout: float = 0.0
+    left_wrist_camera_dropout: float = 0.0
+    right_wrist_camera_dropout: float = 0.0
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        if model_config.action_horizon != self.loader.chunk_length:
+            raise ValueError(
+                f"model action_horizon ({model_config.action_horizon}) must equal the ABC chunk length "
+                f"({self.loader.chunk_length})"
+            )
+        # The dataset already emits the inference-time keys, so repack only applies the (training-only) dropout.
+        repack_transform = _transforms.Group(
+            inputs=[
+                abc_policy.AbcObservationDropout(
+                    prompt=self.prompt_dropout,
+                    top=self.top_camera_dropout,
+                    left_wrist=self.left_wrist_camera_dropout,
+                    right_wrist=self.right_wrist_camera_dropout,
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[abc_policy.AbcInputs(model_type=model_config.model_type)],
+            outputs=[abc_policy.AbcOutputs()],
+        )
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=ModelTransformFactory()(model_config),
+            abc_sim=self.loader,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class LeRobotSteerVLADataConfig(DataConfigFactory):
     """
     Config for training on a smaller nuScenes-style driving dataset in LeRobot format.
@@ -934,6 +986,8 @@ class TrainConfig:
     # data parallel between 2 groups of devices.
     fsdp_devices: int = 1
     skip_norm_stats: bool = False
+    # Evaluations run every `hook.interval` steps (see training/periodic_eval.py), e.g. ABC sim MSE / rollouts.
+    periodic_evals: tyro.conf.Suppress[tuple[Any, ...]] = ()
 
     @property
     def assets_dirs(self) -> pathlib.Path:
@@ -1373,6 +1427,8 @@ _CONFIGS = [
     *polaris_config.get_polaris_configs(),
     # SteerVLA / SimLingo driving configs (fork).
     *steervla_config.get_steervla_configs(),
+    # ABC bimanual simulation configs (fork).
+    *abc_sim_config.get_abc_sim_configs(),
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):

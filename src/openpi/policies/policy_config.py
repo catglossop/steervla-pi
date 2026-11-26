@@ -81,6 +81,10 @@ def create_trained_policy(
     policy_cls, extra_kwargs = _policy.Policy, {}
     if hasattr(model, "sample_cot"):
         policy_cls, extra_kwargs = _cot_policy.CoTPolicy, {"cot_sample_kwargs": cot_sample_kwargs}
+    elif getattr(train_config.model, "action_prefix_max", 0):
+        from openpi.policies import action_prefix_policy
+
+        policy_cls = action_prefix_policy.ActionPrefixPolicy
     return policy_cls(
         model,
         transforms=[
